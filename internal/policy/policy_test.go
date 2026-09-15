@@ -36,8 +36,8 @@ func TestKillDeniesEvenPriorGrants(t *testing.T) {
 	}
 }
 
-// TestReconcileNeverResurrectsAKill mirrors Tessera's explicit invariant
-// of the same name: writing grants for a killed agent must not silently
+// TestReconcileNeverResurrectsAKill checks the same invariant Tessera
+// names explicitly: writing grants for a killed agent must not silently
 // un-kill it.
 func TestReconcileNeverResurrectsAKill(t *testing.T) {
 	ctx := context.Background()

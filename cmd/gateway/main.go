@@ -4,9 +4,9 @@
 // to a canonical agent identity, ask the policy client for a live
 // authorization decision, and forward or block. It never caches an
 // allow, and it never makes an authorization decision itself, that
-// stays in internal/policy (Tessera/OpenFGA) on purpose: the gateway
-// should be swappable or horizontally scaled without the authorization
-// model moving with it.
+// stays in internal/policy (Tessera/OpenFGA), so the gateway can be
+// swapped out or scaled horizontally without the authorization model
+// moving with it.
 //
 // MCP integration lives here: an MCP tool-call request is just another
 // inbound request that needs an identity resolved and a grant checked
@@ -25,11 +25,11 @@ import (
 )
 
 // headerResolver is the reference identity.Resolver: it trusts a single
-// header carrying the agent ref outright. This is deliberately not
-// production-grade, real deployments resolve identity from a verified
-// JWT claim, an mTLS certificate thumbprint, or an API key lookup, the
-// same normalization problem Tessera's own IIdentityResolver solves.
-// Swapping this out is the first thing a real deployment should do.
+// header carrying the agent ref outright. Not production-grade, real
+// deployments resolve identity from a verified JWT claim, an mTLS
+// certificate thumbprint, or an API key lookup, the same normalization
+// problem Tessera's own IIdentityResolver solves. Swapping this out is
+// the first thing a real deployment should do.
 type headerResolver struct {
 	headerName string
 }

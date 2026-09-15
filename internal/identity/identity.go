@@ -2,9 +2,10 @@
 // (NHI) inside NIA: agents, service accounts, and anything else that isn't
 // a human but needs to be known, granted permissions, and killed.
 //
-// This mirrors Tessera's ClientRef / Assurance / ResolvedClient trio
-// (see Tessera.ControlPlane/Model.cs) deliberately. An AgentRef here is
-// what a ClientRef is there, generalized from "M2M API client" to "agent."
+// This follows the shape of Tessera's ClientRef / Assurance /
+// ResolvedClient trio (see Tessera.ControlPlane/Model.cs). An AgentRef
+// here is what a ClientRef is there, generalized from "M2M API client"
+// to "agent."
 package identity
 
 import "time"

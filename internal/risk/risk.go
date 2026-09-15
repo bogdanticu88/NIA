@@ -1,6 +1,6 @@
 // Package risk scores agents and individual calls. This has no Tessera
-// counterpart; it's net-new. The scaffold here defines the shape
-// deliberately thin: a real scorer wants historical baselining per
+// counterpart, it's net-new. The scaffold here keeps the shape thin: a
+// real scorer wants historical baselining per
 // agent (what does this agent normally call, at what volume, touching
 // what data) before its output means anything, and that's exactly the
 // kind of anomaly-detection problem CENTIPEDE was already built for.
@@ -22,8 +22,8 @@ type Signal struct {
 }
 
 // Score is the outcome of scoring one call or one agent's recent
-// behavior. Value is unbounded on purpose; callers decide their own
-// thresholds for what counts as "block this."
+// behavior. Value is unbounded, callers decide their own thresholds
+// for what counts as "block this."
 type Score struct {
 	AgentRef string
 	Value    float64

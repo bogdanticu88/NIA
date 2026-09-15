@@ -5,8 +5,8 @@
 // AgentRef. NIA needs to actually mint and retire the credentials
 // Tessera later resolves.
 //
-// Revocation here is deliberately a smaller action than the kill switch
-// in internal/policy: revoking a credential retires one key without
+// Revocation here is a smaller action than the kill switch in
+// internal/policy: revoking a credential retires one key without
 // touching the agent's grants or identity. Killing an agent (see
 // internal/policy.Client.Kill) is the bigger hammer, use it when the
 // agent itself is compromised, not just one leaked key.
@@ -58,8 +58,7 @@ var ErrNotFound = errors.New("credentials: not found")
 
 // Store is where credential metadata lives. A production deployment
 // backs this with Postgres; the in-memory implementation below is the
-// reference used for local dev, same pattern as every other package
-// here.
+// reference used for local dev, same as every other package here.
 type Store interface {
 	Issue(ctx context.Context, agentRef string, kind Kind, ttl time.Duration) (Credential, error)
 	Get(ctx context.Context, id string) (Credential, error)

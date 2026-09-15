@@ -1,9 +1,9 @@
 // Package registry is where non-human identities and the tools they can
-// call get onboarded and inventoried. Registration here is deliberately
+// call get onboarded and inventoried. Registration here is kept
 // separate from granting permissions (internal/policy): registering an
 // agent creates the identity record, it does not by itself authorize
-// anything. Mirrors Tessera's ClientProvisioner, which onboards a client
-// record distinctly from writing its grants.
+// anything. Follows the same split as Tessera's ClientProvisioner,
+// which onboards a client record distinctly from writing its grants.
 package registry
 
 import (

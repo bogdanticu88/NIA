@@ -1,6 +1,6 @@
 // Package policy is NIA's client for the policy engine: Tessera, backed
-// by OpenFGA. It is deliberately thin. NIA does not reimplement
-// relationship-based authorization, Tessera already does that; this
+// by OpenFGA. It stays thin. NIA does not reimplement relationship-
+// based authorization, Tessera already does that; this
 // package defines the interface NIA's control plane and gateway need
 // against it, shaped to match Tessera's own public surface so a real
 // HTTP adapter is a drop-in once Tessera's v1.2 HTTP surface exists
@@ -20,10 +20,10 @@ import (
 	"time"
 )
 
-// Grant mirrors Tessera's Grant record: either a whole api_group, or a
-// single method+path endpoint. NIA extends the concept to tools and data
-// resources by treating a tool or data resource as just another object a
-// grant can name; the wire shape stays the same.
+// Grant follows the shape of Tessera's Grant record: either a whole
+// api_group, or a single method+path endpoint. NIA extends the concept
+// to tools and data resources by treating a tool or data resource as
+// just another object a grant can name; the wire shape stays the same.
 type Grant struct {
 	Kind   string // "api_group" | "endpoint" | "tool" | "data"
 	Group  string // set when Kind == "api_group"
@@ -39,7 +39,7 @@ func GrantForEndpoint(method, path string) Grant {
 func GrantForTool(tool string) Grant     { return Grant{Kind: "tool", Object: tool} }
 func GrantForData(resource string) Grant { return Grant{Kind: "data", Object: resource} }
 
-// KillResult mirrors Tessera's KillResult: what a kill actually did.
+// KillResult follows Tessera's KillResult: what a kill actually did.
 type KillResult struct {
 	AgentRef      string
 	TuplesDeleted int
