@@ -2,14 +2,16 @@
 // by OpenFGA. It stays thin. NIA does not reimplement relationship-
 // based authorization, Tessera already does that; this
 // package defines the interface NIA's control plane and gateway need
-// against it, shaped to match Tessera's own public surface so a real
-// HTTP adapter is a drop-in once Tessera's v1.2 HTTP surface exists
-// (see docs/ARCHITECTURE.md, "Integration plan for Tessera").
+// against it, shaped to match Tessera's own public surface.
 //
-// Until that surface exists, Client is satisfied by the in-memory
-// reference implementation in this package, the same "runs out of the
-// box, swap in the real thing later" choice Tessera itself makes for
-// IAuthorizationStore and IClientRegistry.
+// Two implementations of Client live here. InMemoryClient is the
+// reference implementation, no OpenFGA, no Tessera, for local dev and
+// for exercising the interface's own invariants directly. TesseraHTTPClient
+// (tessera_client.go) is the real thing, it drives Tessera's actual HTTP
+// surface (see docs/ARCHITECTURE.md, "Integration plan for Tessera", and
+// TesseraHTTPClient's own doc comment for where its behavior and
+// InMemoryClient's diverge, kill in particular does not mean the same
+// thing to both).
 package policy
 
 import (
