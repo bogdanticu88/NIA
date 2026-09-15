@@ -106,9 +106,24 @@ func main() {
 		addr = ":8081"
 	}
 
+	// Same policy.FromEnv switch cmd/api uses: NIA_TESSERA_BASE_URL unset
+	// means the in-memory client and no Tessera dependency to run this
+	// locally, set it (and the signing key alongside it) to check
+	// against a real Tessera instance instead. The gateway is still not
+	// where a production deployment should point its hot-path checks,
+	// see TesseraHTTPClient's doc comment on why Check here reads
+	// Tessera's declared state rather than live OpenFGA truth, a real
+	// gateway calls OpenFGA directly the way docs/ARCHITECTURE.md
+	// describes. This wiring is what makes that swap possible without
+	// touching anything else in this file.
+	pol, err := policy.FromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
 	g := &gateway{
 		resolver: headerResolver{headerName: "X-Agent-Ref"},
-		pol:      policy.NewInMemoryClient(),
+		pol:      pol,
 	}
 
 	srv := &http.Server{

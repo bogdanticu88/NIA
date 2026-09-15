@@ -1,0 +1,20 @@
+# Builds cmd/api. Multi-stage so the shipped image is the static binary
+# plus a minimal base, not the Go toolchain, not go.mod's module cache.
+#
+# Not verified with a real docker build in this repo's own sandbox, it
+# has no Docker daemon, go build/go vet/go test have all run clean
+# against the code this Dockerfile packages, but "docker build" itself
+# has not. Run it once locally before trusting it in CI.
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/nia-api ./cmd/api
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/nia-api /usr/local/bin/nia-api
+EXPOSE 8080
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=5 \
+  CMD wget -q -O- http://localhost:8080/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/nia-api"]

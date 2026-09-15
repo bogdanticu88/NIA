@@ -81,6 +81,20 @@ import (
 //     implementations should not treat "ListGrants looks empty right
 //     after a kill" as something to rely on for TesseraHTTPClient.
 //
+//  5. agentRef and Tessera's client_ref are not the same string. NIA's
+//     own convention is a type-prefixed ref, "agent:billing-reconciler"
+//     (see identity.AgentRef.Ref), Tessera's CanonicalForm.ClientRef
+//     rejects ':' outright, confirmed the hard way: this client passed
+//     tests against a fake server for a while before an actual run
+//     against cmd/api and a real Tessera.Service turned up every single
+//     call failing with "client_ref contains an invalid character: ':'."
+//     encodeClientRef/decodeClientRef (bottom of this file) are a
+//     reversible, collision free escape across that boundary, applied
+//     wherever an agentRef becomes part of a URL path or a client_ref
+//     JSON field. Callers of this type never see the encoded form,
+//     Kill's result carries back the exact agentRef the caller passed
+//     in, not Tessera's (lowercased, encoded) echo of it.
+//
 // One more thing worth knowing: mintToken signs a token good for
 // defaultTokenTTL (30s) from the moment of the call, and Tessera's own
 // Hs256JwtValidator applies a further 30s clock skew allowance on top of
@@ -341,14 +355,18 @@ func (c *TesseraHTTPClient) Kill(ctx context.Context, agentRef, incident, operat
 	}
 
 	var result killResultWire
-	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(agentRef)+"/kill", operator, killRequestBodyWire{Incident: incident}, &result)
+	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(encodeClientRef(agentRef))+"/kill", operator, killRequestBodyWire{Incident: incident}, &result)
 	if err != nil {
 		return KillResult{}, fmt.Errorf("policy: Kill(%s): %w", agentRef, err)
 	}
 	if status != http.StatusOK || !result.Success {
 		return KillResult{}, fmt.Errorf("policy: Kill(%s): tessera returned status %d: %s", agentRef, status, firstNonEmpty(result.ErrorMessage, string(raw)))
 	}
-	return KillResult{AgentRef: result.ClientRef, TuplesDeleted: result.TuplesDeleted}, nil
+	// AgentRef here is the original, exact string the caller passed in,
+	// not result.ClientRef, Tessera both lowercases and, since encoding,
+	// escapes what it's given, echoing that back instead would silently
+	// hand the caller a different string than the one it called with.
+	return KillResult{AgentRef: agentRef, TuplesDeleted: result.TuplesDeleted}, nil
 }
 
 func (c *TesseraHTTPClient) Restore(ctx context.Context, agentRef string) error {
@@ -357,7 +375,7 @@ func (c *TesseraHTTPClient) Restore(ctx context.Context, agentRef string) error 
 	defer lock.Unlock()
 
 	var result restoreResultWire
-	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(agentRef)+"/restore", c.systemSubject, nil, &result)
+	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(encodeClientRef(agentRef))+"/restore", c.systemSubject, nil, &result)
 	if err != nil {
 		return fmt.Errorf("policy: Restore(%s): %w", agentRef, err)
 	}
@@ -395,7 +413,7 @@ func (c *TesseraHTTPClient) onboardMerged(ctx context.Context, agentRef, busines
 
 	var result onboardResultWire
 	status, raw, err := c.do(ctx, http.MethodPost, "/clients/onboard", c.systemSubject, onboardRequestBody{
-		ClientRef:    agentRef,
+		ClientRef:    encodeClientRef(agentRef),
 		BusinessUnit: businessUnit,
 		Grants:       wireGrants,
 	}, &result)
@@ -413,7 +431,7 @@ func (c *TesseraHTTPClient) onboardMerged(ctx context.Context, agentRef, busines
 
 func (c *TesseraHTTPClient) getClientState(ctx context.Context, agentRef string) (*clientStateWire, bool, error) {
 	var result getClientResultWire
-	status, raw, err := c.do(ctx, http.MethodGet, "/clients/"+url.PathEscape(agentRef), c.systemSubject, nil, &result)
+	status, raw, err := c.do(ctx, http.MethodGet, "/clients/"+url.PathEscape(encodeClientRef(agentRef)), c.systemSubject, nil, &result)
 	if err != nil {
 		return nil, false, err
 	}
@@ -616,4 +634,80 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// clientRefEscape is the escape character used by encodeClientRef, '.'
+// specifically because Tessera's CanonicalForm.ClientRef already allows
+// it (see src/Tessera.ControlPlane/CanonicalForm.cs on the Tessera side:
+// only ASCII letters, digits, '.', '_', and '-'), so an encoded ref never
+// needs a second round of escaping just to reach Tessera at all.
+const clientRefEscape = '.'
+const clientRefColonEscape = 'c' // clientRefEscape followed by this means the original character was ':'
+
+// encodeClientRef maps an NIA agentRef, "agent:billing-reconciler" being
+// the convention documented on identity.AgentRef.Ref, onto something
+// Tessera's client_ref will actually accept. Confirmed against the real
+// service, not assumed: CanonicalForm.ClientRef rejects ':' outright, so
+// passing an agentRef straight through as client_ref fails every single
+// call with "client_ref contains an invalid character" the moment a real
+// Tessera instance is on the other end, a gap none of this package's
+// tests caught because none of them used a ref containing a colon, only
+// an actual end to end run against cmd/api and a live Tessera.Service
+// did. This is a reversible, unambiguous escape, not a lossy prefix
+// strip: decodeClientRef inverts it exactly, character by character, so
+// two different agentRefs can never collide onto the same client_ref.
+// It only handles ':', the one character NIA's own ref convention
+// introduces that Tessera's charset doesn't allow, anything else outside
+// that charset still surfaces as a clear 400 from Tessera itself rather
+// than being silently swallowed here.
+func encodeClientRef(agentRef string) string {
+	var b strings.Builder
+	b.Grow(len(agentRef))
+	for _, r := range agentRef {
+		switch r {
+		case clientRefEscape:
+			b.WriteRune(clientRefEscape)
+			b.WriteRune(clientRefEscape)
+		case ':':
+			b.WriteRune(clientRefEscape)
+			b.WriteRune(clientRefColonEscape)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// decodeClientRef inverts encodeClientRef. Not currently called anywhere
+// in this file, Kill and the rest all return the caller's original
+// agentRef rather than round tripping whatever Tessera echoes back (see
+// the comment in Kill on why: Tessera also lowercases, so its echo isn't
+// the original string either way). Kept as the documented, tested
+// inverse of encodeClientRef for whichever caller needs it later, an
+// escape scheme that can't be decoded is a hazard people don't need,
+// even one this package doesn't use yet.
+func decodeClientRef(encoded string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(encoded))
+	runes := []rune(encoded)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r != clientRefEscape {
+			b.WriteRune(r)
+			continue
+		}
+		if i+1 >= len(runes) {
+			return "", fmt.Errorf("truncated escape sequence at the end of client_ref %q", encoded)
+		}
+		switch runes[i+1] {
+		case clientRefEscape:
+			b.WriteRune(clientRefEscape)
+		case clientRefColonEscape:
+			b.WriteRune(':')
+		default:
+			return "", fmt.Errorf("unrecognized escape sequence %q in client_ref %q", string([]rune{clientRefEscape, runes[i+1]}), encoded)
+		}
+		i++
+	}
+	return b.String(), nil
 }

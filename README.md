@@ -8,7 +8,14 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and the s
 
 ## Status
 
-This is the architecture and repo scaffold: package boundaries, interfaces, and in-memory reference implementations for every component, same "runs out of the box, swap in the real thing later" pattern Tessera itself uses. It is not yet a working integration with Tessera or OpenFGA, see the integration plan in `docs/ARCHITECTURE.md` for what that requires and in what order.
+Package boundaries, interfaces, and in-memory reference implementations exist for every one of the seventeen MVP components. `internal/policy` additionally has a second, real implementation, `TesseraHTTPClient`, that drives an actual Tessera.Service instance over HTTP instead of the in-memory reference. `cmd/api` and `cmd/gateway` pick between the two at startup based on environment (`policy.FromEnv`, unset `NIA_TESSERA_BASE_URL` means the in-memory one, same "runs out of the box" default as before).
+
+What's actually been verified, and how:
+
+- `internal/policy`: unit tests against a fake HTTP server (network failures, malformed and oversized responses, cancellation, concurrent writers) plus a live test that spawns a real `Tessera.Service` process and drives it over actual HTTP (`internal/policy/tessera_client_live_test.go`, opt-in via `NIA_TESSERA_REPO_PATH`, a checked-out Tessera repo with `src/Tessera.Service` already built).
+- `cmd/api` and `cmd/gateway` against that same real `Tessera.Service` process, driven over real HTTP end to end, not just through Go's own test harness: registered an agent, killed it through `POST /policy/kill`, and confirmed Tessera's own state showed the kill. This is what caught a real bug (an agent ref containing `:`, NIA's own convention, `agent:billing-reconciler`, fails Tessera's `client_ref` validation outright) that no unit test had a reason to exercise, since none of them used a ref in that shape. Fixed with a reversible encoding at the `TesseraHTTPClient` boundary, see its doc comment, point 5.
+
+What has not: the full `docker-compose.yml` stack, four services actually talking to each other under Docker (`nia-api`, `nia-gateway`, `tessera`, `openfga`, plus `postgres`), and Tessera against real OpenFGA rather than its in-memory store. This sandbox has no Docker daemon, so none of that has been run here, `deployments/Dockerfile.api`, `Dockerfile.gateway`, and Tessera's own `Dockerfile` are written but not `docker build`-verified, and `openfga`'s store/model still need creating by hand against its API before Tessera can point at it (see the comment at the top of `docker-compose.yml`). Confirm this on a machine with Docker before relying on it.
 
 ## Layout
 
@@ -17,7 +24,7 @@ cmd/api        control-plane API: registration, inventory, credentials, grants, 
 cmd/gateway    Agent/MCP gateway: the hot path, resolve -> check -> forward
 cmd/niactl     operator CLI, talks to cmd/api over HTTP
 internal/      identity, registry, credentials, policy, audit, risk, monitoring, graph
-deployments/   docker-compose for local dev (nia-api, nia-gateway, openfga, postgres)
+deployments/   Dockerfiles and docker-compose for local dev (nia-api, nia-gateway, tessera, openfga, postgres)
 docs/          architecture and data model
 ```
 
@@ -26,6 +33,7 @@ docs/          architecture and data model
 ```bash
 go build ./...
 go vet ./...
+go test ./...
 
 # in one terminal
 go run ./cmd/api
@@ -43,7 +51,9 @@ go run ./cmd/niactl list
 go run ./cmd/niactl kill -ref agent:billing-reconciler -incident INC-001
 ```
 
-Everything above runs against in-memory reference implementations, no Postgres, OpenFGA, or Tessera required. `deployments/docker-compose.yml` brings up Postgres and OpenFGA for when the real adapters land.
+The commands above run against the in-memory policy client, no Tessera, OpenFGA, or Postgres required. To point `cmd/api` and `cmd/gateway` at a real Tessera instance instead, set three environment variables before starting them: `NIA_TESSERA_BASE_URL` (Tessera.Service's URL), `NIA_TESSERA_JWT_SIGNING_KEY` (base64, the exact same value Tessera.Service was started with as `TESSERA_JWT_SIGNING_KEY`), and, only if Tessera isn't running with its own defaults, `NIA_TESSERA_JWT_ISSUER` / `NIA_TESSERA_JWT_AUDIENCE`. See `internal/policy/from_env.go` for the full list and defaults.
+
+`deployments/docker-compose.yml` brings up the full stack, NIA's two services plus Tessera, OpenFGA, and Postgres, see the Status section above for what's actually been confirmed to work versus what still needs a Docker-equipped machine to verify.
 
 ## License
 

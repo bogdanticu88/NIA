@@ -7,6 +7,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -34,14 +35,26 @@ type server struct {
 	auditLog audit.Sink
 }
 
-func newServer() *server {
+// newServer wires every control-plane dependency. The policy client comes
+// from policy.FromEnv: NIA_TESSERA_BASE_URL unset means the in-memory
+// reference client, no Tessera required to run this locally, set it and
+// the required signing key alongside it and this talks to a real Tessera
+// instance instead. See internal/policy/from_env.go for the full env var
+// list and internal/policy/tessera_client.go's doc comment for what
+// TesseraHTTPClient does and doesn't guarantee relative to the in-memory
+// one.
+func newServer() (*server, error) {
+	pol, err := policy.FromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
 	return &server{
 		agents:   registry.NewInMemoryAgentRegistry(),
 		toolCat:  tools.NewInMemoryCatalog(),
 		creds:    credentials.NewInMemoryStore(),
-		pol:      policy.NewInMemoryClient(),
+		pol:      pol,
 		auditLog: audit.NewInMemorySink(10_000),
-	}
+	}, nil
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -144,7 +157,10 @@ func main() {
 		addr = ":8080"
 	}
 
-	s := newServer()
+	s, err := newServer()
+	if err != nil {
+		log.Fatalf("nia-api: %v", err)
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.routes(),

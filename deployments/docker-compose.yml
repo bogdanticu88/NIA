@@ -1,9 +1,47 @@
-# Local dev stack for NIA. Brings up the two NIA services plus the
-# dependencies they'll eventually integrate with for real: OpenFGA and
-# Postgres. Tessera is included commented-out until its v1.2 HTTP
-# surface exists (see docs/ARCHITECTURE.md); until then internal/policy
-# runs against its own in-memory reference client and doesn't need
-# either OpenFGA or Tessera to be up.
+# Local dev stack for NIA: the two NIA services, Tessera's HTTP surface,
+# OpenFGA, and Postgres. Wired to actually talk to each other, not just
+# started side by side: nia-api and nia-gateway point at tessera,
+# tessera points at openfga, all over the compose network.
+#
+# What's actually been run: cmd/api and cmd/gateway against a real
+# Tessera.Service process over real HTTP, confirmed end to end including
+# a kill that Tessera's own state then reflected (see
+# internal/policy/tessera_client_live_test.go and docs/ARCHITECTURE.md).
+# Tessera in that run used its in-memory IAuthorizationStore, not real
+# OpenFGA. This compose file, this exact four-service graph running
+# together under Docker, has not been run in this sandbox, there is no
+# Docker daemon here. Before trusting it, run `make up` somewhere that
+# has one and watch all four come up healthy.
+#
+# NIA_TESSERA_JWT_SIGNING_KEY has no default on purpose, same fail-fast
+# choice Tessera.Service itself makes for TESSERA_JWT_SIGNING_KEY (see
+# Tessera's own Program.cs): a missing shared secret should stop the
+# stack at startup, not authenticate every call with a default anyone
+# reading this file could guess. Generate one and put it in a `.env`
+# file next to this one (compose reads that automatically, don't commit
+# it): `openssl rand -base64 32`. Both NIA_TESSERA_JWT_SIGNING_KEY and
+# TESSERA_JWT_SIGNING_KEY below must be the exact same value, it's one
+# shared secret between the two services, not two different ones.
+#
+# OPENFGA_STORE_ID has no default either, and can't: OpenFGA doesn't
+# come preconfigured with a store, one has to be created against its API
+# after it's up (`fga store create --name tessera` with the FGA CLI, or
+# an equivalent HTTP POST to /stores), same for the authorization model.
+# That's a real manual step this compose file doesn't automate, wiring
+# it up is listed as follow-on work, not done here.
+#
+# Healthchecks: postgres (pg_isready), tessera, nia-api, and nia-gateway
+# all have one, each hitting a `/healthz` this codebase actually defines
+# and this session confirmed responds (Tessera's directly, in this
+# sandbox, against a real running instance; NIA's the same way, through
+# cmd/api's own /healthz during the live end to end run described in
+# docs/ARCHITECTURE.md). openfga does not get one here, not because it
+# lacks a health endpoint, but because this session couldn't run a real
+# OpenFGA instance to confirm one (no Docker, and openfga.dev itself is
+# blocked from here), and a healthcheck pointed at a guessed path that's
+# wrong would block startup forever, worse than the plain depends_on
+# (container-started, not app-ready) it would replace. Add one once
+# someone can actually verify the endpoint against a running instance.
 services:
   nia-api:
     build:
@@ -13,6 +51,11 @@ services:
       - "8080:8080"
     environment:
       NIA_API_ADDR: ":8080"
+      NIA_TESSERA_BASE_URL: "http://tessera:8080"
+      NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
+    depends_on:
+      tessera:
+        condition: service_healthy
 
   nia-gateway:
     build:
@@ -22,6 +65,23 @@ services:
       - "8081:8081"
     environment:
       NIA_GATEWAY_ADDR: ":8081"
+      NIA_TESSERA_BASE_URL: "http://tessera:8080"
+      NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
+    depends_on:
+      tessera:
+        condition: service_healthy
+
+  tessera:
+    build:
+      context: ../../tessera
+    ports:
+      - "8090:8080"
+    environment:
+      TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
+      OPENFGA_API_URL: "http://openfga:8080"
+      OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
+    depends_on:
+      - openfga
 
   openfga:
     image: openfga/openfga:latest
@@ -30,7 +90,8 @@ services:
       - "8082:8080"   # HTTP
       - "8083:8081"   # gRPC
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine
@@ -40,21 +101,13 @@ services:
       POSTGRES_DB: nia
     ports:
       - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nia -d nia"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     volumes:
       - nia-postgres:/var/lib/postgresql/data
-
-  # tessera:
-  #   # Uncomment once Tessera's v1.2 minimal HTTP surface (kill,
-  #   # restore, onboard) exists. Build from the Tessera repo directly;
-  #   # it is not vendored into this one.
-  #   build:
-  #     context: ../../tessera
-  #   ports:
-  #     - "8090:8080"
-  #   environment:
-  #     OPENFGA_API_URL: "http://openfga:8080"
-  #   depends_on:
-  #     - openfga
 
 volumes:
   nia-postgres:

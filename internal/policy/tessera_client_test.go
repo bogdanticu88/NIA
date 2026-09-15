@@ -818,6 +818,147 @@ func TestWriteGrants_DifferentAgentsAreNotSerializedAgainstEachOther(t *testing.
 	}
 }
 
+// --- client_ref encoding: agentRef "agent:x" against Tessera's charset ---
+
+func TestClientRefEncoding_RoundTrip(t *testing.T) {
+	cases := []string{
+		"agent:billing-reconciler",
+		"agent:e2e-test",
+		"no-colon-at-all",
+		"my.service",
+		"my_c_service", // deliberately contains the literal escape tokens as plain text
+		"a.b.c:d.e.f",  // multiple dots and one colon
+		"weird::double::colon",
+		"",
+		".",
+		":",
+		"..",
+		"::",
+	}
+	for _, agentRef := range cases {
+		t.Run(agentRef, func(t *testing.T) {
+			encoded := encodeClientRef(agentRef)
+			decoded, err := decodeClientRef(encoded)
+			if err != nil {
+				t.Fatalf("decodeClientRef(%q): %v", encoded, err)
+			}
+			if decoded != agentRef {
+				t.Fatalf("round trip mismatch: original %q, encoded %q, decoded back to %q", agentRef, encoded, decoded)
+			}
+		})
+	}
+}
+
+func TestClientRefEncoding_EncodedFormStaysWithinTesseraCharset(t *testing.T) {
+	// Mirrors CanonicalForm.ClientRef on the Tessera side: ASCII
+	// letters, digits, '.', '_', and '-' only. Anything else in the
+	// encoded output would still fail against the real service.
+	isAllowed := func(r rune) bool {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
+	}
+	for _, agentRef := range []string{"agent:billing-reconciler", "agent:e2e-test", "a.b:c", "::::"} {
+		encoded := encodeClientRef(agentRef)
+		for _, r := range encoded {
+			if !isAllowed(r) {
+				t.Fatalf("encodeClientRef(%q) = %q contains %q, which Tessera's client_ref charset does not allow", agentRef, encoded, r)
+			}
+		}
+	}
+}
+
+func TestClientRefEncoding_DistinctInputsNeverProduceTheSameEncoding(t *testing.T) {
+	// Adversarial set: every input here shares characters with the
+	// escape scheme itself (the escape rune '.', the letter 'c' that
+	// follows it for an escaped colon, actual colons, and combinations
+	// designed to look like an escape sequence once another one is
+	// inserted next to it). A scheme that escapes by substituting
+	// multi-character tokens can make two different inputs collide onto
+	// the same output once the substitutions land next to each other;
+	// this package's scheme (a single escape rune, exactly one rune of
+	// lookahead, decoded strictly left to right) shouldn't be able to,
+	// checked here across every distinct pair rather than one hand picked
+	// example.
+	inputs := []string{
+		"agent:foo",
+		"agent.cfoo",
+		"agent..cfoo",
+		"agent.c.foo",
+		"agent::foo",
+		"agent.foo",
+		"agent..foo",
+		".c",
+		"c.",
+		"..",
+		".",
+		":",
+		"a:.c:b",
+	}
+	seen := make(map[string]string, len(inputs))
+	for _, in := range inputs {
+		enc := encodeClientRef(in)
+		if prior, dup := seen[enc]; dup {
+			t.Fatalf("encodeClientRef(%q) and encodeClientRef(%q) both produced %q", prior, in, enc)
+		}
+		seen[enc] = in
+	}
+}
+
+func TestDecodeClientRef_TrailingEscapeCharacter_IsAnError(t *testing.T) {
+	if _, err := decodeClientRef("agent."); err == nil {
+		t.Fatal("expected an error for a truncated escape sequence")
+	}
+}
+
+func TestDecodeClientRef_UnrecognizedEscapeSequence_IsAnError(t *testing.T) {
+	if _, err := decodeClientRef("agent.x"); err == nil {
+		t.Fatal("expected an error for an escape character followed by something that isn't a recognized escape")
+	}
+}
+
+func TestWriteGrants_AgentRefWithColon_EncodesItForTessera(t *testing.T) {
+	var sawClientRef string
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.URL.Path != "/clients/agent.cbilling-reconciler" {
+				t.Fatalf("expected the GET path to carry the encoded ref, got %s", r.URL.Path)
+			}
+			writeJSON(w, http.StatusNotFound, getClientResultWire{Outcome: "not_found"})
+			return
+		}
+		var body onboardRequestBody
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sawClientRef = body.ClientRef
+		writeJSON(w, http.StatusOK, onboardResultWire{Success: true})
+	})
+
+	if err := c.WriteGrants(context.Background(), "agent:billing-reconciler", []Grant{GrantForAPIGroup("orders")}); err != nil {
+		t.Fatalf("WriteGrants: %v", err)
+	}
+	if sawClientRef != "agent.cbilling-reconciler" {
+		t.Fatalf("expected the onboard body's client_ref to be the encoded form, got %q", sawClientRef)
+	}
+}
+
+func TestKill_AgentRefWithColon_ReturnsTheOriginalAgentRefNotTesserasEcho(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/clients/agent.cBilling-Reconciler/kill" {
+			t.Fatalf("expected the kill path to carry the encoded ref, got %s", r.URL.Path)
+		}
+		// Tessera both lowercases and would echo the encoded form back,
+		// not the original mixed-form agentRef, this is deliberately not
+		// what the caller passed in, to prove Kill doesn't just forward it.
+		writeJSON(w, http.StatusOK, killResultWire{Success: true, ClientRef: "agent.cbilling-reconciler", TuplesDeleted: 1})
+	})
+
+	result, err := c.Kill(context.Background(), "agent:Billing-Reconciler", "INC-1", "alice")
+	if err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if result.AgentRef != "agent:Billing-Reconciler" {
+		t.Fatalf("expected KillResult.AgentRef to be the exact original agentRef, got %q", result.AgentRef)
+	}
+}
+
 // --- test helpers ---
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

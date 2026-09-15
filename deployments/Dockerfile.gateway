@@ -1,0 +1,16 @@
+# Builds cmd/gateway. Same shape as Dockerfile.api, see that file's
+# comment, this one has the same "go build/vet/test verified, docker
+# build not" caveat.
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/nia-gateway ./cmd/gateway
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/nia-gateway /usr/local/bin/nia-gateway
+EXPOSE 8081
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=5 \
+  CMD wget -q -O- http://localhost:8081/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/nia-gateway"]
