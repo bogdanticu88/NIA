@@ -1,0 +1,60 @@
+# Local dev stack for NIA. Brings up the two NIA services plus the
+# dependencies they'll eventually integrate with for real: OpenFGA and
+# Postgres. Tessera is included commented-out until its v1.2 HTTP
+# surface exists (see docs/ARCHITECTURE.md); until then internal/policy
+# runs against its own in-memory reference client and doesn't need
+# either OpenFGA or Tessera to be up.
+services:
+  nia-api:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      NIA_API_ADDR: ":8080"
+
+  nia-gateway:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.gateway
+    ports:
+      - "8081:8081"
+    environment:
+      NIA_GATEWAY_ADDR: ":8081"
+
+  openfga:
+    image: openfga/openfga:latest
+    command: run
+    ports:
+      - "8082:8080"   # HTTP
+      - "8083:8081"   # gRPC
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nia
+      POSTGRES_PASSWORD: nia
+      POSTGRES_DB: nia
+    ports:
+      - "5433:5432"
+    volumes:
+      - nia-postgres:/var/lib/postgresql/data
+
+  # tessera:
+  #   # Uncomment once Tessera's v1.2 minimal HTTP surface (kill,
+  #   # restore, onboard) exists. Build from the Tessera repo directly;
+  #   # it is not vendored into this one.
+  #   build:
+  #     context: ../../tessera
+  #   ports:
+  #     - "8090:8080"
+  #   environment:
+  #     OPENFGA_API_URL: "http://openfga:8080"
+  #   depends_on:
+  #     - openfga
+
+volumes:
+  nia-postgres:
