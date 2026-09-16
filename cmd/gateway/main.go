@@ -58,6 +58,11 @@
 // itself erroring) is audited and logged, not turned into a failed
 // response, the call itself was already legitimately authorized before
 // monitoring ever ran, see risk.CallContext's own doc comment.
+//
+// Every flag, revoke, or kill decision also gets a structured
+// internal/incident record, not just an audit line, readable back
+// through GET /incidents and GET /incidents/{id}. See that package's
+// own doc comment for why it's a separate thing from internal/audit.
 package main
 
 import (
@@ -69,10 +74,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/identity"
+	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -107,6 +114,7 @@ type gateway struct {
 	sensitive      sensitivity.Classifier // nil means every resource is treated as Public, no data-grant check runs
 	scorer         risk.Scorer            // nil means monitoring is not configured, kept nil together with monitor
 	monitor        *monitoring.Monitor    // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
+	incidents      incident.Store         // nil unless monitor is also configured, see main(); GET /incidents and GET /incidents/{id} read this directly
 	auditLog       audit.Sink
 }
 
@@ -313,12 +321,63 @@ func (g *gateway) audit(ctx context.Context, action, agentRef, detail string) {
 	}
 }
 
+// handleListIncidents and handleGetIncident are the read side of
+// internal/incident: structured containment records, one per
+// flag/revoke/kill decision internal/monitoring actually made, see that
+// package's own doc comment for how this differs from grepping
+// internal/audit for events that happen to share an incident string.
+// Both are gateway-local, not cmd/api, because the records themselves
+// are created here, in this process, alongside the Monitor that decides
+// to make them, see this file's own package doc comment on why
+// monitoring lives on the gateway side at all. When incidents is nil,
+// monitoring itself isn't configured, so there is nothing to have
+// recorded, list returns an empty array and get returns 404 rather than
+// either one pretending the endpoint doesn't exist.
+func (g *gateway) handleListIncidents(w http.ResponseWriter, r *http.Request) {
+	if g.incidents == nil {
+		niahttp.WriteJSON(w, http.StatusOK, []incident.Incident{})
+		return
+	}
+	agentRef := r.URL.Query().Get("ref")
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	incidents, err := g.incidents.List(r.Context(), agentRef, limit)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, incidents)
+}
+
+func (g *gateway) handleGetIncident(w http.ResponseWriter, r *http.Request) {
+	if g.incidents == nil {
+		niahttp.WriteError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	in, err := g.incidents.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, incident.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, in)
+}
+
 func (g *gateway) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		niahttp.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /tools/{tool}/call", g.handleToolCall)
+	mux.HandleFunc("GET /incidents", g.handleListIncidents)
+	mux.HandleFunc("GET /incidents/{id}", g.handleGetIncident)
 	return mux
 }
 
@@ -380,21 +439,28 @@ func main() {
 
 	// monitoring.ThresholdsFromEnv: none of NIA_RISK_FLAG_AT,
 	// NIA_RISK_REVOKE_AT, or NIA_RISK_KILL_AT set means monitoring is
-	// skipped entirely, scorer and monitor both stay nil, see this
-	// file's own package doc comment above for why a zero-value
+	// skipped entirely, scorer, monitor, and incidents all stay nil, see
+	// this file's own package doc comment above for why a zero-value
 	// Threshold is never used as the "off" state. credentials.Store is
 	// not wired into this process, so a configured revoke threshold
 	// still works, ActionRevoke degrades to an audited no-op, see
-	// monitoring.Monitor's own doc comment on NewMonitor.
+	// monitoring.Monitor's own doc comment on NewMonitor. incidents is
+	// always the in-memory reference implementation today, same
+	// process-local, not-shared-across-replicas limitation as
+	// everything else in this scaffold that keeps state in a map, see
+	// internal/incident's own doc comment for why there's no
+	// Postgres-backed option yet, unlike internal/audit.
 	var scorer risk.Scorer
 	var monitor *monitoring.Monitor
+	var incidents incident.Store
 	thresholds, monitoringConfigured, err := monitoring.ThresholdsFromEnv()
 	if err != nil {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 	if monitoringConfigured {
 		scorer = risk.NewHistoryScorer(toolCat, sensitive, risk.DefaultWeights())
-		monitor = monitoring.NewMonitor(thresholds, pol, nil, auditLog)
+		incidents = incident.NewInMemoryStore()
+		monitor = monitoring.NewMonitor(thresholds, pol, nil, incidents, auditLog)
 	}
 
 	g := &gateway{
@@ -405,6 +471,7 @@ func main() {
 		sensitive:      sensitive,
 		scorer:         scorer,
 		monitor:        monitor,
+		incidents:      incidents,
 		auditLog:       auditLog,
 	}
 

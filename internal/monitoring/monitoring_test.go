@@ -2,12 +2,14 @@ package monitoring
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/credentials"
+	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/risk"
 )
@@ -18,7 +20,7 @@ func newScore(agentRef string, value float64) risk.Score {
 
 func TestObserve_BelowFlagThreshold_NoActionNoAudit(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 
 	action, err := m.Observe(context.Background(), newScore("agent:billing", 1), "")
 	if err != nil {
@@ -35,7 +37,7 @@ func TestObserve_BelowFlagThreshold_NoActionNoAudit(t *testing.T) {
 
 func TestObserve_FlagThreshold_AuditedNoEnforcement(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 
 	action, err := m.Observe(context.Background(), newScore("agent:billing", 5), "")
 	if err != nil {
@@ -55,7 +57,7 @@ func TestObserve_KillThreshold_CallsPolicyKillAndAudits(t *testing.T) {
 	pol := policy.NewInMemoryClient()
 	ctx := context.Background()
 
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, pol, nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, pol, nil, nil, sink)
 	action, err := m.Observe(ctx, newScore("agent:billing", 20), "INC-001")
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
@@ -72,7 +74,7 @@ func TestObserve_KillThreshold_CallsPolicyKillAndAudits(t *testing.T) {
 
 func TestObserve_RevokeThreshold_NoCredentialStoreConfigured_IsANoOpButAudited(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 
 	action, err := m.Observe(context.Background(), newScore("agent:billing", 10), "")
 	if err != nil {
@@ -111,7 +113,7 @@ func TestObserve_RevokeThreshold_RevokesOnlyActiveCredentialsForThatAgent(t *tes
 		t.Fatalf("Issue: %v", err)
 	}
 
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), store, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), store, nil, sink)
 	action, err := m.Observe(ctx, newScore("agent:billing", 10), "INC-002")
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
@@ -144,7 +146,7 @@ func TestObserve_RevokeThreshold_RevokesOnlyActiveCredentialsForThatAgent(t *tes
 
 func TestObserve_RiskAccumulatesAcrossCalls_CrossesThresholdOnTheThirdCall(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
 	for i, want := range []Action{ActionNone, ActionNone, ActionFlag} {
@@ -163,7 +165,7 @@ func TestObserve_RiskAccumulatesAcrossCalls_CrossesThresholdOnTheThirdCall(t *te
 
 func TestObserve_RiskAccumulationIsPerAgent(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
 	if _, err := m.Observe(ctx, newScore("agent:billing", 4), ""); err != nil {
@@ -186,7 +188,7 @@ func TestObserve_RiskAccumulationIsPerAgent(t *testing.T) {
 
 func TestObserve_KillResetsCumulativeRisk(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
 	if _, err := m.Observe(ctx, newScore("agent:billing", 20), "INC-003"); err != nil {
@@ -199,7 +201,7 @@ func TestObserve_KillResetsCumulativeRisk(t *testing.T) {
 
 func TestObserve_RevokeDoesNotResetCumulativeRisk(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
 	if _, err := m.Observe(ctx, newScore("agent:billing", 10), ""); err != nil {
@@ -212,7 +214,7 @@ func TestObserve_RevokeDoesNotResetCumulativeRisk(t *testing.T) {
 
 func TestObserve_RiskAccumulationIsRaceSafe(t *testing.T) {
 	sink := audit.NewInMemorySink(1000)
-	m := NewMonitor(Threshold{FlagAt: 1_000_000, RevokeAt: 2_000_000, KillAt: 3_000_000}, policy.NewInMemoryClient(), nil, sink)
+	m := NewMonitor(Threshold{FlagAt: 1_000_000, RevokeAt: 2_000_000, KillAt: 3_000_000}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
 	const n = 50
@@ -236,7 +238,7 @@ func TestObserve_RiskAccumulationIsRaceSafe(t *testing.T) {
 func TestObserve_RevokeThreshold_NoActiveCredentials_StillAuditsWithZeroCount(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
 	store := credentials.NewInMemoryStore()
-	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), store, sink)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), store, nil, sink)
 
 	action, err := m.Observe(context.Background(), newScore("agent:billing", 10), "")
 	if err != nil {
@@ -250,3 +252,135 @@ func TestObserve_RevokeThreshold_NoActiveCredentials_StillAuditsWithZeroCount(t 
 		t.Fatalf("got %v, want exactly one monitoring.revoke event", events)
 	}
 }
+
+func TestObserve_NoIncidentStoreConfigured_StillWorksAndStillAudits(t *testing.T) {
+	// The default test Monitor (used by every test above this one)
+	// leaves incidents nil. If Observe dereferenced it without a
+	// nil-check, this would panic, so this also stands in as a
+	// regression guard for that, the same role
+	// TestHandleToolCall_MonitoringNotConfigured_OnlyGatewayAllowedIsAudited
+	// plays for the gateway's own nil-monitor check.
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
+
+	action, err := m.Observe(context.Background(), newScore("agent:billing", 5), "")
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if action != ActionFlag {
+		t.Fatalf("action = %q, want flag", action)
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 1 || events[0].Action != "monitoring.flag" {
+		t.Fatalf("got %v, want exactly one monitoring.flag event even with no incident store configured", events)
+	}
+}
+
+func TestObserve_BelowFlagThreshold_NoIncidentCreated(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	incidents := incident.NewInMemoryStore()
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, incidents, sink)
+
+	if _, err := m.Observe(context.Background(), newScore("agent:billing", 1), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	got, _ := incidents.List(context.Background(), "", 0)
+	if len(got) != 0 {
+		t.Fatalf("got %v, want no incident record for a below-threshold score", got)
+	}
+}
+
+func TestObserve_FlagThreshold_CreatesIncidentRecord(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	incidents := incident.NewInMemoryStore()
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, incidents, sink)
+
+	score := risk.Score{AgentRef: "agent:billing", Value: 5, Signals: []risk.Signal{{Name: "novel_tool", Weight: 5}}}
+	action, err := m.Observe(context.Background(), score, "auto-risk-1")
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if action != ActionFlag {
+		t.Fatalf("action = %q, want flag", action)
+	}
+
+	got, err := incidents.List(context.Background(), "agent:billing", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d incidents, want 1", len(got))
+	}
+	in := got[0]
+	if in.ID == "" {
+		t.Fatal("incident has no ID")
+	}
+	if in.AgentRef != "agent:billing" || in.IncidentRef != "auto-risk-1" || in.Action != "flag" {
+		t.Fatalf("got %+v, want AgentRef=agent:billing IncidentRef=auto-risk-1 Action=flag", in)
+	}
+	if in.RiskValue != 5 || in.Cumulative != 5 {
+		t.Fatalf("got RiskValue=%v Cumulative=%v, want both 5, this is the first and only call", in.RiskValue, in.Cumulative)
+	}
+	if len(in.Signals) != 1 || in.Signals[0].Name != "novel_tool" {
+		t.Fatalf("got signals %v, want the novel_tool signal carried through from the score", in.Signals)
+	}
+	if in.Reason == "" {
+		t.Fatal("incident has no Reason")
+	}
+}
+
+func TestObserve_KillThreshold_IncidentReportsCumulativeAtTimeOfKill(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	incidents := incident.NewInMemoryStore()
+	pol := policy.NewInMemoryClient()
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, pol, nil, incidents, sink)
+	ctx := context.Background()
+
+	m.Observe(ctx, newScore("agent:billing", 15), "")
+	if _, err := m.Observe(ctx, newScore("agent:billing", 15), "INC-009"); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+
+	got, err := incidents.List(ctx, "agent:billing", 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d incidents, want 2, one per call that crossed a threshold", len(got))
+	}
+	last := got[len(got)-1]
+	if last.Action != "kill" || last.Cumulative != 30 {
+		t.Fatalf("got %+v, want the second incident to report Action=kill Cumulative=30 (15+15 before the kill reset the running total)", last)
+	}
+}
+
+func TestObserve_IncidentCreateError_StillCompletesAndAudits(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, failingIncidentStore{}, sink)
+
+	action, err := m.Observe(context.Background(), newScore("agent:billing", 5), "")
+	if err != nil {
+		t.Fatalf("Observe: %v, an incident-recording failure should not fail the containment decision itself", err)
+	}
+	if action != ActionFlag {
+		t.Fatalf("action = %q, want flag", action)
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 1 || events[0].Action != "monitoring.flag" {
+		t.Fatalf("got %v, want the audit event to still be written despite the incident store failing", events)
+	}
+}
+
+type failingIncidentStore struct{}
+
+func (failingIncidentStore) Create(context.Context, incident.Incident) (incident.Incident, error) {
+	return incident.Incident{}, errIncidentStoreDown
+}
+func (failingIncidentStore) Get(context.Context, string) (incident.Incident, error) {
+	return incident.Incident{}, errIncidentStoreDown
+}
+func (failingIncidentStore) List(context.Context, string, int) ([]incident.Incident, error) {
+	return nil, errIncidentStoreDown
+}
+
+var errIncidentStoreDown = fmt.Errorf("incident store unavailable")

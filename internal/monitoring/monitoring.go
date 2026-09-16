@@ -14,6 +14,7 @@ import (
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/credentials"
+	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/risk"
 )
@@ -62,6 +63,7 @@ type Monitor struct {
 	thresholds Threshold
 	policy     policy.Client
 	creds      credentials.Store // optional, nil means ActionRevoke is a documented no-op, see revokeCredentials
+	incidents  incident.Store    // optional, nil means no structured incident record is created, only the audit event
 	audit      audit.Sink
 
 	mu         sync.Mutex
@@ -73,9 +75,13 @@ type Monitor struct {
 // (cmd/gateway doesn't have one today, see cmd/gateway's own doc
 // comment) still gets flag and kill behavior, ActionRevoke degrades to
 // a no-op that says so in its own audit detail rather than silently
-// pretending to have revoked something.
-func NewMonitor(t Threshold, p policy.Client, creds credentials.Store, a audit.Sink) *Monitor {
-	return &Monitor{thresholds: t, policy: p, creds: creds, audit: a, cumulative: make(map[string]float64)}
+// pretending to have revoked something. incidents may also be nil: a
+// deployment that hasn't wired an incident.Store in still gets the
+// audit event Observe always writes, it just doesn't get a structured
+// Incident record alongside it, see this file's own package doc comment
+// on why the two are different things.
+func NewMonitor(t Threshold, p policy.Client, creds credentials.Store, incidents incident.Store, a audit.Sink) *Monitor {
+	return &Monitor{thresholds: t, policy: p, creds: creds, incidents: incidents, audit: a, cumulative: make(map[string]float64)}
 }
 
 // CumulativeRisk returns the current running total for an agent, 0 if
@@ -108,8 +114,12 @@ func (m *Monitor) resetCumulative(agentRef string) {
 
 // Observe takes a risk score and decides + executes a response. Returns
 // the action taken so the caller (typically the gateway's request loop)
-// can log or surface it.
-func (m *Monitor) Observe(ctx context.Context, score risk.Score, incident string) (Action, error) {
+// can log or surface it. incidentRef is the caller-supplied correlator,
+// an operator's "INC-001" on a manual kill or the gateway's own
+// "auto-risk-<nanos>", it's carried into both the audit event and, when
+// this Monitor has an incident.Store configured, the structured
+// Incident record Observe creates for any action beyond ActionNone.
+func (m *Monitor) Observe(ctx context.Context, score risk.Score, incidentRef string) (Action, error) {
 	total := m.accumulate(score.AgentRef, score.Value)
 
 	action := ActionNone
@@ -127,7 +137,7 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incident string
 	detail := fmt.Sprintf("cumulative risk %.0f crossed threshold", total)
 	switch action {
 	case ActionKill:
-		if _, err := m.policy.Kill(ctx, score.AgentRef, incident, "monitoring"); err != nil {
+		if _, err := m.policy.Kill(ctx, score.AgentRef, incidentRef, "monitoring"); err != nil {
 			return action, err
 		}
 		// A kill is the one action that actually changes the agent's
@@ -136,7 +146,7 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incident string
 		// forever, see this type's own doc comment.
 		m.resetCumulative(score.AgentRef)
 	case ActionRevoke:
-		revoked, configured, err := m.revokeCredentials(ctx, score.AgentRef, incident)
+		revoked, configured, err := m.revokeCredentials(ctx, score.AgentRef, incidentRef)
 		if err != nil {
 			return action, err
 		}
@@ -150,11 +160,32 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incident string
 		}
 	}
 
+	// The structured record, not just the audit line. A failure here is
+	// logged into the audit detail rather than failing Observe outright,
+	// same posture as everything else in this function: the containment
+	// action itself already happened (or was already decided not to
+	// revoke anything), a record-keeping failure alongside it is a
+	// separate concern from whether the response executed.
+	if m.incidents != nil {
+		if _, err := m.incidents.Create(ctx, incident.Incident{
+			AgentRef:    score.AgentRef,
+			IncidentRef: incidentRef,
+			Action:      string(action),
+			RiskValue:   score.Value,
+			Cumulative:  total,
+			Signals:     score.Signals,
+			Reason:      detail,
+			CreatedAt:   time.Now(),
+		}); err != nil {
+			detail = detail + fmt.Sprintf(" (incident record not saved: %v)", err)
+		}
+	}
+
 	return action, m.audit.Append(ctx, audit.Event{
 		Action:   "monitoring." + string(action),
 		AgentRef: score.AgentRef,
 		Operator: "monitoring",
-		Incident: incident,
+		Incident: incidentRef,
 		Detail:   detail,
 		At:       time.Now(),
 	})
@@ -170,7 +201,7 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incident string
 // wired in, so a caller building the audit detail can tell "revoked
 // zero because none were active" apart from "couldn't revoke anything,
 // nothing to revoke against."
-func (m *Monitor) revokeCredentials(ctx context.Context, agentRef, incident string) (revoked int, configured bool, err error) {
+func (m *Monitor) revokeCredentials(ctx context.Context, agentRef, incidentRef string) (revoked int, configured bool, err error) {
 	if m.creds == nil {
 		return 0, false, nil
 	}
@@ -182,7 +213,7 @@ func (m *Monitor) revokeCredentials(ctx context.Context, agentRef, incident stri
 		if c.Status != credentials.StatusActive {
 			continue
 		}
-		if err := m.creds.Revoke(ctx, c.ID, "monitoring", "risk score crossed the revoke threshold ("+incident+")"); err != nil {
+		if err := m.creds.Revoke(ctx, c.ID, "monitoring", "risk score crossed the revoke threshold ("+incidentRef+")"); err != nil {
 			return revoked, true, err
 		}
 		revoked++

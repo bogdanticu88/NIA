@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
+	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -105,16 +106,19 @@ func (f fakeScorer) Score(_ context.Context, call risk.CallContext) (risk.Score,
 // fake) sharing the gateway's own audit sink, the same way main() wires
 // them, so these tests exercise the real handoff between the gateway's
 // scoring step and internal/monitoring's own decision logic rather than
-// asserting against a mock of it.
+// asserting against a mock of it. It also wires a real incident.Store,
+// same reason.
 func newTestGatewayWithMonitoring(pol policy.Client, scorer risk.Scorer, thresholds monitoring.Threshold) (*gateway, *audit.InMemorySink) {
 	sink := audit.NewInMemorySink(10)
-	monitor := monitoring.NewMonitor(thresholds, pol, nil, sink)
+	incidents := incident.NewInMemoryStore()
+	monitor := monitoring.NewMonitor(thresholds, pol, nil, incidents, sink)
 	g := &gateway{
-		resolver: headerResolver{headerName: "X-Agent-Ref"},
-		pol:      pol,
-		scorer:   scorer,
-		monitor:  monitor,
-		auditLog: sink,
+		resolver:  headerResolver{headerName: "X-Agent-Ref"},
+		pol:       pol,
+		scorer:    scorer,
+		monitor:   monitor,
+		incidents: incidents,
+		auditLog:  sink,
 	}
 	return g, sink
 }
@@ -391,6 +395,98 @@ func TestHandleToolCall_MonitoringConfigured_ResponseReportsKillAction(t *testin
 	}
 	if action, _ := risk["action"].(string); action != "kill" {
 		t.Fatalf("risk.action = %v, want kill", risk["action"])
+	}
+}
+
+// doGet routes a GET request through the gateway's real mux, so
+// {tool}/{id} path values are populated by http.ServeMux's own pattern
+// matching rather than set by hand.
+func doGet(g *gateway, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	g.routes().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestHandleListIncidents_NotConfigured_ReturnsEmptyArray(t *testing.T) {
+	g, _ := newTestGateway(&fakePolicyClient{allowed: true})
+
+	rec := doGet(g, "/incidents")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %v, want an empty array when monitoring isn't configured", got)
+	}
+}
+
+func TestHandleGetIncident_NotConfigured_404(t *testing.T) {
+	g, _ := newTestGateway(&fakePolicyClient{allowed: true})
+
+	rec := doGet(g, "/incidents/inc-does-not-exist")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleListIncidents_MonitoringConfigured_ReturnsCreatedIncident(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, _ := newTestGatewayWithMonitoring(pol, fakeScorer{value: 100}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	doToolCall(g, "agent:billing-reconciler", "invoices.read")
+
+	rec := doGet(g, "/incidents")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d incidents, want 1", len(got))
+	}
+	if got[0]["agent_ref"] != "agent:billing-reconciler" && got[0]["AgentRef"] != "agent:billing-reconciler" {
+		t.Fatalf("got %v, want the kill-triggering call's agent", got[0])
+	}
+}
+
+func TestHandleGetIncident_ReturnsWhatWasCreated(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, _ := newTestGatewayWithMonitoring(pol, fakeScorer{value: 100}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	listRec := doGet(g, "/incidents")
+	var list []map[string]any
+	json.Unmarshal(listRec.Body.Bytes(), &list)
+	if len(list) != 1 {
+		t.Fatalf("got %d incidents from the list, want 1", len(list))
+	}
+	id, _ := list[0]["id"].(string)
+	if id == "" {
+		id, _ = list[0]["ID"].(string)
+	}
+	if id == "" {
+		t.Fatalf("could not find an id field in %v", list[0])
+	}
+
+	rec := doGet(g, "/incidents/"+id)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleGetIncident_UnknownID_404(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, _ := newTestGatewayWithMonitoring(pol, fakeScorer{value: 100}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doGet(g, "/incidents/inc-does-not-exist")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -50,13 +50,15 @@ What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `lin
 
 - `niactl simulate attack -scenario agent-hijack` is new: a deterministic attack simulation that drives the real pipeline end to end, agent registration, tool registration, grants, then a scripted sequence of real gateway calls, not printed output standing in for one. The scenario models an invoice-processing agent with broader tool access than its normal work ever uses (a realistic over-privileged setup), escalates through tools it's authorized for but has never called (what `HistoryScorer`'s `novel_tool` and risk-class signals exist to catch), gets a real 403 on a `database.query` call touching `customers.ssn` (deliberately left ungranted at the data level, proving the Agent+Tool+Resource decision from the argument-inspection work above), and, when the gateway is started with risk thresholds set low enough, shows an actual kill mid-sequence: a tool the agent successfully called earlier in the same run gets denied later on, because `policy.Check` now reads the kill sentinel, not because the request changed. See "Attack simulation" in `docs/ARCHITECTURE.md`. Verified with `go test ./... -race`: a scenario well-formedness check (every tool a step or grant names is actually registered), unit tests on the transcript-printing functions, and an integration test that drives `runScenario` against fake `cmd/api` and `cmd/gateway` HTTP servers and asserts on the actual call sequence and containment detection.
 
+- `internal/incident` is new: a structured record for every flag, revoke, or kill `internal/monitoring.Monitor` actually decides on, not just the audit trail's free-text line. Each record carries the agent, the correlator string, the action taken, the risk value and signals that triggered it, and the cumulative total at that moment, one record per containment decision rather than something reconstructed later by grepping audit events for a shared incident string. Records are created inside `internal/monitoring`, which only runs in `cmd/gateway`, so that's also where they're read back from, `GET /incidents` (`?ref=`, `?limit=`) and `GET /incidents/{id}`, not `cmd/api`; `niactl incident list` / `get` talk to the gateway's own address for exactly that reason, same as `gateway call` and `simulate attack` already do. This deliberately doesn't carry a blast-radius snapshot yet, the identity graph isn't populated automatically from what's already known elsewhere, so a snapshot taken today would be empty for most agents, see `docs/ARCHITECTURE.md`'s "Structured incident evidence" section for the honest reasoning and the open gaps (no blast-radius snapshot, no shared backend across gateway replicas, unlike `internal/audit`'s `PostgresSink`). Verified with `go test ./... -race`: seven tests on `InMemoryStore` (assignment, lookup, per-agent filtering, limit, empty store), and new `internal/monitoring` and `cmd/gateway` tests covering record creation on flag/kill, the cumulative value at the moment of a kill, an incident-store failure not blocking the containment decision itself, and the gateway's `GET /incidents` / `GET /incidents/{id}` handlers both configured and not.
+
 ## Layout
 
 ```
 cmd/api        control-plane API: registration, inventory, credentials, grants, kill switch
 cmd/gateway    Agent/MCP gateway: the hot path, resolve -> check -> forward
 cmd/niactl     operator CLI, talks to cmd/api over HTTP (and cmd/gateway directly for gateway call / simulate attack)
-internal/      identity, registry, credentials, policy, audit, risk, monitoring, graph
+internal/      identity, registry, credentials, policy, audit, risk, monitoring, incident, graph
 deployments/   Dockerfiles, docker-compose, and the OpenFGA store/model bootstrap for local dev
 docs/          architecture and data model
 ```
@@ -113,6 +115,10 @@ go run ./cmd/niactl gateway call -ref agent:billing-reconciler -tool invoice-loo
 # and, if the gateway was started with NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT
 # set low enough, a real kill partway through and a real denial on the next call
 go run ./cmd/niactl simulate attack -scenario agent-hijack
+
+# review the structured incident records that scenario's containment decisions created
+# (only meaningful if the gateway had risk thresholds set, see above)
+go run ./cmd/niactl incident list -ref agent:invoice-agent
 ```
 
 The commands above run against the in-memory policy client, no Tessera, OpenFGA, or Postgres required. To point `cmd/api` and `cmd/gateway` at a real Tessera instance instead, set three environment variables before starting them: `NIA_TESSERA_BASE_URL` (Tessera.Service's URL), `NIA_TESSERA_JWT_SIGNING_KEY` (base64, the exact same value Tessera.Service was started with as `TESSERA_JWT_SIGNING_KEY`), and, only if Tessera isn't running with its own defaults, `NIA_TESSERA_JWT_ISSUER` / `NIA_TESSERA_JWT_AUDIENCE`. See `internal/policy/from_env.go` for the full list and defaults.

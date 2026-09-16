@@ -55,6 +55,8 @@ Usage:
   niactl grant list -ref <agent_ref>
   niactl gateway call -ref <agent_ref> -tool <tool_name> [-arguments '<json object>']
   niactl simulate attack -scenario <agent-hijack>
+  niactl incident list [-ref <agent_ref>] [-limit <n>]
+  niactl incident get -id <incident_id>
 
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
@@ -113,9 +115,20 @@ twice is safe, though a prior run's kill or accumulated risk carries
 forward since there is no reset endpoint yet. Currently one scenario,
 agent-hijack, see cmd/niactl/simulate.go for the full step-by-step script.
 
+incident list/get read internal/incident's structured containment records,
+not the audit trail, one record per flag/revoke/kill decision monitoring
+actually made, with the risk value and signals that triggered it and the
+cumulative total at that moment, see docs/ARCHITECTURE.md's "Attack
+simulation" section for how this differs from audit's free-text incident
+string. These talk to the gateway, not the control-plane API, because the
+records are created there, alongside the monitor that decides to make
+them; an empty list or a 404 on get most often just means monitoring was
+never configured on that gateway (NIA_RISK_FLAG_AT and friends unset), not
+that the request failed.
+
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080)
-except gateway call and simulate attack, which also talk to the gateway
-(NIA_GATEWAY_URL, default http://localhost:8081).`)
+except gateway call, simulate attack, and incident list/get, which talk to
+the gateway instead (NIA_GATEWAY_URL, default http://localhost:8081).`)
 }
 
 func main() {
@@ -145,6 +158,8 @@ func main() {
 		cmdGateway(os.Args[2:])
 	case "simulate":
 		cmdSimulate(os.Args[2:])
+	case "incident":
+		cmdIncident(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -237,6 +252,54 @@ func cmdGateway(args []string) {
 		usage()
 		os.Exit(1)
 	}
+}
+
+func cmdIncident(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "list":
+		cmdIncidentList(args[1:])
+	case "get":
+		cmdIncidentGet(args[1:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdIncidentList(args []string) {
+	fs := flag.NewFlagSet("incident list", flag.ExitOnError)
+	ref := fs.String("ref", "", "show only incidents for this agent ref, omitted means every agent")
+	limit := fs.Int("limit", 0, "max incidents to show, 0 means everything on record")
+	_ = fs.Parse(args)
+
+	path := "/incidents"
+	q := url.Values{}
+	if *ref != "" {
+		q.Set("ref", *ref)
+	}
+	if *limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", *limit))
+	}
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	getGateway(path)
+}
+
+func cmdIncidentGet(args []string) {
+	fs := flag.NewFlagSet("incident get", flag.ExitOnError)
+	id := fs.String("id", "", "incident id, as returned by incident list")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "incident get: -id is required")
+		os.Exit(1)
+	}
+	getGateway("/incidents/" + url.PathEscape(*id))
 }
 
 func cmdRegister(args []string) {
@@ -604,6 +667,21 @@ func post(path string, body []byte) {
 
 func get(path string) {
 	resp, err := http.Get(apiAddr() + path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	printResponse(resp)
+}
+
+// getGateway is get's twin for the handful of read endpoints that live
+// on the gateway rather than the control-plane API, today just
+// /incidents and /incidents/{id}, see internal/incident's own doc
+// comment for why those records are created (and so read back) from
+// cmd/gateway's own process rather than cmd/api's.
+func getGateway(path string) {
+	resp, err := http.Get(gatewayAddr() + path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
 		os.Exit(1)
