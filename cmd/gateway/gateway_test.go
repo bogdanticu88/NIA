@@ -6,22 +6,29 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
+	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
+	"github.com/bogdanticu88/nia/internal/risk"
 )
 
 // fakePolicyClient lets a test force Check to return a specific answer
-// or error without going through InMemoryClient's grant bookkeeping.
-// Every other method panics if called, the gateway's tool-call path
-// never reaches them. calls counts invocations so a test can assert
-// the catalog check short-circuited before Check was ever reached.
+// or error without going through InMemoryClient's grant bookkeeping,
+// and records a Kill so a monitoring-triggered kill can be asserted on
+// without needing a real policy backend. Every other method still
+// panics if called, nothing in the gateway's tool-call path, including
+// the monitoring hookup, reaches them. calls counts Check invocations
+// so a test can assert the catalog check short-circuited before Check
+// was ever reached.
 type fakePolicyClient struct {
 	policy.Client
-	allowed  bool
-	checkErr error
-	calls    int
+	allowed   bool
+	checkErr  error
+	calls     int
+	killedRef string
 }
 
 func (f *fakePolicyClient) Check(context.Context, string, policy.Grant) (bool, error) {
@@ -30,6 +37,11 @@ func (f *fakePolicyClient) Check(context.Context, string, policy.Grant) (bool, e
 		return false, f.checkErr
 	}
 	return f.allowed, nil
+}
+
+func (f *fakePolicyClient) Kill(_ context.Context, agentRef, _, _ string) (policy.KillResult, error) {
+	f.killedRef = agentRef
+	return policy.KillResult{AgentRef: agentRef}, nil
 }
 
 // fakeToolReader lets a test force a catalog lookup to succeed, come
@@ -66,6 +78,34 @@ func newTestGateway(pol policy.Client) (*gateway, *audit.InMemorySink) {
 func newTestGatewayWithCatalog(pol policy.Client, toolCat tools.Reader) (*gateway, *audit.InMemorySink) {
 	g, sink := newTestGateway(pol)
 	g.toolCat = toolCat
+	return g, sink
+}
+
+// fakeScorer returns a fixed score for every call, so a test can put an
+// allowed call on either side of a monitoring threshold deterministically.
+type fakeScorer struct {
+	value float64
+}
+
+func (f fakeScorer) Score(_ context.Context, call risk.CallContext) (risk.Score, error) {
+	return risk.Score{AgentRef: call.AgentRef, Value: f.value, ScoredAt: time.Now()}, nil
+}
+
+// newTestGatewayWithMonitoring wires a real monitoring.Monitor (not a
+// fake) sharing the gateway's own audit sink, the same way main() wires
+// them, so these tests exercise the real handoff between the gateway's
+// scoring step and internal/monitoring's own decision logic rather than
+// asserting against a mock of it.
+func newTestGatewayWithMonitoring(pol policy.Client, scorer risk.Scorer, thresholds monitoring.Threshold) (*gateway, *audit.InMemorySink) {
+	sink := audit.NewInMemorySink(10)
+	monitor := monitoring.NewMonitor(thresholds, pol, nil, sink)
+	g := &gateway{
+		resolver: headerResolver{headerName: "X-Agent-Ref"},
+		pol:      pol,
+		scorer:   scorer,
+		monitor:  monitor,
+		auditLog: sink,
+	}
 	return g, sink
 }
 
@@ -200,5 +240,67 @@ func TestHandleToolCall_ToolLookupErrorIsAudited(t *testing.T) {
 	events, _ := sink.Recent(context.Background(), 10)
 	if len(events) != 1 || events[0].Action != "gateway.tool_lookup_error" {
 		t.Fatalf("got %v, want exactly one gateway.tool_lookup_error event", events)
+	}
+}
+
+func TestHandleToolCall_MonitoringNotConfigured_OnlyGatewayAllowedIsAudited(t *testing.T) {
+	// The default test gateway (used by every test above this one)
+	// leaves scorer and monitor both nil. If g.observe were reached
+	// without a monitor nil-check, this would panic on a nil interface
+	// call, so this also stands in as a regression guard for that.
+	g, sink := newTestGateway(&fakePolicyClient{allowed: true})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 1 || events[0].Action != "gateway.allowed" {
+		t.Fatalf("got %v, want only gateway.allowed when monitoring isn't configured", events)
+	}
+}
+
+func TestHandleToolCall_AllowedCallBelowEveryThreshold_NoMonitoringAction(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, sink := newTestGatewayWithMonitoring(pol, fakeScorer{value: 0}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 1 || events[0].Action != "gateway.allowed" {
+		t.Fatalf("got %v, want only gateway.allowed, the score is below every threshold", events)
+	}
+}
+
+func TestHandleToolCall_AllowedCallCrossingKillThreshold_TriggersMonitoringKill(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, sink := newTestGatewayWithMonitoring(pol, fakeScorer{value: 100}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, the call itself was legitimately allowed: %s", rec.Code, rec.Body.String())
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 2 || events[0].Action != "gateway.allowed" || events[1].Action != "monitoring.kill" {
+		t.Fatalf("got %v, want gateway.allowed followed by monitoring.kill", events)
+	}
+	if pol.killedRef != "agent:billing-reconciler" {
+		t.Fatalf("policy Kill was called with ref %q, want agent:billing-reconciler", pol.killedRef)
+	}
+}
+
+func TestHandleToolCall_AllowedCallCrossingFlagThreshold_TriggersMonitoringFlag(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, sink := newTestGatewayWithMonitoring(pol, fakeScorer{value: 5}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 2 || events[0].Action != "gateway.allowed" || events[1].Action != "monitoring.flag" {
+		t.Fatalf("got %v, want gateway.allowed followed by monitoring.flag", events)
 	}
 }

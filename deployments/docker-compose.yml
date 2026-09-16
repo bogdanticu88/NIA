@@ -75,6 +75,16 @@
 # audit trail sequence above was, that's still open, add it to the
 # next full stack run rather than assuming it behaves like the
 # unit-tested version against a fake server.
+#
+# NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT turn on
+# risk-based monitoring in nia-gateway, see internal/monitoring and
+# internal/risk.HistoryScorer. Deliberately not set here: nia-gateway
+# has no credential store wired into it yet, so a revoke threshold
+# would only ever degrade to an audited no-op, and turning on a kill
+# threshold in the shared dev stack by default is the kind of surprise
+# ("why did my agent just get killed") this file shouldn't spring on
+# someone who didn't opt into it. Add the three variables to
+# nia-gateway's environment block below to try it locally.
 services:
   nia-api:
     build:

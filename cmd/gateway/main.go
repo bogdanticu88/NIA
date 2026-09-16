@@ -28,6 +28,19 @@
 // Every decision this makes, allow, deny, or a check that errored
 // outright, also goes to internal/audit, that's the second half of what
 // audit's package doc means by "aggregates events from the gateway."
+//
+// An allowed call doesn't stop there either. When NIA_RISK_FLAG_AT,
+// NIA_RISK_REVOKE_AT, or NIA_RISK_KILL_AT is set, every allowed call is
+// scored (internal/risk.HistoryScorer, sharing the same tool catalog
+// reader the enforcement step above uses) and handed to
+// internal/monitoring, which flags, revokes the agent's credentials, or
+// kills it outright if the score crosses a threshold. None of the
+// three set means monitoring is skipped entirely, same additive
+// posture as the catalog check: nothing that worked before this
+// existed stops working. A monitoring failure (the kill or revoke
+// itself erroring) is audited and logged, not turned into a failed
+// response, the call itself was already legitimately authorized before
+// monitoring ever ran, see risk.CallContext's own doc comment.
 package main
 
 import (
@@ -41,8 +54,10 @@ import (
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/identity"
+	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
+	"github.com/bogdanticu88/nia/internal/risk"
 	niahttp "github.com/bogdanticu88/nia/internal/transport/http"
 )
 
@@ -67,7 +82,9 @@ func (h headerResolver) Resolve(ctx identity.ResolveContext) (*identity.Resolved
 type gateway struct {
 	resolver identity.Resolver
 	pol      policy.Client
-	toolCat  tools.Reader // nil means catalog enforcement is not configured, see FromEnvReader
+	toolCat  tools.Reader        // nil means catalog enforcement is not configured, see FromEnvReader
+	scorer   risk.Scorer         // nil means monitoring is not configured, kept nil together with monitor
+	monitor  *monitoring.Monitor // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
 	auditLog audit.Sink
 }
 
@@ -128,15 +145,39 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 
+	if g.monitor != nil {
+		g.observe(ctx, resolved.Ref, tool)
+	}
+
 	// A real deployment forwards the request to the tool's actual
-	// transport (MCP, HTTP, gRPC) here, and hands the response through
-	// internal/monitoring for scoring before returning it. Left as the
-	// integration point rather than stubbed with a fake tool response.
+	// transport (MCP, HTTP, gRPC) here. Left as the integration point
+	// rather than stubbed with a fake tool response.
 	niahttp.WriteJSON(w, http.StatusOK, map[string]string{
 		"agent":  resolved.Ref,
 		"tool":   tool,
 		"status": "allowed",
 	})
+}
+
+// observe scores an already-allowed call and lets internal/monitoring
+// act on it. Errors here are audited and logged, not turned into a
+// failed response: the call was legitimately authorized before this
+// ever ran, a monitoring-side failure (the kill or revoke call itself
+// erroring) is a separate incident from whether this request should
+// have gone through.
+func (g *gateway) observe(ctx context.Context, agentRef, tool string) {
+	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now()})
+	if err != nil {
+		g.audit(ctx, "gateway.scoring_error", agentRef, fmt.Sprintf("tool=%s err=%v", tool, err))
+		log.Printf("nia-gateway: scoring failed for %s on %s: %v", agentRef, tool, err)
+		return
+	}
+
+	incident := fmt.Sprintf("auto-risk-%d", time.Now().UnixNano())
+	if _, err := g.monitor.Observe(ctx, score, incident); err != nil {
+		g.audit(ctx, "gateway.monitoring_error", agentRef, fmt.Sprintf("tool=%s incident=%s err=%v", tool, incident, err))
+		log.Printf("nia-gateway: monitoring action failed for %s on %s: %v", agentRef, tool, err)
+	}
 }
 
 // audit records one gateway decision. It never resolved caller
@@ -210,10 +251,31 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 
+	// monitoring.ThresholdsFromEnv: none of NIA_RISK_FLAG_AT,
+	// NIA_RISK_REVOKE_AT, or NIA_RISK_KILL_AT set means monitoring is
+	// skipped entirely, scorer and monitor both stay nil, see this
+	// file's own package doc comment above for why a zero-value
+	// Threshold is never used as the "off" state. credentials.Store is
+	// not wired into this process, so a configured revoke threshold
+	// still works, ActionRevoke degrades to an audited no-op, see
+	// monitoring.Monitor's own doc comment on NewMonitor.
+	var scorer risk.Scorer
+	var monitor *monitoring.Monitor
+	thresholds, monitoringConfigured, err := monitoring.ThresholdsFromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+	if monitoringConfigured {
+		scorer = risk.NewHistoryScorer(toolCat, risk.DefaultWeights())
+		monitor = monitoring.NewMonitor(thresholds, pol, nil, auditLog)
+	}
+
 	g := &gateway{
 		resolver: headerResolver{headerName: "X-Agent-Ref"},
 		pol:      pol,
 		toolCat:  toolCat,
+		scorer:   scorer,
+		monitor:  monitor,
 		auditLog: auditLog,
 	}
 
