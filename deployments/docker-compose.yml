@@ -59,11 +59,12 @@
 # to actually be one shared stream instead of two, hardcoded rather
 # than an env var like the JWT signing key above because it isn't a
 # secret, just the fixed local-dev credentials already set on the
-# postgres service below. Unlike everything else in this file's
-# comments, this piece has NOT yet been run against this stack, only
-# unit-tested and smoke-tested against a live standalone postgres, see
-# README.md's Status section for exactly what has and hasn't been
-# confirmed here.
+# postgres service below. This has been run against this exact stack:
+# registered an agent through nia-api, denied a gateway call against
+# it, killed it, then read nia-api's own audit endpoint back and saw
+# all three events together, in order, proof the two processes
+# actually share the table rather than each keeping its own history.
+# See README.md's Status section for the full sequence.
 services:
   nia-api:
     build:
