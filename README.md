@@ -1,7 +1,6 @@
 # NIA: Non-Human Identity & Agent Security
 
 [![CI](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml/badge.svg)](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/bogdanticu88/nia)](https://goreportcard.com/report/github.com/bogdanticu88/nia)
 [![Go version](https://img.shields.io/github/go-mod/go-version/bogdanticu88/NIA)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
