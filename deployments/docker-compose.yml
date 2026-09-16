@@ -3,15 +3,20 @@
 # started side by side: nia-api and nia-gateway point at tessera,
 # tessera points at openfga, all over the compose network.
 #
-# What's actually been run: cmd/api and cmd/gateway against a real
-# Tessera.Service process over real HTTP, confirmed end to end including
-# a kill that Tessera's own state then reflected (see
-# internal/policy/tessera_client_live_test.go and docs/ARCHITECTURE.md).
-# Tessera in that run used its in-memory IAuthorizationStore, not real
-# OpenFGA. This compose file, this exact four-service graph running
-# together under Docker, has not been run in this sandbox, there is no
-# Docker daemon here. Before trusting it, run `make up` somewhere that
-# has one and watch all four come up healthy.
+# This exact four-service graph has been run, on a real Docker daemon,
+# not just written and hoped about. All five containers (this graph plus
+# postgres) came up healthy, and a client was onboarded through Tessera,
+# checked as allowed directly against OpenFGA, killed, and checked again
+# as denied, tuples actually written to and deleted from a real OpenFGA
+# store, not the in-memory one. That run caught two real bugs, both
+# fixed: IAuthorizationStore wasn't resolving through the container when
+# pointed at a real store (see the AddTypedClient commit in tessera's
+# history), and ReadTuplesForClientAsync was filtering OpenFGA's /read
+# endpoint by user alone, which OpenFGA rejects outright, it has no
+# query shape for that (see the same history, next commit). Neither
+# would have been caught by the harness tests or the earlier live test
+# against Tessera's in-memory store, only a real OpenFGA instance
+# exercises that code path.
 #
 # NIA_TESSERA_JWT_SIGNING_KEY has no default on purpose, same fail-fast
 # choice Tessera.Service itself makes for TESSERA_JWT_SIGNING_KEY (see
@@ -25,23 +30,24 @@
 #
 # OPENFGA_STORE_ID has no default either, and can't: OpenFGA doesn't
 # come preconfigured with a store, one has to be created against its API
-# after it's up (`fga store create --name tessera` with the FGA CLI, or
-# an equivalent HTTP POST to /stores), same for the authorization model.
-# That's a real manual step this compose file doesn't automate, wiring
-# it up is listed as follow-on work, not done here.
+# after it's up, same for the authorization model. That's a real step
+# this compose file still can't automate on its own (a store only gets
+# an id once OpenFGA is already running, chicken and egg), but it isn't
+# manual guesswork anymore either: bring up just postgres and openfga
+# first (`docker compose up -d postgres openfga`), then run
+# `./bootstrap-openfga.sh`, which creates the store, loads
+# openfga-model.json (the actual shape GrantTupleMapper writes, worked
+# out and confirmed against a live instance, not from documentation
+# alone), and prints the line to add to .env. Then bring up the rest.
 #
 # Healthchecks: postgres (pg_isready), tessera, nia-api, and nia-gateway
-# all have one, each hitting a `/healthz` this codebase actually defines
-# and this session confirmed responds (Tessera's directly, in this
-# sandbox, against a real running instance; NIA's the same way, through
-# cmd/api's own /healthz during the live end to end run described in
-# docs/ARCHITECTURE.md). openfga does not get one here, not because it
-# lacks a health endpoint, but because this session couldn't run a real
-# OpenFGA instance to confirm one (no Docker, and openfga.dev itself is
-# blocked from here), and a healthcheck pointed at a guessed path that's
-# wrong would block startup forever, worse than the plain depends_on
-# (container-started, not app-ready) it would replace. Add one once
-# someone can actually verify the endpoint against a running instance.
+# all have one, each hitting a `/healthz` this codebase actually defines,
+# confirmed responding in this exact stack. openfga does not get one
+# here, not because it lacks a health endpoint, but because nobody has
+# confirmed its actual path against a running instance yet, and a
+# healthcheck pointed at a guessed path that's wrong would block startup
+# forever, worse than the plain depends_on (container-started, not
+# app-ready) it would replace. Add one once someone checks.
 services:
   nia-api:
     build:
