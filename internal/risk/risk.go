@@ -40,6 +40,14 @@ type CallContext struct {
 	AgentRef string
 	Tool     string
 	At       time.Time
+
+	// Resources are the resource object names this call's arguments
+	// touched, named the same way policy.GrantForData and
+	// sensitivity.Rule name them, "customer.ssn" and so on. Left empty
+	// when the caller didn't derive any, either because the tool call
+	// had no arguments worth inspecting or because argument inspection
+	// isn't configured, see cmd/gateway's ArgumentResourcePolicy.
+	Resources []string
 }
 
 // Scorer produces a Score for a call. Implementations are expected to

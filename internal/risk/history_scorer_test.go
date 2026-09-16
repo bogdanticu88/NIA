@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bogdanticu88/nia/internal/registry/tools"
+	"github.com/bogdanticu88/nia/internal/sensitivity"
 )
 
 // fakeToolReader lets a test control what the catalog says about a
@@ -23,7 +24,7 @@ func (f fakeToolReader) Get(_ context.Context, name string) (tools.Tool, error) 
 }
 
 func TestHistoryScorer_FirstCallIsNovel(t *testing.T) {
-	s := NewHistoryScorer(nil, DefaultWeights())
+	s := NewHistoryScorer(nil, nil, DefaultWeights())
 	score, err := s.Score(context.Background(), CallContext{AgentRef: "agent:billing", Tool: "invoices.read"})
 	if err != nil {
 		t.Fatalf("Score: %v", err)
@@ -37,7 +38,7 @@ func TestHistoryScorer_FirstCallIsNovel(t *testing.T) {
 }
 
 func TestHistoryScorer_RepeatCallIsNotNovel(t *testing.T) {
-	s := NewHistoryScorer(nil, DefaultWeights())
+	s := NewHistoryScorer(nil, nil, DefaultWeights())
 	ctx := context.Background()
 	call := CallContext{AgentRef: "agent:billing", Tool: "invoices.read"}
 
@@ -54,7 +55,7 @@ func TestHistoryScorer_RepeatCallIsNotNovel(t *testing.T) {
 }
 
 func TestHistoryScorer_NoveltyIsPerAgent(t *testing.T) {
-	s := NewHistoryScorer(nil, DefaultWeights())
+	s := NewHistoryScorer(nil, nil, DefaultWeights())
 	ctx := context.Background()
 
 	if _, err := s.Score(ctx, CallContext{AgentRef: "agent:billing", Tool: "invoices.read"}); err != nil {
@@ -71,7 +72,7 @@ func TestHistoryScorer_NoveltyIsPerAgent(t *testing.T) {
 
 func TestHistoryScorer_RiskClassSignalWhenCatalogConfigured(t *testing.T) {
 	weights := DefaultWeights()
-	s := NewHistoryScorer(fakeToolReader{tool: tools.Tool{Name: "wire-transfer", RiskClass: tools.RiskDestructive}}, weights)
+	s := NewHistoryScorer(fakeToolReader{tool: tools.Tool{Name: "wire-transfer", RiskClass: tools.RiskDestructive}}, nil, weights)
 
 	score, err := s.Score(context.Background(), CallContext{AgentRef: "agent:billing", Tool: "wire-transfer"})
 	if err != nil {
@@ -88,7 +89,7 @@ func TestHistoryScorer_RiskClassSignalWhenCatalogConfigured(t *testing.T) {
 
 func TestHistoryScorer_ReadOnlyDefaultWeightContributesNothing(t *testing.T) {
 	weights := DefaultWeights()
-	s := NewHistoryScorer(fakeToolReader{tool: tools.Tool{Name: "invoices.read", RiskClass: tools.RiskReadOnly}}, weights)
+	s := NewHistoryScorer(fakeToolReader{tool: tools.Tool{Name: "invoices.read", RiskClass: tools.RiskReadOnly}}, nil, weights)
 
 	score, err := s.Score(context.Background(), CallContext{AgentRef: "agent:billing", Tool: "invoices.read"})
 	if err != nil {
@@ -101,7 +102,7 @@ func TestHistoryScorer_ReadOnlyDefaultWeightContributesNothing(t *testing.T) {
 }
 
 func TestHistoryScorer_CatalogLookupErrorIsNotScoredAndDoesNotFail(t *testing.T) {
-	s := NewHistoryScorer(fakeToolReader{err: tools.ErrNotFound}, DefaultWeights())
+	s := NewHistoryScorer(fakeToolReader{err: tools.ErrNotFound}, nil, DefaultWeights())
 
 	score, err := s.Score(context.Background(), CallContext{AgentRef: "agent:billing", Tool: "unregistered-tool"})
 	if err != nil {
@@ -114,7 +115,7 @@ func TestHistoryScorer_CatalogLookupErrorIsNotScoredAndDoesNotFail(t *testing.T)
 }
 
 func TestHistoryScorer_ConcurrentFirstCallsForSamePairOnlyCountOneNovelty(t *testing.T) {
-	s := NewHistoryScorer(nil, DefaultWeights())
+	s := NewHistoryScorer(nil, nil, DefaultWeights())
 	ctx := context.Background()
 	call := CallContext{AgentRef: "agent:billing", Tool: "invoices.read"}
 
@@ -143,6 +144,74 @@ func TestHistoryScorer_ConcurrentFirstCallsForSamePairOnlyCountOneNovelty(t *tes
 	}
 	if novelCount != 1 {
 		t.Fatalf("got %d concurrent calls scored as novel for the same (agent, tool), want exactly 1", novelCount)
+	}
+}
+
+func TestHistoryScorer_SensitiveResourceSignalWhenClassifierConfigured(t *testing.T) {
+	weights := DefaultWeights()
+	classifier := sensitivity.NewRuleClassifier([]sensitivity.Rule{
+		{Pattern: "customer.ssn", Level: sensitivity.Critical},
+	})
+	s := NewHistoryScorer(nil, classifier, weights)
+
+	score, err := s.Score(context.Background(), CallContext{
+		AgentRef:  "agent:billing",
+		Tool:      "database.query",
+		Resources: []string{"customer.name", "customer.ssn"},
+	})
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	want := weights.NovelTool + weights.SensitiveResource + weights.CriticalResource
+	if score.Value != want {
+		t.Fatalf("Value = %v, want %v (novel_tool + sensitive + critical)", score.Value, want)
+	}
+	found := false
+	for _, sig := range score.Signals {
+		if sig.Name == "sensitive_resource:critical" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("got %v, want a sensitive_resource:critical signal", score.Signals)
+	}
+}
+
+func TestHistoryScorer_ResourceBelowSensitiveThresholdContributesNothing(t *testing.T) {
+	weights := DefaultWeights()
+	classifier := sensitivity.NewRuleClassifier([]sensitivity.Rule{
+		{Pattern: "customer.name", Level: sensitivity.Internal},
+	})
+	s := NewHistoryScorer(nil, classifier, weights)
+
+	score, err := s.Score(context.Background(), CallContext{
+		AgentRef:  "agent:billing",
+		Tool:      "database.query",
+		Resources: []string{"customer.name"},
+	})
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	// Only novel_tool should show up, Internal is below the Sensitive
+	// threshold this scorer requires before it adds any weight.
+	if len(score.Signals) != 1 || score.Signals[0].Name != "novel_tool" {
+		t.Fatalf("got %v, want only novel_tool for a resource classified below Sensitive", score.Signals)
+	}
+}
+
+func TestHistoryScorer_NoClassifierConfiguredSkipsResourceSignalEntirely(t *testing.T) {
+	s := NewHistoryScorer(nil, nil, DefaultWeights())
+
+	score, err := s.Score(context.Background(), CallContext{
+		AgentRef:  "agent:billing",
+		Tool:      "database.query",
+		Resources: []string{"customer.ssn"},
+	})
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if len(score.Signals) != 1 || score.Signals[0].Name != "novel_tool" {
+		t.Fatalf("got %v, want only novel_tool when no sensitivity.Classifier is configured", score.Signals)
 	}
 }
 

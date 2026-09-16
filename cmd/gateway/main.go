@@ -25,6 +25,23 @@
 // behavior is unchanged, this is additive, nothing that worked before
 // this existed stops working.
 //
+// A tool-level allow is not the end of the decision either. When
+// NIA_GATEWAY_RESOURCE_RULES_PATH is set, the gateway decodes the call's
+// arguments (see toolCallRequest) and asks an ArgumentResourcePolicy
+// which resource object names they touch, "customers.ssn" out of a
+// database.query call naming a table and a column, see resources.go.
+// Any resource classified at sensitivity.Sensitive or above (via
+// NIA_SENSITIVITY_RULES_PATH, see internal/sensitivity) needs its own
+// policy.GrantForData grant, checked the same way the tool-level grant
+// is, denied and audited separately if it's missing. This is the
+// Agent+Tool+Action+Resource decision, not just Agent+Tool: an agent
+// can be authorized to call database.query and still not be authorized
+// to retrieve a column an operator has flagged as sensitive. Both env
+// vars unset (the default) skips this entirely, same additive posture
+// as the catalog check, nothing that worked before this existed stops
+// working, and an agent granted a resource nobody bothered to classify
+// stays unaffected either way, classification is opt-in per resource.
+//
 // Every decision this makes, allow, deny, or a check that errored
 // outright, also goes to internal/audit, that's the second half of what
 // audit's package doc means by "aggregates events from the gateway."
@@ -45,8 +62,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -58,6 +77,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
 	"github.com/bogdanticu88/nia/internal/risk"
+	"github.com/bogdanticu88/nia/internal/sensitivity"
 	niahttp "github.com/bogdanticu88/nia/internal/transport/http"
 )
 
@@ -80,18 +100,31 @@ func (h headerResolver) Resolve(ctx identity.ResolveContext) (*identity.Resolved
 }
 
 type gateway struct {
-	resolver identity.Resolver
-	pol      policy.Client
-	toolCat  tools.Reader        // nil means catalog enforcement is not configured, see FromEnvReader
-	scorer   risk.Scorer         // nil means monitoring is not configured, kept nil together with monitor
-	monitor  *monitoring.Monitor // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
-	auditLog audit.Sink
+	resolver       identity.Resolver
+	pol            policy.Client
+	toolCat        tools.Reader           // nil means catalog enforcement is not configured, see FromEnvReader
+	resourcePolicy ArgumentResourcePolicy // nil means argument inspection is not configured, see resourcePolicyFromEnv
+	sensitive      sensitivity.Classifier // nil means every resource is treated as Public, no data-grant check runs
+	scorer         risk.Scorer            // nil means monitoring is not configured, kept nil together with monitor
+	monitor        *monitoring.Monitor    // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
+	auditLog       audit.Sink
+}
+
+// toolCallRequest is the request body handleToolCall decodes.
+// Arguments is optional and opaque to the gateway itself, its shape is
+// whatever the tool underneath expects; the only thing this handler
+// does with it is hand it to resourcePolicy, when one is configured, to
+// find out what resources it names. An empty or absent body is not an
+// error, most tools take no arguments worth inspecting, and every call
+// site that predates this field still works unchanged.
+type toolCallRequest struct {
+	Arguments map[string]any `json:"arguments"`
 }
 
 // handleToolCall is the shape every tool/MCP call goes through:
-// resolve -> check -> forward. It's intentionally the only enforcement
-// point; there is no second place in the codebase that decides whether
-// a call is allowed.
+// resolve -> check -> inspect arguments -> forward. It's intentionally
+// the only enforcement point; there is no second place in the codebase
+// that decides whether a call is allowed.
 func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	headers := map[string]string{}
 	for k := range r.Header {
@@ -110,6 +143,12 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 
 	tool := r.PathValue("tool")
 	ctx := r.Context()
+
+	var body toolCallRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 
 	if g.toolCat != nil {
 		if _, err := g.toolCat.Get(ctx, tool); err != nil {
@@ -143,10 +182,46 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusForbidden, "agent is not authorized for this tool")
 		return
 	}
+
+	// Being allowed to call the tool is not being allowed to touch
+	// every resource the arguments name. This only runs when
+	// resourcePolicy is configured, additive, nothing that worked
+	// before this existed stops working, and even then it only demands
+	// an explicit data grant for a resource classified at
+	// sensitivity.Sensitive or above, see resources.go and
+	// internal/sensitivity's package doc for why: an agent authorized
+	// for database.query doesn't need a data grant declared for every
+	// column it might ever touch, only the ones an operator has flagged
+	// as actually sensitive.
+	var resources []string
+	if g.resourcePolicy != nil {
+		resources = g.resourcePolicy.Resources(tool, body.Arguments)
+		for _, resource := range resources {
+			level := sensitivity.Public
+			if g.sensitive != nil {
+				level = g.sensitive.Classify(resource)
+			}
+			if level < sensitivity.Sensitive {
+				continue
+			}
+			dataAllowed, err := g.pol.Check(ctx, resolved.Ref, policy.GrantForData(resource))
+			if err != nil {
+				g.audit(ctx, "gateway.check_error", resolved.Ref, fmt.Sprintf("tool=%s resource=%s err=%v", tool, resource, err))
+				niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if !dataAllowed {
+				g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s resource=%s level=%s", tool, resource, level))
+				niahttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("agent is not authorized for resource %q", resource))
+				return
+			}
+		}
+	}
+
 	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 
 	if g.monitor != nil {
-		g.observe(ctx, resolved.Ref, tool)
+		g.observe(ctx, resolved.Ref, tool, resources)
 	}
 
 	// A real deployment forwards the request to the tool's actual
@@ -165,8 +240,8 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 // ever ran, a monitoring-side failure (the kill or revoke call itself
 // erroring) is a separate incident from whether this request should
 // have gone through.
-func (g *gateway) observe(ctx context.Context, agentRef, tool string) {
-	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now()})
+func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources []string) {
+	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now(), Resources: resources})
 	if err != nil {
 		g.audit(ctx, "gateway.scoring_error", agentRef, fmt.Sprintf("tool=%s err=%v", tool, err))
 		log.Printf("nia-gateway: scoring failed for %s on %s: %v", agentRef, tool, err)
@@ -251,6 +326,22 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 
+	// resourcePolicyFromEnv: NIA_GATEWAY_RESOURCE_RULES_PATH unset means
+	// argument inspection stays off, same additive posture as the
+	// catalog check above. sensitivity.FromEnvClassifier:
+	// NIA_SENSITIVITY_RULES_PATH unset means every resource classifies
+	// as Public, so even with argument inspection on, nothing gets
+	// blocked on a data grant until an operator actually declares a
+	// resource sensitive.
+	resourcePolicy, err := resourcePolicyFromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+	sensitive, err := sensitivity.FromEnvClassifier()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
 	// monitoring.ThresholdsFromEnv: none of NIA_RISK_FLAG_AT,
 	// NIA_RISK_REVOKE_AT, or NIA_RISK_KILL_AT set means monitoring is
 	// skipped entirely, scorer and monitor both stay nil, see this
@@ -266,17 +357,19 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 	if monitoringConfigured {
-		scorer = risk.NewHistoryScorer(toolCat, risk.DefaultWeights())
+		scorer = risk.NewHistoryScorer(toolCat, sensitive, risk.DefaultWeights())
 		monitor = monitoring.NewMonitor(thresholds, pol, nil, auditLog)
 	}
 
 	g := &gateway{
-		resolver: headerResolver{headerName: "X-Agent-Ref"},
-		pol:      pol,
-		toolCat:  toolCat,
-		scorer:   scorer,
-		monitor:  monitor,
-		auditLog: auditLog,
+		resolver:       headerResolver{headerName: "X-Agent-Ref"},
+		pol:            pol,
+		toolCat:        toolCat,
+		resourcePolicy: resourcePolicy,
+		sensitive:      sensitive,
+		scorer:         scorer,
+		monitor:        monitor,
+		auditLog:       auditLog,
 	}
 
 	srv := &http.Server{
