@@ -1,5 +1,8 @@
 # NIA: Non-Human Identity & Agent Security
 
+[![Non-Human Identity](https://img.shields.io/badge/Non--Human%20Identity-2b2d42)](docs/ARCHITECTURE.md)
+[![Agent Security](https://img.shields.io/badge/Agent%20Security-2b2d42)](docs/ARCHITECTURE.md)
+[![OpenFGA / ReBAC](https://img.shields.io/badge/OpenFGA-ReBAC-2b2d42)](https://openfga.dev)
 [![CI](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml/badge.svg)](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml)
 [![Go version](https://img.shields.io/github/go-mod/go-version/bogdanticu88/NIA)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
