@@ -1,5 +1,10 @@
 # NIA: Non-Human Identity & Agent Security
 
+[![CI](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml/badge.svg)](https://github.com/bogdanticu88/NIA/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bogdanticu88/nia)](https://goreportcard.com/report/github.com/bogdanticu88/nia)
+[![Go version](https://img.shields.io/github/go-mod/go-version/bogdanticu88/NIA)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An agent security control plane: know what an agent is allowed to do, who authorised it, what it actually did, and how to stop it, in the next second instead of the next deploy.
 
 NIA generalizes [Tessera](https://github.com/bogdanticu88/tessera), a relationship-based authorization control plane built on [OpenFGA](https://openfga.dev), from "M2M API client" to "AI agent." Tessera's live per-request checks and surgical kill switch aren't rebuilt here, they're reused as the policy engine layer. NIA adds agent registration, credential lifecycle, tool and MCP awareness, risk scoring, runtime monitoring, agent-to-agent trust, delegation, and an identity graph on top.
@@ -66,4 +71,4 @@ The commands above run against the in-memory policy client, no Tessera, OpenFGA,
 
 ## License
 
-MIT.
+[MIT](LICENSE).
