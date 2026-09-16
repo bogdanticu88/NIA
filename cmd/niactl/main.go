@@ -53,8 +53,10 @@ grants or identity, use kill instead when the agent itself is compromised.
 
 tool register onboards a callable tool into the catalog, -risk defaults to
 read_only, set it honestly, it's what internal/risk will eventually score
-calls against. The gateway does not consult this catalog yet, that's a
-known gap, not a guarantee that an unregistered tool is blocked.
+calls against. When the gateway is started with NIA_TOOLS_API_URL set, it
+checks a tool against this catalog before checking policy, an unregistered
+name is rejected outright; unset, that step is skipped and registering a
+tool is bookkeeping only, see cmd/gateway's package doc comment.
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
 }

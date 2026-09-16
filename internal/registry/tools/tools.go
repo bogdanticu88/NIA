@@ -38,10 +38,19 @@ type Tool struct {
 var ErrAlreadyRegistered = errors.New("tools: already registered")
 var ErrNotFound = errors.New("tools: not found")
 
+// Reader is the read-only half of Catalog, the part the gateway
+// actually needs: look a tool up by name before forwarding a call to
+// it. Kept separate so the gateway can depend on the narrower interface
+// (see http_reader.go's HTTPReader, which only ever reads) the same way
+// it already depends on audit.Sink rather than the wider audit.Store.
+type Reader interface {
+	Get(ctx context.Context, name string) (Tool, error)
+}
+
 // Catalog is the tool registry.
 type Catalog interface {
+	Reader
 	Register(ctx context.Context, tool Tool) error
-	Get(ctx context.Context, name string) (Tool, error)
 	List(ctx context.Context) ([]Tool, error)
 }
 

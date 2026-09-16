@@ -12,6 +12,19 @@
 // inbound request that needs an identity resolved and a grant checked
 // before mcpHandler forwards it to the underlying tool.
 //
+// When NIA_TOOLS_API_URL is set, resolve -> check grows a step in
+// front: look the tool up in cmd/api's catalog first, and reject
+// outright if nobody registered it. That lookup goes over HTTP back to
+// cmd/api rather than a second shared store, the same tradeoff
+// internal/audit made before PostgresSink existed, except here there's
+// no PostgresSink equivalent planned, a tool's existence changes rarely
+// compared to the hot path's actual bottleneck, the policy check
+// itself, so a cheap HTTP round trip to the one process that already
+// owns the catalog is the whole answer, not a stopgap. Unset, this step
+// is skipped entirely and the gateway's original tool-name-only
+// behavior is unchanged, this is additive, nothing that worked before
+// this existed stops working.
+//
 // Every decision this makes, allow, deny, or a check that errored
 // outright, also goes to internal/audit, that's the second half of what
 // audit's package doc means by "aggregates events from the gateway."
@@ -19,6 +32,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -28,6 +42,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/identity"
 	"github.com/bogdanticu88/nia/internal/policy"
+	"github.com/bogdanticu88/nia/internal/registry/tools"
 	niahttp "github.com/bogdanticu88/nia/internal/transport/http"
 )
 
@@ -52,6 +67,7 @@ func (h headerResolver) Resolve(ctx identity.ResolveContext) (*identity.Resolved
 type gateway struct {
 	resolver identity.Resolver
 	pol      policy.Client
+	toolCat  tools.Reader // nil means catalog enforcement is not configured, see FromEnvReader
 	auditLog audit.Sink
 }
 
@@ -76,9 +92,26 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tool := r.PathValue("tool")
-	grant := policy.GrantForTool(tool)
 	ctx := r.Context()
 
+	if g.toolCat != nil {
+		if _, err := g.toolCat.Get(ctx, tool); err != nil {
+			if errors.Is(err, tools.ErrNotFound) {
+				g.audit(ctx, "gateway.unknown_tool", resolved.Ref, fmt.Sprintf("tool=%s", tool))
+				niahttp.WriteError(w, http.StatusNotFound, "tool is not registered")
+				return
+			}
+			// Same posture as a failed policy check below: couldn't
+			// determine whether this tool is even real, so this is not
+			// a denial, it's "we couldn't ask," worth its own action
+			// for an incident review to tell apart from "we said no."
+			g.audit(ctx, "gateway.tool_lookup_error", resolved.Ref, fmt.Sprintf("tool=%s err=%v", tool, err))
+			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	grant := policy.GrantForTool(tool)
 	allowed, err := g.pol.Check(ctx, resolved.Ref, grant)
 	if err != nil {
 		// A failed check is not a denial, the policy engine couldn't be
@@ -168,9 +201,19 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 
+	// tools.FromEnvReader: NIA_TOOLS_API_URL unset means a nil Reader,
+	// catalog enforcement stays off, see this file's own package doc
+	// comment above for why that's the safe default rather than every
+	// tool being treated as unregistered.
+	toolCat, err := tools.FromEnvReader()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
 	g := &gateway{
 		resolver: headerResolver{headerName: "X-Agent-Ref"},
 		pol:      pol,
+		toolCat:  toolCat,
 		auditLog: auditLog,
 	}
 
