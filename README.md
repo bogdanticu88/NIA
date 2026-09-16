@@ -19,6 +19,8 @@ What's actually been verified, and how:
 
 What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `linux/arm64` and standard `linux/amd64` hosts, unconfirmed on anything more exotic. Multi-replica behavior (more than one `nia-api` or `tessera` instance against the same store) hasn't been exercised, the read-modify-write races that implies are a documented, open gap, see `internal/policy/tessera_client.go`'s doc comment.
 
+- `internal/audit`: the gateway now writes every decision it makes (`gateway.allowed`, `gateway.denied`, `gateway.check_error`) to the audit trail, not just `cmd/api`'s own registration and kill events, closing a gap where the package's own doc comment promised "aggregates events from the gateway" and nothing in the gateway actually did that. `cmd/api` exposes it over HTTP (`GET /audit`, `GET /agents/{ref}/audit`) and `niactl audit` wraps both. Verified with `go test ./... -race` (unit tests for `InMemorySink`'s ordering and eviction, and for both HTTP handlers, including that an unresolved caller correctly produces no event, there's no subject to attach one to) and with a live run: real `nia-api` and `nia-gateway` binaries, driven over actual HTTP by `niactl` and `curl`, registering an agent, calling the gateway both with and without a valid identity header, killing the agent, and reading the result back through `niactl audit -ref`. That live run also confirmed a real, current limitation head on rather than just asserting it: `nia-api` and `nia-gateway` each hold their own in-memory sink, so a gateway decision is invisible to `niactl audit`, which only talks to `cmd/api`. There is no single stream yet, only two. The fix is a shared backend (`audit.Store` has exactly one implementation right now, `InMemorySink`), not started, see the closing comment in `internal/audit/audit.go`.
+
 ## Layout
 
 ```
@@ -51,6 +53,9 @@ go run ./cmd/niactl list
 
 # pull the kill switch
 go run ./cmd/niactl kill -ref agent:billing-reconciler -incident INC-001
+
+# review what happened to it
+go run ./cmd/niactl audit -ref agent:billing-reconciler
 ```
 
 The commands above run against the in-memory policy client, no Tessera, OpenFGA, or Postgres required. To point `cmd/api` and `cmd/gateway` at a real Tessera instance instead, set three environment variables before starting them: `NIA_TESSERA_BASE_URL` (Tessera.Service's URL), `NIA_TESSERA_JWT_SIGNING_KEY` (base64, the exact same value Tessera.Service was started with as `TESSERA_JWT_SIGNING_KEY`), and, only if Tessera isn't running with its own defaults, `NIA_TESSERA_JWT_ISSUER` / `NIA_TESSERA_JWT_AUDIENCE`. See `internal/policy/from_env.go` for the full list and defaults.

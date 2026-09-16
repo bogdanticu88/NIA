@@ -6,11 +6,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
@@ -32,7 +34,7 @@ type server struct {
 	toolCat  tools.Catalog
 	creds    credentials.Store
 	pol      policy.Client
-	auditLog audit.Sink
+	auditLog audit.Store
 }
 
 // newServer wires every control-plane dependency. The policy client comes
@@ -95,7 +97,7 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
-	_ = s.auditLog.Append(ctx, audit.Event{
+	s.audit(ctx, audit.Event{
 		Action:   "agent.registered",
 		AgentRef: agent.Ref,
 		Operator: req.Owner,
@@ -132,7 +134,7 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.agents.SetState(ctx, req.AgentRef, identity.StateKilled)
-	_ = s.auditLog.Append(ctx, audit.Event{
+	s.audit(ctx, audit.Event{
 		Action:   "agent.killed",
 		AgentRef: req.AgentRef,
 		Operator: req.Operator,
@@ -142,12 +144,68 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, result)
 }
 
+// audit appends one event, logging rather than silently dropping a
+// failure: on a security control plane, an action that didn't make it
+// into the trail is worth knowing about even when there's nothing this
+// handler can do about it mid-request.
+func (s *server) audit(ctx context.Context, evt audit.Event) {
+	if err := s.auditLog.Append(ctx, evt); err != nil {
+		log.Printf("nia-api: audit append failed: %v", err)
+	}
+}
+
+// auditLimitDefault and auditLimitMax bound the recent-events query.
+// Unbounded would let one request pull the entire in-memory sink (or,
+// once there's a real backend, scan a very large table) into a single
+// JSON response.
+const (
+	auditLimitDefault = 100
+	auditLimitMax     = 1000
+)
+
+func (s *server) handleRecentAudit(w http.ResponseWriter, r *http.Request) {
+	limit := auditLimitDefault
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			niahttp.WriteError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	if limit > auditLimitMax {
+		limit = auditLimitMax
+	}
+	events, err := s.auditLog.Recent(r.Context(), limit)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, events)
+}
+
+func (s *server) handleAgentAudit(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	events, err := s.auditLog.ForAgent(r.Context(), ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, events)
+}
+
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
 	mux.HandleFunc("GET /agents", s.handleListAgents)
 	mux.HandleFunc("POST /policy/kill", s.handleKill)
+	mux.HandleFunc("GET /audit", s.handleRecentAudit)
+	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
 	return mux
 }
 

@@ -29,8 +29,28 @@ type Event struct {
 // Sink is an append-only audit destination. Matches Tessera's
 // IAuditSink shape (see Tessera.ControlPlane/Abstractions.cs) so events
 // forwarded from Tessera don't need translation beyond field names.
+// The gateway only ever writes, so it depends on Sink rather than the
+// wider Store, one place appending events can't accidentally start
+// reading them back.
 type Sink interface {
 	Append(ctx context.Context, evt Event) error
+}
+
+// Store is a Sink that can also be queried. cmd/api holds one of these,
+// not a bare Sink, because the audit endpoints (recent events, an
+// agent's history) need to read the same trail back regardless of which
+// backend is behind it. Both methods take ctx and return an error, even
+// though InMemorySink below never fails, because the real backend this
+// is written against (Postgres, see the roadmap note at the bottom of
+// this file) very much can.
+type Store interface {
+	Sink
+	// Recent returns up to n most recent events, oldest first. n <= 0
+	// or n greater than what's available returns everything there is.
+	Recent(ctx context.Context, n int) ([]Event, error)
+	// ForAgent returns every recorded event for a given agent, oldest
+	// first. This is the query an incident review starts with.
+	ForAgent(ctx context.Context, agentRef string) ([]Event, error)
 }
 
 // InMemorySink keeps the last N events in memory. Useful for local dev
@@ -62,8 +82,10 @@ func (s *InMemorySink) Append(_ context.Context, evt Event) error {
 	return nil
 }
 
-// Recent returns up to n most recent events, newest last.
-func (s *InMemorySink) Recent(n int) []Event {
+// Recent returns up to n most recent events, oldest first. Never
+// returns an error, it's in-memory; the signature matches Store because
+// callers write against the interface, not this concrete type.
+func (s *InMemorySink) Recent(_ context.Context, n int) ([]Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n <= 0 || n > len(s.events) {
@@ -71,12 +93,12 @@ func (s *InMemorySink) Recent(n int) []Event {
 	}
 	out := make([]Event, n)
 	copy(out, s.events[len(s.events)-n:])
-	return out
+	return out, nil
 }
 
 // ForAgent returns every recorded event for a given agent, in order.
 // This is the query an incident review starts with.
-func (s *InMemorySink) ForAgent(agentRef string) []Event {
+func (s *InMemorySink) ForAgent(_ context.Context, agentRef string) ([]Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Event
@@ -85,7 +107,17 @@ func (s *InMemorySink) ForAgent(agentRef string) []Event {
 			out = append(out, e)
 		}
 	}
-	return out
+	return out, nil
 }
 
-var _ Sink = (*InMemorySink)(nil)
+var (
+	_ Sink  = (*InMemorySink)(nil)
+	_ Store = (*InMemorySink)(nil)
+)
+
+// Not yet real: this package still has exactly one implementation, and
+// it forgets everything on restart and can't be shared across the
+// nia-api and nia-gateway processes that both want to write to it, so
+// "one stream" in the package doc above is aspirational until a
+// Postgres-backed Store exists. That's the next piece of work, not
+// started here, see docs/ARCHITECTURE.md's audit trail row.

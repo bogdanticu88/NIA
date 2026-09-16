@@ -1,8 +1,9 @@
 // cmd/niactl is the operator CLI: register an agent, grant or revoke
-// permissions, pull the kill switch, restore a killed agent, and
-// inspect current state. It talks to cmd/api over HTTP; it holds no
-// state of its own and implements no policy logic, everything here is
-// a thin wrapper around the control-plane API's HTTP surface.
+// permissions, pull the kill switch, restore a killed agent, inspect
+// current state, and review the audit trail. It talks to cmd/api over
+// HTTP; it holds no state of its own and implements no policy logic,
+// everything here is a thin wrapper around the control-plane API's
+// HTTP surface.
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 )
 
@@ -29,6 +31,12 @@ Usage:
   niactl register -ref <agent_ref> [-owner <owner>] [-purpose <purpose>]
   niactl list
   niactl kill -ref <agent_ref> -incident <incident_id> [-operator <name>]
+  niactl audit [-ref <agent_ref>] [-limit <n>]
+
+audit with -ref shows everything recorded for that agent (registration,
+grants, kills, every gateway decision), oldest first, the query an
+incident review starts with. Without -ref it shows the n most recent
+events across every agent (default 100).
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
 }
@@ -46,6 +54,8 @@ func main() {
 		cmdList(os.Args[2:])
 	case "kill":
 		cmdKill(os.Args[2:])
+	case "audit":
+		cmdAudit(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -94,6 +104,19 @@ func cmdKill(args []string) {
 		"operator":  *operator,
 	})
 	post("/policy/kill", body)
+}
+
+func cmdAudit(args []string) {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	ref := fs.String("ref", "", "show only events for this agent ref")
+	limit := fs.Int("limit", 100, "max events to show when -ref is not given")
+	_ = fs.Parse(args)
+
+	if *ref != "" {
+		get("/agents/" + url.PathEscape(*ref) + "/audit")
+		return
+	}
+	get(fmt.Sprintf("/audit?limit=%d", *limit))
 }
 
 func post(path string, body []byte) {
