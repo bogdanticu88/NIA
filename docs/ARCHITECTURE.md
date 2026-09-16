@@ -111,6 +111,16 @@ This graph is queryable independently of the live OpenFGA checks. OpenFGA answer
 
 * * *
 
+### Resource sensitivity
+
+`internal/sensitivity` answers a narrower question than the identity graph: given a resource name, a tool argument, a column, a field, a data object, how sensitive is it. Five levels, `public`, `internal`, `confidential`, `sensitive`, `critical`, `public` being the zero value and the default for anything nobody declared a rule for. This is deliberately a flat rule list, not inference: an operator writes "customer.ssn is critical," the classifier looks it up, first matching rule wins. That's what makes it explainable, an incident review can point at the exact rule that made a call get flagged, not a model's guess.
+
+The point of this package is to name resources the same way `policy.GrantForData` already does, `GrantForData("customer.ssn")` is an authorization grant naming that resource, a `sensitivity.Rule{Pattern: "customer.ssn", Level: sensitivity.Critical}` is a classification of the same name. The two are meant to be read together: an agent can be granted `database.query` as a tool while still lacking the data grant for `customer.ssn`, which is what makes "authorized to call the tool, not authorized to touch this column" enforceable without inventing a second authorization system, `internal/policy`'s existing `data` grant kind already covers it, see "The seventeen MVP items" table above.
+
+As of this writing this package classifies resources and nothing else, it is not yet wired into `cmd/gateway`'s tool-call handling or into `internal/risk`'s scoring. `POST /tools/{tool}/call` still only ever sees the tool name off the URL path, no request body, no arguments, so there is nothing for a classifier to inspect yet on the enforcement side. That's the next piece of work, not a gap left implicit.
+
+* * *
+
 ### Integration plan for Tessera
 
 Tessera started as a .NET library plus reference in-memory implementations. Its own roadmap listed what NIA needed from it: a minimal HTTP surface for kill, restore, and onboard (v1.2), and an OpenFGA REST adapter with paging and chunking (v1.1). Rather than reimplementing Tessera's invariants in Go, the plan was to finish that roadmap as part of standing NIA up, since NIA is the first real consumer of exactly that surface. That plan is done:
@@ -145,6 +155,7 @@ nia/
 │   ├── policy/         client for Tessera / OpenFGA (permissions, authorization, kill switch)
 │   ├── audit/          append-only audit sink and aggregation
 │   ├── risk/            risk scoring
+│   ├── sensitivity/     resource sensitivity classification (public/internal/confidential/sensitive/critical)
 │   ├── monitoring/     runtime monitoring, detect/block
 │   ├── graph/           identity graph, trust, delegation
 │   └── transport/http/  shared HTTP transport helpers
