@@ -157,6 +157,9 @@ func runScenario(sc scenario, out io.Writer) {
 
 	fmt.Fprintln(out, "\ncontrol-plane audit trail (cmd/api's own view; it will not include the gateway's gateway.* and monitoring.* events unless NIA_AUDIT_DATABASE_URL points both processes at the same backend, see docker-compose.yml):")
 	printScenarioAudit(out, sc.agentRef)
+
+	fmt.Fprintln(out, "\nblast radius (what this agent's own grants reached in the identity graph, auto-populated as writeScenarioGrants ran, not hand-built):")
+	printScenarioBlastRadius(out, sc.agentRef)
 }
 
 func apiCall(method, path string, body []byte) (*http.Response, error) {
@@ -343,5 +346,44 @@ func printScenarioAudit(out io.Writer, agentRef string) {
 		} else {
 			fmt.Fprintf(out, "  %s\n", action)
 		}
+	}
+}
+
+// printScenarioBlastRadius reads back GET /graph/{ref}/blast-radius,
+// the same auto-populated edges writeScenarioGrants' calls to
+// cmd/api's grant-writing endpoint already created, see
+// docs/ARCHITECTURE.md's identity graph section for how severity is
+// decided. This is read-only, it does not change anything the attack
+// sequence already did, it just shows what an incident review would
+// see if they asked "what could this agent reach" right after this run.
+func printScenarioBlastRadius(out io.Writer, agentRef string) {
+	resp, err := apiCall(http.MethodGet, "/graph/"+url.PathEscape(agentRef)+"/blast-radius", nil)
+	if err != nil {
+		fmt.Fprintf(out, "  could not reach the control-plane API: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(out, "  unexpected status %d: %s\n", resp.StatusCode, raw)
+		return
+	}
+	var br map[string]any
+	if err := json.Unmarshal(raw, &br); err != nil {
+		fmt.Fprintf(out, "  could not parse the blast-radius response: %v\n", err)
+		return
+	}
+	total, _ := br["total"].(float64)
+	severity, _ := br["severity"].(string)
+	fmt.Fprintf(out, "  %.0f node(s) reachable, severity %s\n", total, severity)
+	if byKind, ok := br["by_kind"].(map[string]any); ok && len(byKind) > 0 {
+		parts := make([]string, 0, len(byKind))
+		for kind, count := range byKind {
+			parts = append(parts, fmt.Sprintf("%s:%.0f", kind, count))
+		}
+		fmt.Fprintf(out, "  by kind: %s\n", strings.Join(parts, ", "))
+	}
+	if critical, ok := br["critical_resources"].([]any); ok && len(critical) > 0 {
+		fmt.Fprintf(out, "  critical resources reachable: %v\n", critical)
 	}
 }

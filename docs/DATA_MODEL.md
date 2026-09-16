@@ -20,6 +20,7 @@ The identity graph answers "everything this identity could reach, directly or tr
 | `Agent` | A non-human identity: an agent, service account, or automated process | `agent:billing-reconciler` |
 | `Tool` | Something an agent can call | `tool:invoice-api` |
 | `Data` | A data resource an agent can reach, directly or through a tool | `data:customer-pii` |
+| `Credential` | A credential issued to an agent | `cred:a1b2c3` |
 
 `Agent` nodes here are the same canonical ref as `identity.AgentRef` in the registry, the graph doesn't mint its own identity namespace, it references the registry's.
 
@@ -34,10 +35,12 @@ The identity graph answers "everything this identity could reach, directly or tr
 | `grants` | Agent → Tool \| Data | Mirrors a live grant in the policy engine |
 | `bound_to` | Credential → Agent | Which agent a credential belongs to |
 
-`grants` edges are redundant with what Tessera/OpenFGA already knows, and that's intentional. They're written to the graph at the same time they're written to the policy client (both calls happen from `internal/policy`'s caller, typically `cmd/api`'s grant handler), so the graph has a complete picture for traversal without querying OpenFGA node by node, which OpenFGA's tuple model isn't built for efficiently at graph scale.
+`grants` edges are redundant with what Tessera/OpenFGA already knows, and that's intentional. They're written to the graph right after they're written to the policy client (`cmd/api`'s grant handler calls `WriteGrants` first, then adds the matching graph edge once that succeeds), so the graph has a complete picture for traversal without querying OpenFGA node by node, which OpenFGA's tuple model isn't built for efficiently at graph scale. `owns`, `delegates_to`, `trusts`, and `member_of` still have no automatic source, nothing in the registry or policy client produces any of the four, so they're added by hand through `POST /graph/edges` / `niactl graph add-edge` until something does. `bound_to` is automatic too, issuing a credential adds the `Credential` node and the edge to its agent in the same call. Deleting a grant does not remove its edge, `Graph` has no edge-removal method yet, so the graph is a superset of what's currently granted after a revoke, `internal/policy.ListGrants` is still the source of truth for exactly what's granted right now.
 
 ## The query that matters most: blast radius
 
 Given a compromised or suspect agent, `Graph.Reachable` answers: starting from this agent, and following `delegates_to`, `trusts`, and `grants` edges transitively, what else is reachable. That set is your blast radius, and it's the thing you want on screen in the first sixty seconds of an incident, before deciding whether a `Kill` (via `internal/policy`) needs to cascade to more than one agent.
+
+`GET /graph/{id}/blast-radius` (`niactl graph blast-radius`) is `Reachable` plus the summary an incident review wants first rather than a raw node list to eyeball: total count, a count by node kind, which reachable `Data` nodes classify `sensitive` or `critical` through `internal/sensitivity`, and a `HIGH`/`MEDIUM`/`LOW` severity call. The rule is fixed, not learned: `HIGH` when anything reachable is critical or five-plus reachable nodes are agents or tools, `MEDIUM` when anything reachable is sensitive or at least one reachable node is an agent or tool, `LOW` otherwise. See `ARCHITECTURE.md`'s identity graph section for the full reasoning behind that rule.
 
 This is also why `delegates_to` is modeled as its own edge kind instead of folded into `grants`: a delegation chain (agent A delegates to B, which delegates to C) needs to be walkable independently of what each hop is individually permitted to touch.

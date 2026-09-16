@@ -37,3 +37,29 @@ func TestReachableFollowsDelegationChains(t *testing.T) {
 		}
 	}
 }
+
+func TestSummarize_CountsByKind(t *testing.T) {
+	nodes := []Node{
+		{ID: "agent:b", Kind: NodeAgent},
+		{ID: "agent:c", Kind: NodeAgent},
+		{ID: "tool:invoice-api", Kind: NodeTool},
+		{ID: "customer.ssn", Kind: NodeData},
+	}
+	s := Summarize(nodes)
+	if s.Total != 4 {
+		t.Fatalf("Total = %d, want 4", s.Total)
+	}
+	if s.ByKind[NodeAgent] != 2 || s.ByKind[NodeTool] != 1 || s.ByKind[NodeData] != 1 {
+		t.Fatalf("ByKind = %v, want agent:2 tool:1 data:1", s.ByKind)
+	}
+}
+
+func TestSummarize_EmptyList(t *testing.T) {
+	s := Summarize(nil)
+	if s.Total != 0 {
+		t.Fatalf("Total = %d, want 0 for an empty reachable list", s.Total)
+	}
+	if len(s.ByKind) != 0 {
+		t.Fatalf("ByKind = %v, want empty", s.ByKind)
+	}
+}

@@ -16,10 +16,11 @@ import (
 type NodeKind string
 
 const (
-	NodeHuman NodeKind = "human"
-	NodeAgent NodeKind = "agent"
-	NodeTool  NodeKind = "tool"
-	NodeData  NodeKind = "data"
+	NodeHuman      NodeKind = "human"
+	NodeAgent      NodeKind = "agent"
+	NodeTool       NodeKind = "tool"
+	NodeData       NodeKind = "data"
+	NodeCredential NodeKind = "credential"
 )
 
 // EdgeKind is the relationship an edge represents. Named to match the
@@ -137,6 +138,26 @@ func (g *InMemoryGraph) Reachable(_ context.Context, id string, kinds []EdgeKind
 		}
 	}
 	return out, nil
+}
+
+// Summary is the aggregate shape of a blast-radius query: not the full
+// node list Reachable returns, but how many of each kind it contains,
+// the number an incident review actually wants first. Deliberately a
+// pure function of a node list rather than a method on Graph, it has no
+// reason to touch the store or take a context, callers just hand it
+// whatever Reachable already gave them.
+type Summary struct {
+	Total  int
+	ByKind map[NodeKind]int
+}
+
+func Summarize(nodes []Node) Summary {
+	s := Summary{ByKind: make(map[NodeKind]int)}
+	for _, n := range nodes {
+		s.Total++
+		s.ByKind[n.Kind]++
+	}
+	return s
 }
 
 var _ Graph = (*InMemoryGraph)(nil)

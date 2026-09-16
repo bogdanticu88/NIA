@@ -50,6 +50,7 @@ Usage:
   niactl graph add-edge -from <node_id> -to <node_id> -kind <owns|delegates_to|trusts|member_of|grants|bound_to>
   niactl graph neighbors -id <node_id> -kind <edge_kind>
   niactl graph reachable -id <node_id> [-kinds <edge_kind,edge_kind,...>]
+  niactl graph blast-radius -id <node_id> [-kinds <edge_kind,edge_kind,...>]
   niactl grant write -ref <agent_ref> -kind <api_group|endpoint|tool|data> [-group <g>] [-method <m>] [-path <p>] [-object <o>] [-operator <name>]
   niactl grant delete -ref <agent_ref> -kind <...> [-group|-method|-path|-object matching what was written] [-operator <name>]
   niactl grant list -ref <agent_ref>
@@ -88,12 +89,21 @@ time, not an error.
 
 graph add-node/add-edge build the identity graph by hand, a node id is
 whatever internal/graph's node kind implies, "agent:billing-reconciler" for
-an agent, a human or tool or data resource id for the rest, adding a node
-does not require it to also be registered through niactl register or niactl
-tool register, the graph is independent bookkeeping. graph neighbors is one
-hop out along a single edge kind; graph reachable follows edges
-transitively, the blast-radius query, what a compromised node could reach
-either way, defaulting to every edge kind when -kinds is omitted.
+an agent, a human or tool or data resource id for the rest. Registering an
+agent or tool, issuing a credential, and writing a tool or data grant all
+add their own nodes and edges automatically now, so add-node/add-edge is
+mainly for a human node (nothing else creates those) or for adding
+something ahead of when NIA would otherwise learn about it. graph
+neighbors is one hop out along a single edge kind; graph reachable follows
+edges transitively, the full node list, defaulting to every edge kind when
+-kinds is omitted; graph blast-radius runs the same traversal but returns
+counts by node kind, which reachable resources are classified sensitive or
+critical (see internal/sensitivity, NIA_SENSITIVITY_RULES_PATH), and a
+HIGH/MEDIUM/LOW severity call, see docs/ARCHITECTURE.md's identity graph
+section for exactly how severity is decided. Known gap: deleting a grant
+does not remove the grants edge it added, the graph can currently only
+grow, treat it as a superset of what's actually still granted, not a
+stale-safe mirror, check niactl grant list for the current truth.
 
 gateway call drives the gateway's own hot path directly, POST /tools/{tool}/call
 with -ref sent as X-Agent-Ref and -arguments (a JSON object, optional) as the
@@ -216,6 +226,8 @@ func cmdGraph(args []string) {
 		cmdGraphNeighbors(args[1:])
 	case "reachable":
 		cmdGraphReachable(args[1:])
+	case "blast-radius":
+		cmdGraphBlastRadius(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -513,6 +525,23 @@ func cmdGraphReachable(args []string) {
 		os.Exit(1)
 	}
 	path := "/graph/" + url.PathEscape(*id) + "/reachable"
+	if *kinds != "" {
+		path += "?kinds=" + url.QueryEscape(*kinds)
+	}
+	get(path)
+}
+
+func cmdGraphBlastRadius(args []string) {
+	fs := flag.NewFlagSet("graph blast-radius", flag.ExitOnError)
+	id := fs.String("id", "", "node id to start from")
+	kinds := fs.String("kinds", "", "comma-separated edge kinds to follow; omitted means every edge kind")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "graph blast-radius: -id is required")
+		os.Exit(1)
+	}
+	path := "/graph/" + url.PathEscape(*id) + "/blast-radius"
 	if *kinds != "" {
 		path += "?kinds=" + url.QueryEscape(*kinds)
 	}

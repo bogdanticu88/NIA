@@ -161,6 +161,16 @@ func newFakeControlPlane(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode([]map[string]any{{"action": "agent.registered"}})
 	})
+	mux.HandleFunc("GET /graph/{ref}/blast-radius", func(w http.ResponseWriter, r *http.Request) {
+		fc.paths = append(fc.paths, "GET /graph/"+r.PathValue("ref")+"/blast-radius")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":       r.PathValue("ref"),
+			"total":    2,
+			"by_kind":  map[string]int{"tool": 2},
+			"severity": "MEDIUM",
+		})
+	})
 	return httptest.NewServer(mux)
 }
 
@@ -223,5 +233,43 @@ func TestRunScenario_DrivesRealSetupCallsAndDetectsContainment(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("gateway received %d calls, want 2", callCount)
+	}
+	if !strings.Contains(got, "severity MEDIUM") {
+		t.Fatalf("transcript missing the blast-radius summary read back from the graph:\n%s", got)
+	}
+}
+
+func TestPrintScenarioBlastRadius_PrintsTotalAndSeverity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"total":               3,
+			"by_kind":             map[string]int{"tool": 2, "data": 1},
+			"severity":            "HIGH",
+			"critical_resources":  []string{"customers.ssn"},
+			"sensitive_resources": []string{},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("NIA_API_URL", srv.URL)
+
+	var buf bytes.Buffer
+	printScenarioBlastRadius(&buf, "agent:test")
+	out := buf.String()
+	if !strings.Contains(out, "3 node(s) reachable, severity HIGH") {
+		t.Fatalf("got %q, want the total and severity reported", out)
+	}
+	if !strings.Contains(out, "customers.ssn") {
+		t.Fatalf("got %q, want the critical resource named", out)
+	}
+}
+
+func TestPrintScenarioBlastRadius_UnreachableAPI(t *testing.T) {
+	t.Setenv("NIA_API_URL", "http://127.0.0.1:1")
+
+	var buf bytes.Buffer
+	printScenarioBlastRadius(&buf, "agent:test")
+	if !strings.Contains(buf.String(), "could not reach") {
+		t.Fatalf("got %q, want an honest error rather than a panic", buf.String())
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
+	"github.com/bogdanticu88/nia/internal/sensitivity"
 	niahttp "github.com/bogdanticu88/nia/internal/transport/http"
 )
 
@@ -33,12 +34,13 @@ import (
 // one) satisfies it. Swapping the policy client for a real Tessera HTTP
 // adapter, once it exists, touches only this constructor.
 type server struct {
-	agents   registry.AgentRegistry
-	toolCat  tools.Catalog
-	creds    credentials.Store
-	pol      policy.Client
-	auditLog audit.Store
-	graph    graph.Graph
+	agents    registry.AgentRegistry
+	toolCat   tools.Catalog
+	creds     credentials.Store
+	pol       policy.Client
+	auditLog  audit.Store
+	graph     graph.Graph
+	sensitive sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
 }
 
 // newServer wires every control-plane dependency. The policy client comes
@@ -62,13 +64,22 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
+	// Same NIA_SENSITIVITY_RULES_PATH env var cmd/gateway reads, unset
+	// means every resource classifies as Public, so a blast-radius query
+	// still returns its node counts, it just can't say which reachable
+	// data resources are the sensitive or critical ones.
+	sensitive, err := sensitivity.FromEnvClassifier()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
 	return &server{
-		agents:   registry.NewInMemoryAgentRegistry(),
-		toolCat:  tools.NewInMemoryCatalog(),
-		creds:    credentials.NewInMemoryStore(),
-		pol:      pol,
-		auditLog: auditLog,
-		graph:    graph.NewInMemoryGraph(),
+		agents:    registry.NewInMemoryAgentRegistry(),
+		toolCat:   tools.NewInMemoryCatalog(),
+		creds:     credentials.NewInMemoryStore(),
+		pol:       pol,
+		auditLog:  auditLog,
+		graph:     graph.NewInMemoryGraph(),
+		sensitive: sensitive,
 	}, nil
 }
 
@@ -110,6 +121,7 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	s.graphAddNode(ctx, agent.Ref, graph.NodeAgent)
 	s.audit(ctx, audit.Event{
 		Action:   "agent.registered",
 		AgentRef: agent.Ref,
@@ -202,6 +214,8 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.graphAddNode(ctx, cred.ID, graph.NodeCredential)
+	s.graphAddEdge(ctx, cred.ID, ref, graph.EdgeBoundTo)
 	s.audit(ctx, audit.Event{
 		Action:   "credential.issued",
 		AgentRef: ref,
@@ -319,10 +333,12 @@ func (s *server) handleRegisterTool(w http.ResponseWriter, r *http.Request) {
 		RiskClass:   risk,
 		Owner:       req.Owner,
 	}
-	if err := s.toolCat.Register(r.Context(), tool); err != nil {
+	ctx := r.Context()
+	if err := s.toolCat.Register(ctx, tool); err != nil {
 		niahttp.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	s.graphAddNode(ctx, tool.Name, graph.NodeTool)
 	niahttp.WriteJSON(w, http.StatusCreated, tool)
 }
 
@@ -451,6 +467,7 @@ func (s *server) handleWriteGrants(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.graphAddGrantEdges(ctx, ref, grants)
 	s.audit(ctx, audit.Event{
 		Action:   "grant.written",
 		AgentRef: ref,
@@ -551,13 +568,17 @@ type addGraphNodeRequest struct {
 	Kind string `json:"kind"`
 }
 
-// handleAddGraphNode adds one node to the identity graph. This is
-// separate bookkeeping from agent registration, not a mirror of it: a
-// node here can be a human or a tool or a data resource too, things
-// internal/registry has no concept of, and registering an agent through
-// internal/registry does not implicitly add it to the graph, the two
-// are kept independent on purpose until there's a real reason to couple
-// them (see docs/ARCHITECTURE.md's identity graph section).
+// handleAddGraphNode adds one node to the identity graph by hand. Agent
+// registration, tool registration, credential issuance, and grant
+// writes all add their own nodes automatically now (see
+// graphAddNode/graphAddEdge and their call sites above), so this
+// endpoint's real remaining job is the node kind nothing else creates
+// on its own, Human, an operator or team accountable for an agent,
+// internal/registry has no concept of a human at all. It's also still
+// how an operator adds a node for something NIA doesn't otherwise track
+// (a data resource nobody has granted yet but wants represented in the
+// graph ahead of time), or repairs the graph by hand if something ever
+// gets out of sync with it.
 func (s *server) handleAddGraphNode(w http.ResponseWriter, r *http.Request) {
 	var req addGraphNodeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -570,9 +591,9 @@ func (s *server) handleAddGraphNode(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := graph.NodeKind(req.Kind)
 	switch kind {
-	case graph.NodeHuman, graph.NodeAgent, graph.NodeTool, graph.NodeData:
+	case graph.NodeHuman, graph.NodeAgent, graph.NodeTool, graph.NodeData, graph.NodeCredential:
 	default:
-		niahttp.WriteError(w, http.StatusBadRequest, "kind must be one of human, agent, tool, data")
+		niahttp.WriteError(w, http.StatusBadRequest, "kind must be one of human, agent, tool, data, credential")
 		return
 	}
 
@@ -683,18 +704,10 @@ func (s *server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kinds := allGraphEdgeKinds
-	if raw := r.URL.Query().Get("kinds"); raw != "" {
-		parts := strings.Split(raw, ",")
-		kinds = make([]graph.EdgeKind, 0, len(parts))
-		for _, p := range parts {
-			kind := graph.EdgeKind(strings.TrimSpace(p))
-			if !validGraphEdgeKind(kind) {
-				niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
-				return
-			}
-			kinds = append(kinds, kind)
-		}
+	kinds, ok := parseGraphEdgeKinds(r)
+	if !ok {
+		niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
+		return
 	}
 
 	nodes, err := s.graph.Reachable(r.Context(), id, kinds)
@@ -705,6 +718,115 @@ func (s *server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, nodes)
 }
 
+// parseGraphEdgeKinds is handleGraphReachable and handleBlastRadius's
+// shared ?kinds= parsing: a comma-separated list of edge kinds, or
+// every edge kind when the query param is omitted, same "everything
+// reachable, however" default both endpoints want. The bool return is
+// false on an unknown kind, the caller decides how to report that.
+func parseGraphEdgeKinds(r *http.Request) ([]graph.EdgeKind, bool) {
+	raw := r.URL.Query().Get("kinds")
+	if raw == "" {
+		return allGraphEdgeKinds, true
+	}
+	parts := strings.Split(raw, ",")
+	kinds := make([]graph.EdgeKind, 0, len(parts))
+	for _, p := range parts {
+		kind := graph.EdgeKind(strings.TrimSpace(p))
+		if !validGraphEdgeKind(kind) {
+			return nil, false
+		}
+		kinds = append(kinds, kind)
+	}
+	return kinds, true
+}
+
+// blastRadius is handleBlastRadius's response shape: Summary's counts
+// plus what the graph alone can't say, which of the reachable data
+// resources are actually sensitive, and a severity call an incident
+// review can read in one glance rather than adding up ByKind itself.
+// See handleBlastRadius's own doc comment for exactly how Severity is
+// decided, a fixed, explainable rule, not a score nobody can reproduce.
+type blastRadius struct {
+	ID                 string                 `json:"id"`
+	Total              int                    `json:"total"`
+	ByKind             map[graph.NodeKind]int `json:"by_kind"`
+	CriticalResources  []string               `json:"critical_resources"`
+	SensitiveResources []string               `json:"sensitive_resources"`
+	Severity           string                 `json:"severity"`
+}
+
+// handleBlastRadius answers the question docs/ARCHITECTURE.md's
+// identity graph section poses but handleGraphReachable alone doesn't:
+// not just what's reachable, but how much, and how bad. Severity is a
+// fixed, explainable rule over what Reachable and internal/sensitivity
+// already know, not a tuned score: HIGH if anything reachable
+// classifies sensitivity.Critical, or five or more reachable nodes are
+// themselves agents or tools (a wide blast radius of controllable
+// things, even without touching data an operator flagged as critical);
+// MEDIUM if anything reachable classifies sensitivity.Sensitive, or at
+// least one reachable node is an agent or tool; LOW otherwise. This is
+// deliberately simple and stated plainly here so it's easy to argue
+// with and cheap to change, the same posture internal/sensitivity's own
+// rule-based classification takes, explainable over sophisticated.
+// s.sensitive nil (no NIA_SENSITIVITY_RULES_PATH configured) means
+// every data resource classifies Public, so CriticalResources and
+// SensitiveResources both always come back empty in that case, not an
+// error, just nothing declared sensitive yet.
+func (s *server) handleBlastRadius(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "node id is required")
+		return
+	}
+
+	kinds, ok := parseGraphEdgeKinds(r)
+	if !ok {
+		niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
+		return
+	}
+
+	nodes, err := s.graph.Reachable(r.Context(), id, kinds)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	summary := graph.Summarize(nodes)
+	critical := []string{}
+	sensitiveResources := []string{}
+	if s.sensitive != nil {
+		for _, n := range nodes {
+			if n.Kind != graph.NodeData {
+				continue
+			}
+			switch s.sensitive.Classify(n.ID) {
+			case sensitivity.Critical:
+				critical = append(critical, n.ID)
+			case sensitivity.Sensitive:
+				sensitiveResources = append(sensitiveResources, n.ID)
+			}
+		}
+	}
+
+	controllable := summary.ByKind[graph.NodeAgent] + summary.ByKind[graph.NodeTool]
+	severity := "LOW"
+	switch {
+	case len(critical) > 0 || controllable >= 5:
+		severity = "HIGH"
+	case len(sensitiveResources) > 0 || controllable >= 1:
+		severity = "MEDIUM"
+	}
+
+	niahttp.WriteJSON(w, http.StatusOK, blastRadius{
+		ID:                 id,
+		Total:              summary.Total,
+		ByKind:             summary.ByKind,
+		CriticalResources:  critical,
+		SensitiveResources: sensitiveResources,
+		Severity:           severity,
+	})
+}
+
 // audit appends one event, logging rather than silently dropping a
 // failure: on a security control plane, an action that didn't make it
 // into the trail is worth knowing about even when there's nothing this
@@ -712,6 +834,61 @@ func (s *server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
 func (s *server) audit(ctx context.Context, evt audit.Event) {
 	if err := s.auditLog.Append(ctx, evt); err != nil {
 		log.Printf("nia-api: audit append failed: %v", err)
+	}
+}
+
+// graphAddNode and graphAddEdge are what auto-populates the identity
+// graph from what's already known elsewhere: an agent registering, a
+// tool registering, a grant being written. Before this, an operator had
+// to add every node and edge by hand through niactl graph add-node/
+// add-edge for the graph to know anything at all, which meant a
+// blast-radius query on a freshly registered agent came back empty even
+// though the control plane already knew that agent existed. Both are
+// fail-open the same way s.audit is: the thing that actually mattered
+// (the registration, the grant) already succeeded, a graph write
+// failing alongside it is logged, not turned into a failed response,
+// AddNode and AddEdge on the in-memory implementation never actually
+// fail today, this exists for whatever backs Graph next.
+func (s *server) graphAddNode(ctx context.Context, id string, kind graph.NodeKind) {
+	if err := s.graph.AddNode(ctx, graph.Node{ID: id, Kind: kind}); err != nil {
+		log.Printf("nia-api: graph add node failed: %v", err)
+	}
+}
+
+func (s *server) graphAddEdge(ctx context.Context, from, to string, kind graph.EdgeKind) {
+	if err := s.graph.AddEdge(ctx, graph.Edge{From: from, To: to, Kind: kind}); err != nil {
+		log.Printf("nia-api: graph add edge failed: %v", err)
+	}
+}
+
+// graphAddGrantEdges is handleWriteGrants' hook into the graph: a tool
+// or data grant is also a grants edge, agent -> object, the same fact
+// internal/policy just recorded for live authorization, recorded a
+// second way for traversal. api_group and endpoint grants have no
+// natural node on either side of them, nothing here represents an API
+// group or a URL path, so those two kinds are skipped, not an
+// oversight. The object node (a tool or a data resource) is added if it
+// doesn't already exist, AddNode is idempotent, a grant naming a tool
+// or resource nobody separately registered still gets a node so the
+// edge has somewhere to point.
+//
+// Known gap, documented rather than silently wrong: handleDeleteGrants
+// does not call the mirror of this, internal/graph.Graph has no edge
+// removal primitive today, so a revoked grant still shows up as a
+// reachable edge in a blast-radius query until something adds one. An
+// operator relying on the graph for an exact, current picture after a
+// revoke should still check internal/policy's own ListGrants, the
+// graph is a superset, not a stale-safe mirror, until this is fixed.
+func (s *server) graphAddGrantEdges(ctx context.Context, ref string, grants []policy.Grant) {
+	for _, g := range grants {
+		switch g.Kind {
+		case "tool":
+			s.graphAddNode(ctx, g.Object, graph.NodeTool)
+			s.graphAddEdge(ctx, ref, g.Object, graph.EdgeGrants)
+		case "data":
+			s.graphAddNode(ctx, g.Object, graph.NodeData)
+			s.graphAddEdge(ctx, ref, g.Object, graph.EdgeGrants)
+		}
 	}
 }
 
@@ -780,6 +957,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /graph/edges", s.handleAddGraphEdge)
 	mux.HandleFunc("GET /graph/{id}/neighbors", s.handleGraphNeighbors)
 	mux.HandleFunc("GET /graph/{id}/reachable", s.handleGraphReachable)
+	mux.HandleFunc("GET /graph/{id}/blast-radius", s.handleBlastRadius)
 	return mux
 }
 
