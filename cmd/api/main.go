@@ -273,6 +273,82 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 	niahttp.WriteJSON(w, http.StatusOK, updated)
 }
 
+type registerToolRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Transport   string `json:"transport"`
+	RiskClass   string `json:"risk_class"`
+	Owner       string `json:"owner"`
+}
+
+// handleRegisterTool onboards a callable tool into the catalog the
+// gateway will eventually consult before forwarding a call. Not audited:
+// audit.Event's AgentRef is documented as "the subject the event is
+// about", an agent identity, and a tool has no agent to attach an event
+// to, the same reasoning the gateway already applies to an unresolved
+// caller. A tool-centric trail is a real gap, not an oversight, see
+// docs/ARCHITECTURE.md's audit trail row.
+func (s *server) handleRegisterTool(w http.ResponseWriter, r *http.Request) {
+	var req registerToolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	risk := tools.RiskClass(req.RiskClass)
+	switch risk {
+	case tools.RiskReadOnly, tools.RiskWrite, tools.RiskDestructive:
+	case "":
+		risk = tools.RiskReadOnly
+	default:
+		niahttp.WriteError(w, http.StatusBadRequest, "risk_class must be one of read_only, write, destructive")
+		return
+	}
+
+	tool := tools.Tool{
+		Name:        req.Name,
+		Description: req.Description,
+		Transport:   req.Transport,
+		RiskClass:   risk,
+		Owner:       req.Owner,
+	}
+	if err := s.toolCat.Register(r.Context(), tool); err != nil {
+		niahttp.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusCreated, tool)
+}
+
+func (s *server) handleListTools(w http.ResponseWriter, r *http.Request) {
+	list, err := s.toolCat.List(r.Context())
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, list)
+}
+
+func (s *server) handleGetTool(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "tool name is required")
+		return
+	}
+	tool, err := s.toolCat.Get(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, tools.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "tool not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, tool)
+}
+
 // audit appends one event, logging rather than silently dropping a
 // failure: on a security control plane, an action that didn't make it
 // into the trail is worth knowing about even when there's nothing this
@@ -336,6 +412,9 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /agents/{ref}/credentials", s.handleIssueCredential)
 	mux.HandleFunc("GET /agents/{ref}/credentials", s.handleListCredentials)
 	mux.HandleFunc("POST /credentials/{id}/revoke", s.handleRevokeCredential)
+	mux.HandleFunc("POST /tools", s.handleRegisterTool)
+	mux.HandleFunc("GET /tools", s.handleListTools)
+	mux.HandleFunc("GET /tools/{name}", s.handleGetTool)
 	mux.HandleFunc("GET /audit", s.handleRecentAudit)
 	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
 	return mux

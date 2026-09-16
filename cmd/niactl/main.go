@@ -36,6 +36,9 @@ Usage:
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
   niactl credential list -ref <agent_ref>
   niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
+  niactl tool register -name <tool_name> [-description <text>] [-transport <mcp|http|grpc>] [-risk <read_only|write|destructive>] [-owner <owner>]
+  niactl tool list
+  niactl tool get -name <tool_name>
 
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
@@ -47,6 +50,11 @@ generate the credential material itself, see internal/credentials's package
 doc for why. -ttl takes a Go duration (24h, 30m); omitted or zero means no
 expiry. credential revoke retires one key without touching the agent's
 grants or identity, use kill instead when the agent itself is compromised.
+
+tool register onboards a callable tool into the catalog, -risk defaults to
+read_only, set it honestly, it's what internal/risk will eventually score
+calls against. The gateway does not consult this catalog yet, that's a
+known gap, not a guarantee that an unregistered tool is blocked.
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
 }
@@ -68,6 +76,26 @@ func main() {
 		cmdAudit(os.Args[2:])
 	case "credential":
 		cmdCredential(os.Args[2:])
+	case "tool":
+		cmdTool(os.Args[2:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdTool(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "register":
+		cmdToolRegister(args[1:])
+	case "list":
+		cmdToolList(args[1:])
+	case "get":
+		cmdToolGet(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -199,6 +227,46 @@ func cmdCredentialRevoke(args []string) {
 		"reason":     *reason,
 	})
 	post("/credentials/"+url.PathEscape(*id)+"/revoke", body)
+}
+
+func cmdToolRegister(args []string) {
+	fs := flag.NewFlagSet("tool register", flag.ExitOnError)
+	name := fs.String("name", "", "tool name")
+	description := fs.String("description", "", "what this tool does")
+	transport := fs.String("transport", "", "how the gateway reaches it: mcp, http, or grpc")
+	risk := fs.String("risk", "read_only", "risk classification: read_only, write, or destructive")
+	owner := fs.String("owner", "", "human or team accountable for this tool")
+	_ = fs.Parse(args)
+
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "tool register: -name is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"name":        *name,
+		"description": *description,
+		"transport":   *transport,
+		"risk_class":  *risk,
+		"owner":       *owner,
+	})
+	post("/tools", body)
+}
+
+func cmdToolList(_ []string) {
+	get("/tools")
+}
+
+func cmdToolGet(args []string) {
+	fs := flag.NewFlagSet("tool get", flag.ExitOnError)
+	name := fs.String("name", "", "tool name")
+	_ = fs.Parse(args)
+
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "tool get: -name is required")
+		os.Exit(1)
+	}
+	get("/tools/" + url.PathEscape(*name))
 }
 
 func post(path string, body []byte) {

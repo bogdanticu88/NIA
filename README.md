@@ -32,6 +32,8 @@ What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `lin
 
 - `internal/credentials`: the package already had a full in-memory `Store`, issue, get, list, revoke, but nothing outside the package called it. `cmd/api` exposes it now, `POST /agents/{ref}/credentials` to issue, `GET` to list, `POST /credentials/{id}/revoke` to retire one, and `niactl credential issue` / `list` / `revoke` wrap all three. Issuing requires the agent to already be registered, revoking writes `credential.revoked` to the audit trail the same way every other control-plane action does, so `niactl audit -ref` now shows a credential's whole lifecycle next to registration and kills. Verified with `go test ./... -race`, seven new tests on the in-memory store and six on the HTTP handlers. `cmd/api` has no network path to the Go module proxy in the environment this was written in either, same constraint `PostgresSink` hit, so the whole module was verified once against a local stub of the `lib/pq` import path (nothing committed, no network involved) to get a real build/vet/test pass rather than a hand review of the new code.
 
+- `internal/registry/tools`: same gap, same fix. `cmd/api` now exposes the catalog, `POST /tools` to register, `GET /tools` and `GET /tools/{name}` to read it back, `niactl tool register` / `list` / `get` on top. Registering defaults `risk_class` to `read_only` rather than requiring it, and rejects anything else that isn't `read_only`, `write`, or `destructive`. What this doesn't do yet, and says so in the CLI's own usage text: the gateway still checks policy by tool name alone, it doesn't look the name up in this catalog first, so registering a tool is bookkeeping right now, not an enforcement gate. Verified with `go test ./... -race`, six new tests on the HTTP handlers, same build-verification path as the credentials work above.
+
 ## Layout
 
 ```
@@ -61,6 +63,9 @@ go run ./cmd/niactl register -ref agent:billing-reconciler -owner bogdan -purpos
 
 # list what's registered
 go run ./cmd/niactl list
+
+# register a tool it's allowed to call
+go run ./cmd/niactl tool register -name invoice-lookup -transport http -risk read_only -owner bogdan
 
 # issue it a credential
 go run ./cmd/niactl credential issue -ref agent:billing-reconciler -kind api_key -ttl 24h
