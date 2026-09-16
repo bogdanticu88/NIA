@@ -82,7 +82,7 @@ The brief lists seventeen things to build. None of them are new categories, they
 | Agent registration | `internal/registry` | Onboards a new `AgentRef`, mirrors Tessera's `ClientProvisioner` |
 | NHI inventory | `internal/registry` + `internal/store` | Queryable list/search over all registered identities |
 | Agent identity | `internal/identity` | Canonical `AgentRef`, assurance level, lifecycle state (active/suspended/killed) |
-| Credentials | `internal/credentials` | Issuance, rotation, binding of API keys, short-lived tokens, mTLS certs to an `AgentRef`. Tessera assumes credentials already exist and only resolves them, NIA owns the credential lifecycle itself |
+| Credentials | `internal/credentials` | Issuance, rotation, binding of API keys, short-lived tokens, mTLS certs to an `AgentRef`. Tessera assumes credentials already exist and only resolves them, NIA owns the credential lifecycle itself. Wired into `cmd/api` (`POST /agents/{ref}/credentials`, `GET` to list) and `niactl credential issue` / `list`, verified with `go test ./... -race` |
 | Permissions | `internal/policy` | Thin Go client over Tessera's `Grant` model (api_group or endpoint-level grants), extended with tool and data scoped grants |
 | Tool registration | `internal/registry/tools` (sub-package) | Catalog of callable tools, each with a risk classification |
 | MCP integration | `cmd/gateway` | MCP-aware transport in the gateway, intercepts tool-call requests, resolves the calling agent, checks policy before invoking |
@@ -91,7 +91,7 @@ The brief lists seventeen things to build. None of them are new categories, they
 | Audit trail | `internal/audit` | Append-only sink. Gateway decisions and registry changes both write here now, one event shape either way; Tessera's own `AuditEvent`s still don't, no bridge exists yet. `PostgresSink` gives it a real, shared backend, confirmed against a live stack, `nia-api` and `nia-gateway` reading and writing the same table, see "What this scaffold is, and isn't" |
 | Risk scoring | `internal/risk` | New. Scores agents and individual calls off signals: novel tool use, sensitive data touched, deviation from historical pattern. Natural fit for CENTIPEDE's anomaly detection work |
 | Runtime monitoring | `internal/monitoring` | Consumes the gateway's request stream, feeds the risk engine, raises detect/block signals |
-| Credential revocation | `internal/credentials` (revoke path) | Distinct from the kill switch: revokes one credential without killing the whole identity |
+| Credential revocation | `internal/credentials` (revoke path) | Distinct from the kill switch: revokes one credential without killing the whole identity. `POST /credentials/{id}/revoke` and `niactl credential revoke`, writes `credential.revoked` to the audit trail same as every other control-plane action, verified with `go test ./... -race` |
 | Kill switch | Tessera's `KillSwitchService`, called from `internal/policy` | Reused as-is: sentinel-first delete, confirmed, one client, nothing else touched |
 | Agent-to-agent trust | `internal/graph` | Trust edges between `AgentRef`s: which agents may invoke which other agents |
 | Delegation | `internal/graph` + `internal/policy` | "Acting on behalf of" relations layered onto OpenFGA as a `delegate` relation alongside Tessera's existing `member` / method relations |

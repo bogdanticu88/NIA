@@ -30,6 +30,8 @@ What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `lin
 
 - `internal/audit.PostgresSink`: a real, shared `Store` backing the trail, `database/sql` plus `lib/pq`, schema created on first connect (`CREATE TABLE IF NOT EXISTS`, see `postgres_sink.go`, this table's shape has never changed and doesn't warrant a migration framework yet). `audit.FromEnv` picks it over `InMemorySink` when `NIA_AUDIT_DATABASE_URL` is set, same pattern as `policy.FromEnv`, and `deployments/docker-compose.yml` points both NIA services at the stack's own `postgres` service so they share one trail instead of two. Written somewhere with no network path to the Go module proxy, so it went through three separate confirmations once real internet was available rather than one: `go mod tidy && go build ./... && go vet ./... && go test ./... -race` (clean, including the new code's first real compile), the opt-in live test against a standalone `postgres` container (`NIA_AUDIT_TEST_DATABASE_URL=... go test ./internal/audit/... -run TestPostgresSink_Live -v`, confirms inserts and both read paths against a real database), and the full `docker compose up -d --build` stack, registered an agent through `nia-api`, called `nia-gateway` with no grants yet (denied), killed the agent, then read `GET /agents/{ref}/audit` back from `nia-api` and got `agent.registered`, `gateway.denied`, `agent.killed`, all three, correctly ordered, one process reading back what another process wrote. That last part is the actual point: the two services now genuinely share one audit trail instead of each keeping its own.
 
+- `internal/credentials`: the package already had a full in-memory `Store`, issue, get, list, revoke, but nothing outside the package called it. `cmd/api` exposes it now, `POST /agents/{ref}/credentials` to issue, `GET` to list, `POST /credentials/{id}/revoke` to retire one, and `niactl credential issue` / `list` / `revoke` wrap all three. Issuing requires the agent to already be registered, revoking writes `credential.revoked` to the audit trail the same way every other control-plane action does, so `niactl audit -ref` now shows a credential's whole lifecycle next to registration and kills. Verified with `go test ./... -race`, seven new tests on the in-memory store and six on the HTTP handlers. `cmd/api` has no network path to the Go module proxy in the environment this was written in either, same constraint `PostgresSink` hit, so the whole module was verified once against a local stub of the `lib/pq` import path (nothing committed, no network involved) to get a real build/vet/test pass rather than a hand review of the new code.
+
 ## Layout
 
 ```
@@ -60,7 +62,13 @@ go run ./cmd/niactl register -ref agent:billing-reconciler -owner bogdan -purpos
 # list what's registered
 go run ./cmd/niactl list
 
-# pull the kill switch
+# issue it a credential
+go run ./cmd/niactl credential issue -ref agent:billing-reconciler -kind api_key -ttl 24h
+
+# revoke one key without touching the agent itself
+go run ./cmd/niactl credential revoke -id <credential_id> -reason "key leaked in a log"
+
+# pull the kill switch, the bigger hammer, for when the agent itself is compromised
 go run ./cmd/niactl kill -ref agent:billing-reconciler -incident INC-001
 
 # review what happened to it
