@@ -1,0 +1,199 @@
+# NIA threat model
+
+This is not a marketing list of things NIA "handles." Every threat below gets checked against the actual code, function by function, and classified honestly across five questions: does NIA stop this before it happens (Prevent), notice it while or after it happens (Detect), limit or cut off the damage once noticed (Contain), leave enough evidence to reconstruct what happened afterward (Investigate), and where does none of that apply yet (Not covered). Most threats here land on more than one of these, few land on all five, and several are honestly Not covered outright. That's the point of writing this down rather than letting docs/ARCHITECTURE.md's per-component claims imply more coverage than actually exists when read together.
+
+Scope: this is the threat model for NIA's own control plane, the identity, authorization, monitoring, and evidence layer around agents. It is not a threat model for Tessera's OpenFGA integration (see Tessera's own repo for that), and it is not a threat model for whatever the agents themselves do once a tool call is allowed, NIA gates access to a tool, it does not currently forward the call or inspect the tool's response, see `cmd/gateway`'s `handleToolCall` doc comment.
+
+* * *
+
+### 1. Stolen or leaked agent credential used by an attacker outside the agent
+
+An attacker gets hold of an agent's API key or token (leaked in a log, checked into a repo, exfiltrated from wherever the agent stores it) and uses it directly, bypassing the agent's own code entirely.
+
+**Prevent:** Nothing today. `internal/credentials` issues, lists, and revokes credentials, but the gateway's own identity resolver, `headerResolver` in `cmd/gateway/main.go`, never checks a credential against a request at all, it trusts an `X-Agent-Ref` header outright. A stolen credential isn't even required for an attacker who can set that header, see threat 2.
+
+**Detect:** Only indirectly, through the same risk signals that would flag the agent's own compromise, `novel_tool`, risk-class weighting, sensitive-resource touches (`internal/risk.HistoryScorer`). Nothing distinguishes "the real agent doing something unusual" from "an attacker using its stolen key doing something unusual," the identity looks identical either way.
+
+**Contain:** `internal/credentials.Store`'s revoke path exists and `POST /credentials/{id}/revoke` works, and `internal/monitoring.Monitor`'s `ActionRevoke` is real code that calls it, but `cmd/gateway`'s own `main()` wires the monitor with a `nil` credentials.Store (`monitoring.NewMonitor(thresholds, pol, nil, incidents, auditLog)`), so in the shipped gateway, crossing the revoke threshold degrades to an audited no-op, see `revokeCredentials`'s doc comment. The kill switch is the actual containment lever today, `niactl kill` or an `ActionKill` from monitoring denies every subsequent call for that agent ref regardless of which credential made it, confirmed against a real Tessera/OpenFGA stack.
+
+**Investigate:** `internal/audit` has every allowed and denied call the stolen credential made, under the agent's ref, and `internal/credentials.Store` can show which credentials were active for that agent at the time. There's no way to tell after the fact which specific credential, if more than one was active, actually made a given call, `internal/audit.Event` doesn't carry a credential ID.
+
+**Not covered:** Credential-to-request binding at the gateway. This is the single largest gap in NIA's current threat coverage, everything else in this document assumes the caller is who it claims to be, and nothing enforces that yet.
+
+* * *
+
+### 2. Spoofed caller identity, no credential at all
+
+Anyone who can reach `cmd/gateway` sets `X-Agent-Ref: agent:billing-reconciler` and is treated as that agent, no proof of anything required.
+
+**Prevent:** None. `headerResolver.Resolve` (`cmd/gateway/main.go`) reads the header and returns `identity.AssuranceWeak` for whatever it finds, unconditionally. Its own doc comment says this plainly: "not production-grade, real deployments resolve identity from a verified JWT claim, an mTLS certificate thumbprint, or an API key lookup... swapping this out is the first thing a real deployment should do." `identity.Resolver` is an interface specifically so this is swappable, but nothing in this repo swaps it yet.
+
+**Detect:** `AssuranceWeak` is recorded on the resolved identity but nothing currently reads or acts on it, no signal, no audit annotation, no risk weighting keyed off assurance level. It's plumbing for a future check, not a current one.
+
+**Contain:** Whatever containment applies to the spoofed identity's ref, kill, revoke, applies the same as if the real agent were compromised, see threat 1. If the attacker instead spoofs a ref that was never registered, `internal/policy.Check` still runs, most policy engines including the in-memory reference and Tessera treat an unknown subject as having no grants, so an unregistered ref gets denied by default, not admitted.
+
+**Investigate:** Same as threat 1, the audit trail records calls under whatever ref was spoofed, indistinguishable from that ref's own real traffic.
+
+**Not covered:** Any actual authentication of the caller. This is threat 1's root cause, not a separate gap, fixing `identity.Resolver`'s reference implementation fixes both.
+
+* * *
+
+### 3. Over-privileged agent, standing grants broader than the job needs
+
+An agent is granted every tool it might conceivably need up front, RBAC says yes to all of it, and most of that access is never exercised in normal operation, exactly the setup `niactl simulate attack -scenario agent-hijack` models on purpose.
+
+**Prevent:** Nothing prevents an operator from over-granting, `internal/policy.WriteGrants` has no notion of least privilege or unused-grant flagging, it writes whatever it's told. This is a design and process problem, not something an authorization control plane can solve unilaterally.
+
+**Detect:** This is what `internal/risk.HistoryScorer`'s `novel_tool` signal exists for, an agent calling a tool it's authorized for but has never used before scores as risk, over-provisioning becomes visible the first time it's actually exercised rather than staying invisible forever. `GET /graph/{id}/blast-radius` also makes the standing exposure itself visible before anything happens, an operator can query what an agent could reach right now and get a `HIGH`/`MEDIUM`/`LOW` call on it.
+
+**Contain:** The same flag/revoke/kill thresholds as any other risk-driven containment, once the excess access actually gets used.
+
+**Investigate:** `internal/audit` and `internal/incident` both show exactly which grant got exercised and when. `internal/graph`'s reachability query can answer "what else could this agent have reached" as part of a post-incident review, not just what it did reach.
+
+**Not covered:** Proactive least-privilege enforcement, there's no "flag grants nobody has used in 90 days" report or anything like it. This is a real, scoped gap, not a placeholder for something claimed elsewhere.
+
+* * *
+
+### 4. Compromised agent escalating through tools it's authorized for but rarely uses
+
+The agent's own reasoning is hijacked, through a prompt injection, a poisoned input, a compromised dependency, whatever the mechanism, and it starts calling tools that are technically within its granted permissions but outside its normal behavior.
+
+**Prevent:** Not by NIA, this is upstream of what an authorization and monitoring layer can stop, the call is authorized, that's the premise of the scenario.
+
+**Detect:** This is the core thing `internal/risk.HistoryScorer` is built for. `novel_tool` catches a tool the agent has never called before, the risk-class-weighted signal catches escalation toward destructive tools specifically, and `internal/monitoring.Monitor` accumulates these into a running per-agent total rather than judging each call alone, so a sequence of individually-small-looking escalations still adds up. `niactl simulate attack -scenario agent-hijack` demonstrates exactly this pattern end to end.
+
+**Contain:** Real, not simulated. Crossing the kill threshold calls `internal/policy.Kill`, which is confirmed against a live Tessera/OpenFGA stack to actually deny the next request, not just log that it would have. Crossing the flag threshold currently only audits, it doesn't reduce access, that's an honest gap, flag is a signal for a human to look at, not an automatic containment action today.
+
+**Investigate:** `internal/incident` records the exact signals, weights, and cumulative total that triggered containment, and `GET /graph/{id}/blast-radius` on the agent shows what it could still have reached had containment not fired.
+
+**Not covered:** Detection here is signature-free but still shallow, three signals (novel tool, risk class, sensitive resource), not the fuller privilege-deviation or sequence-anomaly detection the original engineering directive called for, both still open per the roadmap in the project's implementation assessment. `CENTIPEDE`-style anomaly detection replacing `HistoryScorer` outright is still an intent, not code.
+
+* * *
+
+### 5. Compromised agent exfiltrating a sensitive field through a tool it's authorized to call
+
+The agent is legitimately allowed to call `database.query`, but an attacker directs it to query a column, `customers.ssn`, that goes well beyond what its normal job touches.
+
+**Prevent:** Real, not just detected after the fact. When `NIA_GATEWAY_RESOURCE_RULES_PATH` is set, `ArgumentResourcePolicy` (`cmd/gateway/resources.go`) turns the call's arguments into resource names, and anything `internal/sensitivity` classifies `sensitive` or above needs its own `policy.GrantForData` grant, checked and denied separately from the tool-level grant if missing, `gateway.denied` naming the specific resource. This is the Agent+Tool+Resource decision, not only Agent+Tool, and `niactl simulate attack`'s own transcript shows a real 403 on exactly this pattern.
+
+**Detect:** `internal/risk.HistoryScorer`'s `sensitive_resource` signal adds to the risk total the same call already crossed the data-grant check for, or, if the resource wasn't classified sensitive enough to require its own grant, at least contributes to the running total.
+
+**Contain:** Immediate for a classified resource, the request is denied in that same call, not after review. For an unclassified but actually-sensitive resource nobody wrote a rule for, containment falls back to the general risk-accumulation path in threat 4.
+
+**Investigate:** The audit event names the specific resource denied, not just the tool. `internal/incident` records don't currently carry the resource name in a structured field, only inside the free-text reason and signal names, a real gap for tooling that wants to query "which incidents involved this specific column" directly rather than grepping.
+
+**Not covered:** Anything not named in `NIA_GATEWAY_RESOURCE_RULES_PATH`'s rules. `internal/sensitivity` is a flat, explicit rule list on purpose, explainable over inferred, which means an unclassified resource is silently `public` and gets no extra check at all, a real and deliberate tradeoff, not an oversight, see the package's own doc comment.
+
+* * *
+
+### 6. Malicious or compromised tool, or a compromised MCP server
+
+The tool an agent calls, or the MCP server fronting it, is itself malicious or compromised, and returns attacker-controlled output back to the agent, or silently does something other than what its registration claims.
+
+**Prevent:** Registration-time only. `internal/registry/tools` requires a tool to be registered with a declared risk class before the gateway's catalog check (`NIA_TOOLS_API_URL`) will let a call through at all, so an entirely unregistered tool is rejected outright. Nothing verifies that a registered tool's actual behavior matches its declared risk class, or that its MCP endpoint is what it claims to be, that's a trust relationship with whoever registered it, not something NIA independently verifies.
+
+**Detect:** Not by NIA. The gateway is explicitly an authorization decision point, it does not forward the call to the tool's real transport or inspect what comes back, see `handleToolCall`'s own comment: "a real deployment forwards the request to the tool's actual transport here. Left as the integration point rather than stubbed with a fake tool response." There is currently nothing on the other side of that integration point for NIA to detect anything with.
+
+**Contain:** N/A, follows from Detect.
+
+**Investigate:** The audit trail shows which tool was called and when, useful context if a tool is later found to be compromised, an operator can find every agent that called it. Nothing about the tool's actual response is captured anywhere.
+
+**Not covered:** This entire threat, essentially. NIA today is an authorization and monitoring layer in front of tool calls, not a proxy that inspects tool responses. Stated plainly rather than implied away: this is out of scope for the current implementation, not solved by anything described elsewhere in this document.
+
+* * *
+
+### 7. Agent-to-agent trust and delegation abuse
+
+A compromised or malicious agent uses a `trusts` or `delegates_to` relationship to reach a more privileged agent, or to have another agent act on its behalf beyond what was intended.
+
+**Prevent:** Not yet. `internal/graph` records `trusts` and `delegates_to` edges, `POST /graph/edges` and `niactl graph add-edge`, and they're queryable, but `internal/policy`'s live authorization check does not consult the graph at all, a `delegates_to` edge doesn't change what OpenFGA allows. This is documented plainly in docs/ARCHITECTURE.md's Delegation row, not a silent gap.
+
+**Detect:** Only as bookkeeping. `GET /graph/{id}/reachable` or `blast-radius` following `delegates_to` and `trusts` edges will show a delegation chain if someone queries for it, nothing runs that query proactively or flags an unusual delegation pattern.
+
+**Contain:** Whatever the receiving agent's own grants and risk thresholds provide, the delegation relationship itself has no separate containment lever, killing the delegating agent doesn't automatically constrain what the delegate can still do, since the delegate's authorization was never actually conditioned on the delegation edge in the first place.
+
+**Investigate:** The graph can answer "what did this agent trust or delegate to" after the fact, useful for scoping an incident's blast radius even though it wasn't enforced live.
+
+**Not covered:** Live enforcement of trust and delegation. Closing this needs `delegate` layered onto OpenFGA as a relation Tessera's own checks understand, so a delegation edge actually changes what the gateway allows rather than only what the graph reports, tracked as open work, not attempted in this pass.
+
+* * *
+
+### 8. Kill switch bypass, a killed agent continuing to act
+
+Whether through a race, a cached decision, or a second policy-engine instance that didn't see the kill, a killed agent's calls keep getting allowed.
+
+**Prevent:** The core invariant holds by design: `InMemoryClient.Check` and Tessera's own `CheckAsync` both consult the kill sentinel before anything else, sentinel-first, and `Kill` clears grants at the same time it sets the sentinel so a concurrent grant write can't land after a kill and resurrect access. There is no cache on the hot path, `internal/policy.Check` is a live, per-request call every time, confirmed end to end against a real Tessera/OpenFGA stack: kill, then check, denied, real tuples deleted from a real store.
+
+**Detect:** N/A within a single, correctly-running instance, prevention is the mechanism here, not detection after the fact.
+
+**Contain:** N/A, follows from Prevent holding.
+
+**Investigate:** `internal/audit` records the kill event itself (`agent.killed`) and every subsequent `gateway.denied` for that agent, a clean before/after in the trail.
+
+**Not covered:** Multi-replica correctness. `TesseraHTTPClient`'s read-modify-write grant reconciliation only serializes within one client instance, and if more than one `cmd/api` or `cmd/gateway` process talks to the same Tessera/OpenFGA backend concurrently, a kill from one instance racing a grant write from another isn't proven safe, this needs Tessera-side advisory locking, already on Tessera's own roadmap, and is tracked as an explicit, ongoing gap rather than solved inside NIA's repo, see docs/ARCHITECTURE.md's Integration plan section. This is the one threat on this list where the single-instance answer is genuinely strong and the multi-instance answer is genuinely unverified, worth keeping those two facts separate rather than letting the first imply the second.
+
+* * *
+
+### 9. Audit trail tampering or silent loss
+
+An attacker with database access to the audit store, or a bug, deletes or alters records to cover tracks, or the audit write itself silently fails and nobody notices.
+
+**Prevent:** No tamper-resistance. `internal/audit.PostgresSink` is a plain `INSERT`-only table, `CREATE TABLE IF NOT EXISTS`, no hash chaining, no append-only database constraint, no separate write-only credential for the audit path. Anyone with write access to that Postgres instance can alter or delete rows undetected.
+
+**Detect:** Only for the failure-to-write case, and only as a log line, not an alert: `s.audit()` in `cmd/api` and the gateway's own `audit()` helper both log an append failure (`log.Printf`) and continue, the action they're recording already succeeded either way. This is documented as a deliberate fail-open choice, not an oversight, see the implementation assessment's Correctness section, but it means an audit outage produces no alarm beyond a log line an operator has to be watching for.
+
+**Contain:** N/A, this threat is about the evidence trail itself, not an ongoing action to stop.
+
+**Investigate:** Ironically the weakest category for this specific threat, tampering that already happened leaves no trace to investigate by design, there's no separate integrity check to compare against.
+
+**Not covered:** Tamper-evidence of any kind, append-only storage guarantees, write-path alerting beyond a log line, and a fail-closed mode for audit writes (today, every audited action succeeds whether or not its audit event was actually recorded). This is a real, named gap, not implied coverage.
+
+* * *
+
+### 10. High-volume or resource-exhaustion abuse by a compromised agent
+
+A compromised agent calls tools rapidly, far outside its normal request volume, either to exfiltrate data fast before it's caught or simply to run up cost and load.
+
+**Prevent:** None. No rate limiting exists anywhere in `cmd/gateway`.
+
+**Detect:** None currently. `internal/risk.Signal`'s own doc comment names `volume_deviation` as an intended future signal, but `HistoryScorer` doesn't implement it, there's no request-rate tracking in this codebase to detect a burst against.
+
+**Contain:** Indirect only, if the burst happens to also trip `novel_tool` or a sensitive-resource check, normal containment applies, but a burst of calls to tools the agent already uses normally would sail through today.
+
+**Investigate:** `internal/audit` has a timestamped record of every call, so a burst is visible after the fact to anyone who thinks to look at call frequency, nothing surfaces it proactively.
+
+**Not covered:** This entire threat category. Named directly rather than folded into a vaguer "risk scoring covers behavioral anomalies" claim, it doesn't, not this one, yet.
+
+* * *
+
+### 11. Concurrent control-plane instances racing each other
+
+More than one `cmd/api` or `cmd/gateway` process, or more than one `Tessera.Service` instance, handles requests against the same backing store at the same time.
+
+**Prevent, Detect, Contain:** Unverified in either direction. This isn't a threat NIA has evidence of handling correctly or incorrectly, it hasn't been exercised, single-instance correctness (see threat 8) doesn't generalize to it automatically. `internal/incident.InMemoryStore` and `cmd/gateway`'s in-memory incident store are explicitly process-local too, a second gateway replica wouldn't even see the first one's incident records, a real availability and consistency gap for anyone running more than one replica, independent of the Tessera-side race.
+
+**Investigate:** Whatever each individual instance's own audit and incident records show, with no cross-instance correlation, two replicas' worth of records for the same agent aren't merged or reconciled anywhere.
+
+**Not covered:** Everything about actual multi-replica operation. This is scoped out deliberately, see docs/ARCHITECTURE.md's Integration plan section, and tracked as dependent on Tessera-side locking work rather than something NIA's repo can close alone.
+
+* * *
+
+### 12. An operator misusing the control plane itself
+
+Someone with legitimate `niactl`/`cmd/api` access, a human operator, grants excessive access, kills the wrong agent, or issues credentials they shouldn't, whether by mistake or by insider intent.
+
+**Prevent:** Not scoped. NIA has no notion of operator-level authorization yet, whoever can reach `cmd/api` can register agents, write grants, issue credentials, and kill or restore anything, there's no RBAC on the control plane's own operations. `TesseraHTTPClient`'s own doc comment notes a related, narrower version of this: most calls other than Kill authenticate as a configured system identity rather than a real per-operator one, `Client.Restore` and the others carry no operator parameter to sign with, so even where Tessera has room for per-operator identity, NIA's own client doesn't populate it yet.
+
+**Detect:** Not proactively, an unusual pattern of operator actions (mass grants, rapid credential issuance) isn't flagged, only visible to someone manually reviewing the audit trail.
+
+**Contain:** N/A, no separate operator-action containment lever exists distinct from the mechanisms already covering agents (a bad grant can be deleted, a bad kill can be restored).
+
+**Investigate:** Every registration, grant, credential, and kill/restore action writes to `internal/audit`, `niactl kill` already requires an `-incident` string, and `internal/audit.Event` records what happened, though not which operator did it beyond whatever system identity `internal/policy` authenticated as, see the Prevent note above, the audit trail can show what changed but not reliably who changed it.
+
+**Not covered:** Per-operator authentication and authorization on the control plane's own API, and any anomaly detection over operator behavior itself. NIA secures what agents can do, it does not yet secure who gets to configure NIA.
+
+* * *
+
+### What this document is not
+
+This is not a claim that every threat above is fully handled, several are explicitly Not covered, and several land on Prevent only because the specific mechanism (the kill switch, the data-grant check) happens to be real, not because the surrounding category is solved. It should be re-read and re-scored honestly as coverage changes, the same discipline docs/ARCHITECTURE.md's own "What this scaffold is, and isn't" section applies to individual components, applied here at the threat level instead.

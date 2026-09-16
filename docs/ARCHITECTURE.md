@@ -192,7 +192,8 @@ nia/
 │   └── docker-compose.yml   nia-api, nia-gateway, tessera, openfga, postgres
 └── docs/
     ├── ARCHITECTURE.md   this file
-    └── DATA_MODEL.md     identity graph schema in detail
+    ├── DATA_MODEL.md     identity graph schema in detail
+    └── THREAT_MODEL.md   per-threat Prevent/Detect/Contain/Investigate breakdown, including what isn't covered yet
 ```
 
 Every `internal/*` package that stands in for a not-yet-implemented piece of Tessera ships with an in-memory reference implementation, same choice Tessera itself made, so the whole thing runs locally without external dependencies while the real adapters get built.
