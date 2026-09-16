@@ -11,7 +11,7 @@ An agent security control plane: know what an agent is allowed to do, who author
 
 NIA generalizes [Tessera](https://github.com/bogdanticu88/tessera), a relationship-based authorization control plane built on [OpenFGA](https://openfga.dev), from "M2M API client" to "AI agent." Tessera's live per-request checks and surgical kill switch aren't rebuilt here, they're reused as the policy engine layer. NIA adds agent registration, credential lifecycle, tool and MCP awareness, risk scoring, runtime monitoring, agent-to-agent trust, delegation, and an identity graph on top.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and the seventeen-item MVP-to-module map, [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) for the identity graph schema, and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for an honest, per-threat Prevent/Detect/Contain/Investigate breakdown, including what's explicitly not covered yet.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and the seventeen-item MVP-to-module map, [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) for the identity graph schema, [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for an honest, per-threat Prevent/Detect/Contain/Investigate breakdown, including what's explicitly not covered yet, and [`docs/SECURITY_INVARIANTS.md`](docs/SECURITY_INVARIANTS.md) for specific, tested claims about what NIA guarantees, each one pointing at the test that actually checks it.
 
 ## Status
 
@@ -56,6 +56,8 @@ What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `lin
 
 - `docs/THREAT_MODEL.md` is new: twelve threats, from stolen credentials and spoofed identity through operator misuse, each scored honestly across Prevent/Detect/Contain/Investigate/Not covered against the actual code, not a blanket "risk scoring catches anomalies" claim. It names the same gaps documented elsewhere in this README and in docs/ARCHITECTURE.md in one place, alongside what genuinely works: the kill switch's sentinel-first invariant, the resource-sensitivity data-grant check, and the risk-accumulation containment path all hold up under this scrutiny, while identity resolution (the gateway trusts an `X-Agent-Ref` header outright, no credential or signature check), tool-response inspection (the gateway is an authorization decision point, it doesn't forward calls or see what a tool actually returns), rate limiting, audit tamper-resistance, and multi-replica correctness are all named as real, current gaps rather than implied handled. No code changed for this phase, this is a documentation-only pass, the kind of honest accounting the directive asked for before adding anything else.
 
+- `docs/SECURITY_INVARIANTS.md` is new, phase 6: ten specific, checkable claims about what NIA guarantees, each pointing at the test that actually verifies it, not just the doc comment that claims it. Closed along the way rather than just documented: two real bugs in `cmd/api/main.go`, `handleKill` discarding the local registry's `SetState` error after a policy-level kill succeeded (now logged, not silently dropped, the kill itself was never blocked either way), and `handleRegisterAgent`/`handleRegisterTool` mapping every registration error straight to 409 without checking it was an actual duplicate (now 500 for anything else). Also closed: three fail-open postures, an audit write failing, a graph write failing, an incident-store write failing, were previously described in prose only and never actually exercised by a test that fails the write and confirms the underlying action still succeeds; all three now are, using test doubles that force the failure (`failingAuditStore`, `failingGraph`, the existing `failingIncidentStore` from phase 3). Verified with `go test ./... -race`: eight new `cmd/api` tests in `invariants_test.go` covering both bug fixes and the audit and graph fail-open paths, the kill and incident invariants reuse tests that already existed in `internal/policy`, `internal/monitoring`, and `cmd/gateway` rather than duplicating coverage, `docs/SECURITY_INVARIANTS.md` names each one directly. No behavior changed for the fail-open postures themselves, they were correct before this pass too, what changed is that they're now proven rather than only claimed.
+
 ## Layout
 
 ```
@@ -64,7 +66,7 @@ cmd/gateway    Agent/MCP gateway: the hot path, resolve -> check -> forward
 cmd/niactl     operator CLI, talks to cmd/api over HTTP (and cmd/gateway directly for gateway call / simulate attack)
 internal/      identity, registry, credentials, policy, audit, risk, monitoring, incident, graph
 deployments/   Dockerfiles, docker-compose, and the OpenFGA store/model bootstrap for local dev
-docs/          architecture, data model, and threat model
+docs/          architecture, data model, threat model, and security invariants
 ```
 
 ## Running locally

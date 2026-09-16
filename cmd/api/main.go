@@ -118,7 +118,17 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	if err := s.agents.Register(ctx, agent); err != nil {
-		niahttp.WriteError(w, http.StatusConflict, err.Error())
+		// The in-memory registry only ever returns ErrAlreadyRegistered,
+		// which made this safe to map straight to 409 without checking,
+		// but that stops being true the day this is backed by something
+		// real that can fail other ways (a database down, say), and a
+		// caller deserves 500, not a false "you already registered
+		// this," for that. See docs/SECURITY_INVARIANTS.md.
+		if errors.Is(err, registry.ErrAlreadyRegistered) {
+			niahttp.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.graphAddNode(ctx, agent.Ref, graph.NodeAgent)
@@ -158,7 +168,16 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.agents.SetState(ctx, req.AgentRef, identity.StateKilled)
+	// The kill itself already succeeded, that's what actually matters,
+	// so a failure here is logged rather than turned into a failed
+	// response, same fail-open posture as s.audit and the graph
+	// auto-population helpers, see docs/SECURITY_INVARIANTS.md. Silently
+	// discarding this error used to mean the registry could report an
+	// agent as active that Tessera/OpenFGA had actually killed, with
+	// nothing to show for it, not even a log line.
+	if err := s.agents.SetState(ctx, req.AgentRef, identity.StateKilled); err != nil {
+		log.Printf("nia-api: registry state update to killed failed for %s: %v", req.AgentRef, err)
+	}
 	s.audit(ctx, audit.Event{
 		Action:   "agent.killed",
 		AgentRef: req.AgentRef,
@@ -335,7 +354,14 @@ func (s *server) handleRegisterTool(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	if err := s.toolCat.Register(ctx, tool); err != nil {
-		niahttp.WriteError(w, http.StatusConflict, err.Error())
+		// Same fix as handleRegisterAgent above and for the same reason,
+		// see docs/SECURITY_INVARIANTS.md: only an actual duplicate is a
+		// 409, anything else is a 500.
+		if errors.Is(err, tools.ErrAlreadyRegistered) {
+			niahttp.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.graphAddNode(ctx, tool.Name, graph.NodeTool)
