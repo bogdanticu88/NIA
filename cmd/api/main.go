@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -152,6 +153,126 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, result)
 }
 
+type issueCredentialRequest struct {
+	Kind       string `json:"kind"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+	Operator   string `json:"operator"`
+}
+
+// handleIssueCredential mints credential metadata for an already
+// registered agent. It requires the agent to exist first, issuance
+// isn't a backdoor way to create an identity record, registration is
+// (see handleRegisterAgent). The credential material itself is never
+// generated here, see internal/credentials's package doc for why.
+func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.agents.Get(ctx, ref); err != nil {
+		niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
+		return
+	}
+
+	var req issueCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	kind := credentials.Kind(req.Kind)
+	switch kind {
+	case credentials.KindAPIKey, credentials.KindOAuthToken, credentials.KindMTLSCert:
+	default:
+		niahttp.WriteError(w, http.StatusBadRequest, "kind must be one of api_key, oauth_token, mtls_cert")
+		return
+	}
+	var ttl time.Duration
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+
+	cred, err := s.creds.Issue(ctx, ref, kind, ttl)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "credential.issued",
+		AgentRef: ref,
+		Operator: req.Operator,
+		Detail:   string(kind) + " " + cred.ID,
+		At:       time.Now(),
+	})
+	niahttp.WriteJSON(w, http.StatusCreated, cred)
+}
+
+func (s *server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	creds, err := s.creds.ListForAgent(r.Context(), ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, creds)
+}
+
+type revokeCredentialRequest struct {
+	RevokedBy string `json:"revoked_by"`
+	Reason    string `json:"reason"`
+}
+
+// handleRevokeCredential retires one credential. This is deliberately
+// smaller than handleKill: it takes out one key, not the whole agent,
+// see internal/credentials's package doc for why the two are kept
+// separate rather than folded into one endpoint.
+func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "credential id is required")
+		return
+	}
+	var req revokeCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	ctx := r.Context()
+	cred, err := s.creds.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, credentials.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "credential not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.creds.Revoke(ctx, id, req.RevokedBy, req.Reason); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "credential.revoked",
+		AgentRef: cred.AgentRef,
+		Operator: req.RevokedBy,
+		Detail:   req.Reason,
+		At:       time.Now(),
+	})
+
+	updated, err := s.creds.Get(ctx, id)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
 // audit appends one event, logging rather than silently dropping a
 // failure: on a security control plane, an action that didn't make it
 // into the trail is worth knowing about even when there's nothing this
@@ -212,6 +333,9 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
 	mux.HandleFunc("GET /agents", s.handleListAgents)
 	mux.HandleFunc("POST /policy/kill", s.handleKill)
+	mux.HandleFunc("POST /agents/{ref}/credentials", s.handleIssueCredential)
+	mux.HandleFunc("GET /agents/{ref}/credentials", s.handleListCredentials)
+	mux.HandleFunc("POST /credentials/{id}/revoke", s.handleRevokeCredential)
 	mux.HandleFunc("GET /audit", s.handleRecentAudit)
 	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
 	return mux

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 )
 
 func apiAddr() string {
@@ -32,11 +33,20 @@ Usage:
   niactl list
   niactl kill -ref <agent_ref> -incident <incident_id> [-operator <name>]
   niactl audit [-ref <agent_ref>] [-limit <n>]
+  niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
+  niactl credential list -ref <agent_ref>
+  niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
 
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
 incident review starts with. Without -ref it shows the n most recent
 events across every agent (default 100).
+
+credential issue only mints metadata, an id, kind, and expiry, NIA does not
+generate the credential material itself, see internal/credentials's package
+doc for why. -ttl takes a Go duration (24h, 30m); omitted or zero means no
+expiry. credential revoke retires one key without touching the agent's
+grants or identity, use kill instead when the agent itself is compromised.
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
 }
@@ -56,6 +66,26 @@ func main() {
 		cmdKill(os.Args[2:])
 	case "audit":
 		cmdAudit(os.Args[2:])
+	case "credential":
+		cmdCredential(os.Args[2:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdCredential(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "issue":
+		cmdCredentialIssue(args[1:])
+	case "list":
+		cmdCredentialList(args[1:])
+	case "revoke":
+		cmdCredentialRevoke(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -117,6 +147,58 @@ func cmdAudit(args []string) {
 		return
 	}
 	get(fmt.Sprintf("/audit?limit=%d", *limit))
+}
+
+func cmdCredentialIssue(args []string) {
+	fs := flag.NewFlagSet("credential issue", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref to issue the credential for")
+	kind := fs.String("kind", "api_key", "credential kind: api_key, oauth_token, or mtls_cert")
+	ttl := fs.Duration("ttl", 0, "how long the credential is valid for, e.g. 24h; 0 means no expiry")
+	operator := fs.String("operator", "niactl", "who is issuing this")
+	_ = fs.Parse(args)
+
+	if *ref == "" {
+		fmt.Fprintln(os.Stderr, "credential issue: -ref is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"kind":        *kind,
+		"ttl_seconds": int64(*ttl / time.Second),
+		"operator":    *operator,
+	})
+	post("/agents/"+url.PathEscape(*ref)+"/credentials", body)
+}
+
+func cmdCredentialList(args []string) {
+	fs := flag.NewFlagSet("credential list", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref to list credentials for")
+	_ = fs.Parse(args)
+
+	if *ref == "" {
+		fmt.Fprintln(os.Stderr, "credential list: -ref is required")
+		os.Exit(1)
+	}
+	get("/agents/" + url.PathEscape(*ref) + "/credentials")
+}
+
+func cmdCredentialRevoke(args []string) {
+	fs := flag.NewFlagSet("credential revoke", flag.ExitOnError)
+	id := fs.String("id", "", "credential id to revoke")
+	reason := fs.String("reason", "", "why this credential is being revoked")
+	operator := fs.String("operator", "niactl", "who is revoking this")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "credential revoke: -id is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"revoked_by": *operator,
+		"reason":     *reason,
+	})
+	post("/credentials/"+url.PathEscape(*id)+"/revoke", body)
 }
 
 func post(path string, body []byte) {
