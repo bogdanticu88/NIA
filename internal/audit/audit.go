@@ -115,9 +115,11 @@ var (
 	_ Store = (*InMemorySink)(nil)
 )
 
-// Not yet real: this package still has exactly one implementation, and
-// it forgets everything on restart and can't be shared across the
-// nia-api and nia-gateway processes that both want to write to it, so
-// "one stream" in the package doc above is aspirational until a
-// Postgres-backed Store exists. That's the next piece of work, not
-// started here, see docs/ARCHITECTURE.md's audit trail row.
+// PostgresSink (postgres_sink.go) is the shared backend: point cmd/api
+// and cmd/gateway at the same database via NIA_AUDIT_DATABASE_URL (see
+// from_env.go) and "one stream" in the package doc above stops being
+// aspirational, both processes read and write the same table instead
+// of each keeping its own in-memory history. Wiring that in is
+// deployment configuration, not code, see docker-compose.yml and
+// README.md's Status section for what's actually been run against a
+// real instance.

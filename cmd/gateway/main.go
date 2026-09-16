@@ -158,15 +158,20 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 
-	// In-memory for now, same as cmd/api: fine for local dev, but two
-	// separate processes each keeping their own audit events in memory
-	// means there is no single "one stream" to review yet, only a
-	// shared backend (audit.Store, not written yet, see internal/audit's
-	// closing comment) actually delivers what the package doc promises.
+	// Same audit.FromEnv switch cmd/api uses: NIA_AUDIT_DATABASE_URL
+	// unset means an in-memory sink private to this process, set it (to
+	// the same value cmd/api is started with) and both processes share
+	// one real audit trail instead of two separate in-memory ones, see
+	// internal/audit/from_env.go and PostgresSink's doc comment.
+	auditLog, err := audit.FromEnv(context.Background())
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
 	g := &gateway{
 		resolver: headerResolver{headerName: "X-Agent-Ref"},
 		pol:      pol,
-		auditLog: audit.NewInMemorySink(10_000),
+		auditLog: auditLog,
 	}
 
 	srv := &http.Server{

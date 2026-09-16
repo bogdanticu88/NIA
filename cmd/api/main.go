@@ -44,9 +44,17 @@ type server struct {
 // instance instead. See internal/policy/from_env.go for the full env var
 // list and internal/policy/tessera_client.go's doc comment for what
 // TesseraHTTPClient does and doesn't guarantee relative to the in-memory
-// one.
-func newServer() (*server, error) {
+// one. The audit store follows the same pattern: audit.FromEnv, unset
+// NIA_AUDIT_DATABASE_URL means an in-memory sink private to this
+// process, set it (to the same value cmd/gateway is started with) and
+// both share one real audit trail instead of two separate in-memory
+// ones, see internal/audit/from_env.go.
+func newServer(ctx context.Context) (*server, error) {
 	pol, err := policy.FromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	auditLog, err := audit.FromEnv(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
@@ -55,7 +63,7 @@ func newServer() (*server, error) {
 		toolCat:  tools.NewInMemoryCatalog(),
 		creds:    credentials.NewInMemoryStore(),
 		pol:      pol,
-		auditLog: audit.NewInMemorySink(10_000),
+		auditLog: auditLog,
 	}, nil
 }
 
@@ -215,7 +223,7 @@ func main() {
 		addr = ":8080"
 	}
 
-	s, err := newServer()
+	s, err := newServer(context.Background())
 	if err != nil {
 		log.Fatalf("nia-api: %v", err)
 	}

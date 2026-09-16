@@ -48,6 +48,22 @@
 # healthcheck pointed at a guessed path that's wrong would block startup
 # forever, worse than the plain depends_on (container-started, not
 # app-ready) it would replace. Add one once someone checks.
+#
+# NIA_AUDIT_DATABASE_URL points nia-api and nia-gateway at this same
+# postgres, same database (nia), a different table (audit_events,
+# created on first connect, see internal/audit/postgres_sink.go) than
+# whatever openfga would use if it were ever pointed at postgres
+# instead of its own default in-memory datastore, which it currently
+# is not, see the depends_on above, that's a separate, still-open gap.
+# Both NIA services need the exact same value here for the audit trail
+# to actually be one shared stream instead of two, hardcoded rather
+# than an env var like the JWT signing key above because it isn't a
+# secret, just the fixed local-dev credentials already set on the
+# postgres service below. Unlike everything else in this file's
+# comments, this piece has NOT yet been run against this stack, only
+# unit-tested and smoke-tested against a live standalone postgres, see
+# README.md's Status section for exactly what has and hasn't been
+# confirmed here.
 services:
   nia-api:
     build:
@@ -59,8 +75,11 @@ services:
       NIA_API_ADDR: ":8080"
       NIA_TESSERA_BASE_URL: "http://tessera:8080"
       NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
+      NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     depends_on:
       tessera:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   nia-gateway:
@@ -73,8 +92,11 @@ services:
       NIA_GATEWAY_ADDR: ":8081"
       NIA_TESSERA_BASE_URL: "http://tessera:8080"
       NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
+      NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     depends_on:
       tessera:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   tessera:

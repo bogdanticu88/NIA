@@ -3,3 +3,9 @@
 *.test
 *.out
 .env
+
+# go build ./cmd/<name>/ with no -o drops a binary named after the
+# directory right here, easy to do by accident while iterating.
+/api
+/gateway
+/niactl
