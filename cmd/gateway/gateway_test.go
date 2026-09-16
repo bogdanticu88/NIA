@@ -339,6 +339,61 @@ func TestHandleToolCall_AllowedCallCrossingFlagThreshold_TriggersMonitoringFlag(
 	}
 }
 
+func TestHandleToolCall_MonitoringNotConfigured_NoRiskFieldInResponse(t *testing.T) {
+	g, _ := newTestGateway(&fakePolicyClient{allowed: true})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, present := body["risk"]; present {
+		t.Fatalf("got a risk field with monitoring not configured, want none: %v", body)
+	}
+}
+
+func TestHandleToolCall_MonitoringConfigured_ResponseCarriesRiskValueAndCumulative(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, _ := newTestGatewayWithMonitoring(pol, fakeScorer{value: 3}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	risk, ok := body["risk"].(map[string]any)
+	if !ok {
+		t.Fatalf("got %v, want a risk object in the response", body)
+	}
+	if value, _ := risk["value"].(float64); value != 3 {
+		t.Fatalf("risk.value = %v, want 3", risk["value"])
+	}
+	if cumulative, _ := risk["cumulative"].(float64); cumulative != 3 {
+		t.Fatalf("risk.cumulative = %v, want 3, this is the only call so far", risk["cumulative"])
+	}
+	if action, _ := risk["action"].(string); action != "none" {
+		t.Fatalf("risk.action = %v, want none, 3 is below every threshold", risk["action"])
+	}
+}
+
+func TestHandleToolCall_MonitoringConfigured_ResponseReportsKillAction(t *testing.T) {
+	pol := &fakePolicyClient{allowed: true}
+	g, _ := newTestGatewayWithMonitoring(pol, fakeScorer{value: 100}, monitoring.Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20})
+
+	rec := doToolCall(g, "agent:billing-reconciler", "invoices.read")
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	risk, ok := body["risk"].(map[string]any)
+	if !ok {
+		t.Fatalf("got %v, want a risk object in the response", body)
+	}
+	if action, _ := risk["action"].(string); action != "kill" {
+		t.Fatalf("risk.action = %v, want kill", risk["action"])
+	}
+}
+
 func TestHandleToolCall_EmptyBodyStillWorksWithResourcePolicyConfigured(t *testing.T) {
 	pol := &fakePolicyClient{allowed: true}
 	resourcePolicy := NewFieldResourcePolicy([]ResourceRule{

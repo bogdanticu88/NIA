@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +139,97 @@ func TestObserve_RevokeThreshold_RevokesOnlyActiveCredentialsForThatAgent(t *tes
 	events, _ := sink.Recent(ctx, 10)
 	if len(events) != 1 || events[0].Action != "monitoring.revoke" {
 		t.Fatalf("got %v, want exactly one monitoring.revoke event", events)
+	}
+}
+
+func TestObserve_RiskAccumulatesAcrossCalls_CrossesThresholdOnTheThirdCall(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	ctx := context.Background()
+
+	for i, want := range []Action{ActionNone, ActionNone, ActionFlag} {
+		action, err := m.Observe(ctx, newScore("agent:billing", 2), "")
+		if err != nil {
+			t.Fatalf("Observe #%d: %v", i, err)
+		}
+		if action != want {
+			t.Fatalf("Observe #%d: action = %q, want %q", i, action, want)
+		}
+	}
+	if got := m.CumulativeRisk("agent:billing"); got != 6 {
+		t.Fatalf("CumulativeRisk = %v, want 6 (three calls at 2 each)", got)
+	}
+}
+
+func TestObserve_RiskAccumulationIsPerAgent(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	ctx := context.Background()
+
+	if _, err := m.Observe(ctx, newScore("agent:billing", 4), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	action, err := m.Observe(ctx, newScore("agent:reporting", 4), "")
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if action != ActionNone {
+		t.Fatalf("action = %q, want none, agent:reporting's own total is only 4, below the flag threshold of 5", action)
+	}
+	if got := m.CumulativeRisk("agent:billing"); got != 4 {
+		t.Fatalf("CumulativeRisk(agent:billing) = %v, want 4", got)
+	}
+	if got := m.CumulativeRisk("agent:reporting"); got != 4 {
+		t.Fatalf("CumulativeRisk(agent:reporting) = %v, want 4", got)
+	}
+}
+
+func TestObserve_KillResetsCumulativeRisk(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	ctx := context.Background()
+
+	if _, err := m.Observe(ctx, newScore("agent:billing", 20), "INC-003"); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if got := m.CumulativeRisk("agent:billing"); got != 0 {
+		t.Fatalf("CumulativeRisk after a kill = %v, want 0", got)
+	}
+}
+
+func TestObserve_RevokeDoesNotResetCumulativeRisk(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, sink)
+	ctx := context.Background()
+
+	if _, err := m.Observe(ctx, newScore("agent:billing", 10), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if got := m.CumulativeRisk("agent:billing"); got != 10 {
+		t.Fatalf("CumulativeRisk after a revoke = %v, want 10, a revoke should not reset the running total, only a kill does", got)
+	}
+}
+
+func TestObserve_RiskAccumulationIsRaceSafe(t *testing.T) {
+	sink := audit.NewInMemorySink(1000)
+	m := NewMonitor(Threshold{FlagAt: 1_000_000, RevokeAt: 2_000_000, KillAt: 3_000_000}, policy.NewInMemoryClient(), nil, sink)
+	ctx := context.Background()
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := m.Observe(ctx, newScore("agent:billing", 1), ""); err != nil {
+				t.Errorf("Observe: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := m.CumulativeRisk("agent:billing"); got != n {
+		t.Fatalf("CumulativeRisk = %v, want %d, concurrent Observe calls must not lose an update", got, n)
 	}
 }
 

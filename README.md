@@ -44,12 +44,18 @@ What has not: `Dockerfile.api` and `Dockerfile.gateway` build correctly for `lin
 
 - The gateway now actually inspects tool-call arguments instead of only ever seeing a tool name. `POST /tools/{tool}/call` decodes an optional `arguments` object; when `NIA_GATEWAY_RESOURCE_RULES_PATH` is set, a `FieldResourcePolicy` (`cmd/gateway/resources.go`) turns those arguments into resource object names, a `database.query` call with `{"table": "customers", "columns": ["name", "ssn"]}` and a rule naming `table` as the qualifier and `columns` as the fields becomes `customers.name` and `customers.ssn`. Any of those classified `sensitive` or above needs its own `policy.GrantForData` grant, checked and audited the same way the tool-level grant already was, `gateway.denied` naming the specific resource if it's missing, not just the tool. This is the Agent+Tool+Action+Resource decision, not only Agent+Tool: an agent can be authorized to call `database.query` and still not be authorized to retrieve a column an operator flagged as sensitive. `internal/risk.HistoryScorer` picked up a third signal off the same classifier, `sensitive_resource`, weighted higher again when the highest level touched is `critical`. Both new env vars are independently optional, and even with argument inspection on, a resource nobody classified stays `public` and needs no extra grant, so this is additive on top of everything that worked before, not a stricter default nobody opted into. Verified with `go test ./... -race`: eight new tests on `FieldResourcePolicy`, six on its `FromEnv` loader, ten more on the gateway's handler (an empty body still working, a malformed body rejected, arguments ignored when unconfigured, a resource below the sensitive threshold skipping the extra check, a sensitive resource both granted and denied, a data-grant check error audited and blocked), and three new `HistoryScorer` tests for the `sensitive_resource` signal.
 
+- Permissions had a real gap closed: `internal/policy.Client`'s `WriteGrants`/`DeleteGrants`/`ListGrants` have existed since the policy client itself did, but nothing outside the package ever called them, there was no way to actually grant an agent a permission through the running control plane, only through a test constructing an `InMemoryClient` directly. `cmd/api` now exposes `POST`/`DELETE`/`GET /agents/{ref}/grants`, `niactl grant write` / `delete` / `list` wraps all three, and the write path is additive: writing the same grant twice is a no-op the second time, not an error. Verified with `go test ./... -race`, seven new handler tests covering the unregistered-agent case, empty and unknown-kind rejections, the audit event it writes, and that delete only removes what was named.
+
+- Risk scoring moved from judging one call in isolation to a running per-agent total: `internal/monitoring.Monitor` now accumulates every scored call into `cumulative[agentRef]` and compares that total, not the single call's own value, against the flag/revoke/kill thresholds, resetting only on an actual kill, since that's the one action that changes the agent's state enough to justify starting its risk history over. Without this, three separate flags below the kill threshold would never add up to anything, which didn't match how a real escalating compromise looks. `CumulativeRisk(agentRef)` exposes the same number `Observe` itself compares, and `POST /tools/{tool}/call`'s response now carries a `risk` block, this call's own value and signals plus the current cumulative total and whatever action fired, when monitoring is configured, so a caller can see the running total without a separate query. Verified with `go test ./... -race`, five new `Monitor` tests including one that fires fifty concurrent `Observe` calls for the same agent and checks the total lost no updates, plus three new gateway tests asserting the `risk` block's shape and that a kill-triggering call reports `action: "kill"`.
+
+- `niactl simulate attack -scenario agent-hijack` is new: a deterministic attack simulation that drives the real pipeline end to end, agent registration, tool registration, grants, then a scripted sequence of real gateway calls, not printed output standing in for one. The scenario models an invoice-processing agent with broader tool access than its normal work ever uses (a realistic over-privileged setup), escalates through tools it's authorized for but has never called (what `HistoryScorer`'s `novel_tool` and risk-class signals exist to catch), gets a real 403 on a `database.query` call touching `customers.ssn` (deliberately left ungranted at the data level, proving the Agent+Tool+Resource decision from the argument-inspection work above), and, when the gateway is started with risk thresholds set low enough, shows an actual kill mid-sequence: a tool the agent successfully called earlier in the same run gets denied later on, because `policy.Check` now reads the kill sentinel, not because the request changed. See "Attack simulation" in `docs/ARCHITECTURE.md`. Verified with `go test ./... -race`: a scenario well-formedness check (every tool a step or grant names is actually registered), unit tests on the transcript-printing functions, and an integration test that drives `runScenario` against fake `cmd/api` and `cmd/gateway` HTTP servers and asserts on the actual call sequence and containment detection.
+
 ## Layout
 
 ```
 cmd/api        control-plane API: registration, inventory, credentials, grants, kill switch
 cmd/gateway    Agent/MCP gateway: the hot path, resolve -> check -> forward
-cmd/niactl     operator CLI, talks to cmd/api over HTTP
+cmd/niactl     operator CLI, talks to cmd/api over HTTP (and cmd/gateway directly for gateway call / simulate attack)
 internal/      identity, registry, credentials, policy, audit, risk, monitoring, graph
 deployments/   Dockerfiles, docker-compose, and the OpenFGA store/model bootstrap for local dev
 docs/          architecture and data model
@@ -96,6 +102,17 @@ go run ./cmd/niactl graph add-edge -from agent:billing-reconciler -to tool:invoi
 
 # what could this agent reach if it were compromised right now
 go run ./cmd/niactl graph reachable -id agent:billing-reconciler
+
+# grant the agent access to that tool (this is the part the graph edge above doesn't do on its own)
+go run ./cmd/niactl grant write -ref agent:billing-reconciler -kind tool -object invoice-lookup
+
+# call the gateway directly the way an MCP-aware caller would
+go run ./cmd/niactl gateway call -ref agent:billing-reconciler -tool invoice-lookup
+
+# drive the whole loop end to end: registration, grants, a scripted attack sequence,
+# and, if the gateway was started with NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT
+# set low enough, a real kill partway through and a real denial on the next call
+go run ./cmd/niactl simulate attack -scenario agent-hijack
 ```
 
 The commands above run against the in-memory policy client, no Tessera, OpenFGA, or Postgres required. To point `cmd/api` and `cmd/gateway` at a real Tessera instance instead, set three environment variables before starting them: `NIA_TESSERA_BASE_URL` (Tessera.Service's URL), `NIA_TESSERA_JWT_SIGNING_KEY` (base64, the exact same value Tessera.Service was started with as `TESSERA_JWT_SIGNING_KEY`), and, only if Tessera isn't running with its own defaults, `NIA_TESSERA_JWT_ISSUER` / `NIA_TESSERA_JWT_AUDIENCE`. See `internal/policy/from_env.go` for the full list and defaults.

@@ -220,18 +220,39 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 
 	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 
+	resp := map[string]any{
+		"agent":  resolved.Ref,
+		"tool":   tool,
+		"status": "allowed",
+	}
 	if g.monitor != nil {
-		g.observe(ctx, resolved.Ref, tool, resources)
+		if ri, ok := g.observe(ctx, resolved.Ref, tool, resources); ok {
+			resp["risk"] = ri
+		}
 	}
 
 	// A real deployment forwards the request to the tool's actual
 	// transport (MCP, HTTP, gRPC) here. Left as the integration point
 	// rather than stubbed with a fake tool response.
-	niahttp.WriteJSON(w, http.StatusOK, map[string]string{
-		"agent":  resolved.Ref,
-		"tool":   tool,
-		"status": "allowed",
-	})
+	niahttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// riskInfo is the risk block handleToolCall attaches to an allowed
+// call's response when monitoring is configured. It's the same number
+// and reasoning internal/monitoring itself acted on, not a second
+// opinion computed for display purposes; Cumulative and Action are
+// what actually decided whether anything got enforced, Value and
+// Signals are this one call's own contribution to that total.
+type riskInfo struct {
+	Value      float64           `json:"value"`
+	Signals    []riskSignal      `json:"signals"`
+	Cumulative float64           `json:"cumulative"`
+	Action     monitoring.Action `json:"action"`
+}
+
+type riskSignal struct {
+	Name   string  `json:"name"`
+	Weight float64 `json:"weight"`
 }
 
 // observe scores an already-allowed call and lets internal/monitoring
@@ -239,20 +260,35 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 // failed response: the call was legitimately authorized before this
 // ever ran, a monitoring-side failure (the kill or revoke call itself
 // erroring) is a separate incident from whether this request should
-// have gone through.
-func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources []string) {
+// have gone through. The bool return is whether scoring succeeded at
+// all, a scoring error means there is no risk data worth attaching to
+// the response, not that the call should look unscored versus scored
+// zero.
+func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources []string) (riskInfo, bool) {
 	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now(), Resources: resources})
 	if err != nil {
 		g.audit(ctx, "gateway.scoring_error", agentRef, fmt.Sprintf("tool=%s err=%v", tool, err))
 		log.Printf("nia-gateway: scoring failed for %s on %s: %v", agentRef, tool, err)
-		return
+		return riskInfo{}, false
 	}
 
 	incident := fmt.Sprintf("auto-risk-%d", time.Now().UnixNano())
-	if _, err := g.monitor.Observe(ctx, score, incident); err != nil {
+	action, err := g.monitor.Observe(ctx, score, incident)
+	if err != nil {
 		g.audit(ctx, "gateway.monitoring_error", agentRef, fmt.Sprintf("tool=%s incident=%s err=%v", tool, incident, err))
 		log.Printf("nia-gateway: monitoring action failed for %s on %s: %v", agentRef, tool, err)
 	}
+
+	signals := make([]riskSignal, 0, len(score.Signals))
+	for _, s := range score.Signals {
+		signals = append(signals, riskSignal{Name: s.Name, Weight: s.Weight})
+	}
+	return riskInfo{
+		Value:      score.Value,
+		Signals:    signals,
+		Cumulative: g.monitor.CumulativeRisk(agentRef),
+		Action:     action,
+	}, true
 }
 
 // audit records one gateway decision. It never resolved caller

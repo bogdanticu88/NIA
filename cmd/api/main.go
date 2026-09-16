@@ -353,6 +353,199 @@ func (s *server) handleGetTool(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, tool)
 }
 
+// grantWire is a policy.Grant on the wire: only the fields relevant to
+// Kind are meaningful, the rest are left at their zero value, same
+// shape policy.Grant itself uses.
+type grantWire struct {
+	Kind   string `json:"kind"`
+	Group  string `json:"group,omitempty"`
+	Method string `json:"method,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Object string `json:"object,omitempty"`
+}
+
+func grantFromWire(w grantWire) (policy.Grant, error) {
+	switch w.Kind {
+	case "api_group":
+		if w.Group == "" {
+			return policy.Grant{}, errors.New("api_group grant requires group")
+		}
+		return policy.GrantForAPIGroup(w.Group), nil
+	case "endpoint":
+		if w.Method == "" || w.Path == "" {
+			return policy.Grant{}, errors.New("endpoint grant requires method and path")
+		}
+		return policy.GrantForEndpoint(w.Method, w.Path), nil
+	case "tool":
+		if w.Object == "" {
+			return policy.Grant{}, errors.New("tool grant requires object")
+		}
+		return policy.GrantForTool(w.Object), nil
+	case "data":
+		if w.Object == "" {
+			return policy.Grant{}, errors.New("data grant requires object")
+		}
+		return policy.GrantForData(w.Object), nil
+	default:
+		return policy.Grant{}, fmt.Errorf("unknown grant kind %q, want one of api_group, endpoint, tool, data", w.Kind)
+	}
+}
+
+func grantsFromWire(in []grantWire) ([]policy.Grant, error) {
+	out := make([]policy.Grant, 0, len(in))
+	for _, w := range in {
+		g, err := grantFromWire(w)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+type writeGrantsRequest struct {
+	Grants   []grantWire `json:"grants"`
+	Operator string      `json:"operator"`
+}
+
+// handleWriteGrants is Permissions' missing HTTP surface: internal/policy
+// has had WriteGrants on the Client interface since the beginning, and
+// TesseraHTTPClient/InMemoryClient both implement it, but until now
+// nothing outside a test ever called it over HTTP, an operator had no
+// way to actually grant an agent anything through cmd/api or niactl.
+// Requires the agent to already be registered, same reasoning as
+// handleIssueCredential: granting isn't a backdoor way to create an
+// identity record.
+func (s *server) handleWriteGrants(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.agents.Get(ctx, ref); err != nil {
+		niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
+		return
+	}
+
+	var req writeGrantsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.Grants) == 0 {
+		niahttp.WriteError(w, http.StatusBadRequest, "grants is required and must be non-empty")
+		return
+	}
+	grants, err := grantsFromWire(req.Grants)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := s.pol.WriteGrants(ctx, ref, grants); err != nil {
+		if errors.Is(err, policy.ErrKilled) {
+			niahttp.WriteError(w, http.StatusConflict, "agent is killed, restore before writing grants")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "grant.written",
+		AgentRef: ref,
+		Operator: req.Operator,
+		Detail:   grantSummary(grants),
+		At:       time.Now(),
+	})
+
+	updated, err := s.pol.ListGrants(ctx, ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
+// handleDeleteGrants removes specific grants without touching the rest
+// of the agent's declared state, the same "smaller than a kill" posture
+// handleRevokeCredential takes relative to handleKill.
+func (s *server) handleDeleteGrants(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	ctx := r.Context()
+	if _, err := s.agents.Get(ctx, ref); err != nil {
+		niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
+		return
+	}
+
+	var req writeGrantsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.Grants) == 0 {
+		niahttp.WriteError(w, http.StatusBadRequest, "grants is required and must be non-empty")
+		return
+	}
+	grants, err := grantsFromWire(req.Grants)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := s.pol.DeleteGrants(ctx, ref, grants); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "grant.deleted",
+		AgentRef: ref,
+		Operator: req.Operator,
+		Detail:   grantSummary(grants),
+		At:       time.Now(),
+	})
+
+	updated, err := s.pol.ListGrants(ctx, ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
+func (s *server) handleListGrants(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	grants, err := s.pol.ListGrants(r.Context(), ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, grants)
+}
+
+func grantSummary(grants []policy.Grant) string {
+	parts := make([]string, 0, len(grants))
+	for _, g := range grants {
+		switch g.Kind {
+		case "api_group":
+			parts = append(parts, "api_group:"+g.Group)
+		case "endpoint":
+			parts = append(parts, "endpoint:"+g.Method+" "+g.Path)
+		default:
+			parts = append(parts, g.Kind+":"+g.Object)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 type addGraphNodeRequest struct {
 	ID   string `json:"id"`
 	Kind string `json:"kind"`
@@ -572,6 +765,9 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
 	mux.HandleFunc("GET /agents", s.handleListAgents)
 	mux.HandleFunc("POST /policy/kill", s.handleKill)
+	mux.HandleFunc("POST /agents/{ref}/grants", s.handleWriteGrants)
+	mux.HandleFunc("DELETE /agents/{ref}/grants", s.handleDeleteGrants)
+	mux.HandleFunc("GET /agents/{ref}/grants", s.handleListGrants)
 	mux.HandleFunc("POST /agents/{ref}/credentials", s.handleIssueCredential)
 	mux.HandleFunc("GET /agents/{ref}/credentials", s.handleListCredentials)
 	mux.HandleFunc("POST /credentials/{id}/revoke", s.handleRevokeCredential)

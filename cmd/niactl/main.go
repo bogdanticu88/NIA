@@ -25,6 +25,13 @@ func apiAddr() string {
 	return "http://localhost:8080"
 }
 
+func gatewayAddr() string {
+	if v := os.Getenv("NIA_GATEWAY_URL"); v != "" {
+		return v
+	}
+	return "http://localhost:8081"
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `niactl - NIA operator CLI
 
@@ -43,6 +50,11 @@ Usage:
   niactl graph add-edge -from <node_id> -to <node_id> -kind <owns|delegates_to|trusts|member_of|grants|bound_to>
   niactl graph neighbors -id <node_id> -kind <edge_kind>
   niactl graph reachable -id <node_id> [-kinds <edge_kind,edge_kind,...>]
+  niactl grant write -ref <agent_ref> -kind <api_group|endpoint|tool|data> [-group <g>] [-method <m>] [-path <p>] [-object <o>] [-operator <name>]
+  niactl grant delete -ref <agent_ref> -kind <...> [-group|-method|-path|-object matching what was written] [-operator <name>]
+  niactl grant list -ref <agent_ref>
+  niactl gateway call -ref <agent_ref> -tool <tool_name> [-arguments '<json object>']
+  niactl simulate attack -scenario <agent-hijack>
 
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
@@ -62,6 +74,16 @@ checks a tool against this catalog before checking policy, an unregistered
 name is rejected outright; unset, that step is skipped and registering a
 tool is bookkeeping only, see cmd/gateway's package doc comment.
 
+grant write/delete/list are the missing half of Permissions: internal/policy
+has always had WriteGrants/DeleteGrants/ListGrants, this is the first CLI
+surface for them. -kind selects which of Grant's four shapes this is:
+api_group needs -group, endpoint needs -method and -path, tool and data both
+need -object, a tool name or a resource name respectively, the same names
+niactl tool register and internal/sensitivity use. Writing is additive, it
+diffs against what the agent already has and only adds what's missing,
+niactl grant write called twice with the same grant is a no-op the second
+time, not an error.
+
 graph add-node/add-edge build the identity graph by hand, a node id is
 whatever internal/graph's node kind implies, "agent:billing-reconciler" for
 an agent, a human or tool or data resource id for the rest, adding a node
@@ -71,7 +93,29 @@ hop out along a single edge kind; graph reachable follows edges
 transitively, the blast-radius query, what a compromised node could reach
 either way, defaulting to every edge kind when -kinds is omitted.
 
-Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
+gateway call drives the gateway's own hot path directly, POST /tools/{tool}/call
+with -ref sent as X-Agent-Ref and -arguments (a JSON object, optional) as the
+request body's arguments field, the exact request an MCP-aware caller sends.
+This is what makes niactl simulate possible: every step it prints is a real
+gateway call through this same path, not printed output pretending to be one.
+
+simulate attack drives a scripted, deterministic scenario end to end through
+the real control-plane API and the real gateway: registers the scenario's
+agent, registers its tools, writes its starting grants, then issues the
+scenario's sequence of gateway calls in order, printing each one's real
+outcome, allowed, denied, and, once configured with risk thresholds (see
+deployments/docker-compose.yml's comment on NIA_RISK_FLAG_AT and friends),
+watches containment actually fire and the agent's next request actually get
+blocked. A re-run against an already-registered agent picks up where the
+grants and tool catalog left off rather than failing, registration and
+WriteGrants both tolerate "already exists," so running the same scenario
+twice is safe, though a prior run's kill or accumulated risk carries
+forward since there is no reset endpoint yet. Currently one scenario,
+agent-hijack, see cmd/niactl/simulate.go for the full step-by-step script.
+
+Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080)
+except gateway call and simulate attack, which also talk to the gateway
+(NIA_GATEWAY_URL, default http://localhost:8081).`)
 }
 
 func main() {
@@ -95,6 +139,12 @@ func main() {
 		cmdTool(os.Args[2:])
 	case "graph":
 		cmdGraph(os.Args[2:])
+	case "grant":
+		cmdGrant(os.Args[2:])
+	case "gateway":
+		cmdGateway(os.Args[2:])
+	case "simulate":
+		cmdSimulate(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -151,6 +201,38 @@ func cmdGraph(args []string) {
 		cmdGraphNeighbors(args[1:])
 	case "reachable":
 		cmdGraphReachable(args[1:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdGrant(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "write":
+		cmdGrantWrite(args[1:])
+	case "delete":
+		cmdGrantDelete(args[1:])
+	case "list":
+		cmdGrantList(args[1:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdGateway(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "call":
+		cmdGatewayCall(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -372,6 +454,142 @@ func cmdGraphReachable(args []string) {
 		path += "?kinds=" + url.QueryEscape(*kinds)
 	}
 	get(path)
+}
+
+func grantFlagSet(name string) (*flag.FlagSet, *string, *string, *string, *string, *string, *string) {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref")
+	kind := fs.String("kind", "", "grant kind: api_group, endpoint, tool, or data")
+	group := fs.String("group", "", "api_group grants: the group name")
+	method := fs.String("method", "", "endpoint grants: the HTTP method")
+	path := fs.String("path", "", "endpoint grants: the path")
+	object := fs.String("object", "", "tool or data grants: the tool name or resource name")
+	return fs, ref, kind, group, method, path, object
+}
+
+func grantRequestBody(kind, group, method, path, object, operator string) []byte {
+	grant := map[string]string{"kind": kind}
+	if group != "" {
+		grant["group"] = group
+	}
+	if method != "" {
+		grant["method"] = method
+	}
+	if path != "" {
+		grant["path"] = path
+	}
+	if object != "" {
+		grant["object"] = object
+	}
+	body, _ := json.Marshal(map[string]any{
+		"grants":   []map[string]string{grant},
+		"operator": operator,
+	})
+	return body
+}
+
+func cmdGrantWrite(args []string) {
+	fs, ref, kind, group, method, path, object := grantFlagSet("grant write")
+	operator := fs.String("operator", "niactl", "who is granting this")
+	_ = fs.Parse(args)
+
+	if *ref == "" || *kind == "" {
+		fmt.Fprintln(os.Stderr, "grant write: -ref and -kind are required")
+		os.Exit(1)
+	}
+	post("/agents/"+url.PathEscape(*ref)+"/grants", grantRequestBody(*kind, *group, *method, *path, *object, *operator))
+}
+
+func cmdGrantDelete(args []string) {
+	fs, ref, kind, group, method, path, object := grantFlagSet("grant delete")
+	operator := fs.String("operator", "niactl", "who is removing this")
+	_ = fs.Parse(args)
+
+	if *ref == "" || *kind == "" {
+		fmt.Fprintln(os.Stderr, "grant delete: -ref and -kind are required")
+		os.Exit(1)
+	}
+	del("/agents/"+url.PathEscape(*ref)+"/grants", grantRequestBody(*kind, *group, *method, *path, *object, *operator))
+}
+
+func cmdGrantList(args []string) {
+	fs := flag.NewFlagSet("grant list", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref to list grants for")
+	_ = fs.Parse(args)
+
+	if *ref == "" {
+		fmt.Fprintln(os.Stderr, "grant list: -ref is required")
+		os.Exit(1)
+	}
+	get("/agents/" + url.PathEscape(*ref) + "/grants")
+}
+
+func cmdGatewayCall(args []string) {
+	fs := flag.NewFlagSet("gateway call", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref making the call, sent as X-Agent-Ref")
+	tool := fs.String("tool", "", "tool to call")
+	arguments := fs.String("arguments", "", "JSON object of arguments to pass, e.g. {\"table\":\"customers\",\"columns\":[\"ssn\"]}")
+	_ = fs.Parse(args)
+
+	if *ref == "" || *tool == "" {
+		fmt.Fprintln(os.Stderr, "gateway call: -ref and -tool are required")
+		os.Exit(1)
+	}
+
+	resp, err := callGateway(*ref, *tool, *arguments)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	printResponse(resp)
+}
+
+// callGateway is the shared primitive both cmdGatewayCall and
+// cmd/niactl's simulate command use: a real HTTP call to the gateway's
+// tool-call endpoint, X-Agent-Ref set from ref, arguments (raw JSON
+// object text, may be empty) wrapped in the {"arguments": ...} body
+// shape cmd/gateway's toolCallRequest decodes. Returns the response
+// unconsumed so callers can inspect status and body their own way
+// rather than always printing it, simulate needs to interpret the
+// result, not just show it.
+func callGateway(ref, tool, arguments string) (*http.Response, error) {
+	body := []byte(`{}`)
+	if arguments != "" {
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(arguments), &probe); err != nil {
+			return nil, fmt.Errorf("-arguments must be a JSON object: %w", err)
+		}
+		wrapped, err := json.Marshal(map[string]any{"arguments": probe})
+		if err != nil {
+			return nil, err
+		}
+		body = wrapped
+	}
+
+	req, err := http.NewRequest(http.MethodPost, gatewayAddr()+"/tools/"+url.PathEscape(tool)+"/call", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Ref", ref)
+	return http.DefaultClient.Do(req)
+}
+
+func del(path string, body []byte) {
+	req, err := http.NewRequest(http.MethodDelete, apiAddr()+path, bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	printResponse(resp)
 }
 
 func post(path string, body []byte) {
