@@ -39,6 +39,10 @@ Usage:
   niactl tool register -name <tool_name> [-description <text>] [-transport <mcp|http|grpc>] [-risk <read_only|write|destructive>] [-owner <owner>]
   niactl tool list
   niactl tool get -name <tool_name>
+  niactl graph add-node -id <node_id> -kind <human|agent|tool|data>
+  niactl graph add-edge -from <node_id> -to <node_id> -kind <owns|delegates_to|trusts|member_of|grants|bound_to>
+  niactl graph neighbors -id <node_id> -kind <edge_kind>
+  niactl graph reachable -id <node_id> [-kinds <edge_kind,edge_kind,...>]
 
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
@@ -57,6 +61,15 @@ calls against. When the gateway is started with NIA_TOOLS_API_URL set, it
 checks a tool against this catalog before checking policy, an unregistered
 name is rejected outright; unset, that step is skipped and registering a
 tool is bookkeeping only, see cmd/gateway's package doc comment.
+
+graph add-node/add-edge build the identity graph by hand, a node id is
+whatever internal/graph's node kind implies, "agent:billing-reconciler" for
+an agent, a human or tool or data resource id for the rest, adding a node
+does not require it to also be registered through niactl register or niactl
+tool register, the graph is independent bookkeeping. graph neighbors is one
+hop out along a single edge kind; graph reachable follows edges
+transitively, the blast-radius query, what a compromised node could reach
+either way, defaulting to every edge kind when -kinds is omitted.
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080).`)
 }
@@ -80,6 +93,8 @@ func main() {
 		cmdCredential(os.Args[2:])
 	case "tool":
 		cmdTool(os.Args[2:])
+	case "graph":
+		cmdGraph(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -116,6 +131,26 @@ func cmdCredential(args []string) {
 		cmdCredentialList(args[1:])
 	case "revoke":
 		cmdCredentialRevoke(args[1:])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}
+
+func cmdGraph(args []string) {
+	if len(args) < 1 {
+		usage()
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "add-node":
+		cmdGraphAddNode(args[1:])
+	case "add-edge":
+		cmdGraphAddEdge(args[1:])
+	case "neighbors":
+		cmdGraphNeighbors(args[1:])
+	case "reachable":
+		cmdGraphReachable(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -269,6 +304,74 @@ func cmdToolGet(args []string) {
 		os.Exit(1)
 	}
 	get("/tools/" + url.PathEscape(*name))
+}
+
+func cmdGraphAddNode(args []string) {
+	fs := flag.NewFlagSet("graph add-node", flag.ExitOnError)
+	id := fs.String("id", "", "node id, e.g. agent:billing-reconciler")
+	kind := fs.String("kind", "", "node kind: human, agent, tool, or data")
+	_ = fs.Parse(args)
+
+	if *id == "" || *kind == "" {
+		fmt.Fprintln(os.Stderr, "graph add-node: -id and -kind are required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"id":   *id,
+		"kind": *kind,
+	})
+	post("/graph/nodes", body)
+}
+
+func cmdGraphAddEdge(args []string) {
+	fs := flag.NewFlagSet("graph add-edge", flag.ExitOnError)
+	from := fs.String("from", "", "source node id")
+	to := fs.String("to", "", "destination node id")
+	kind := fs.String("kind", "", "edge kind: owns, delegates_to, trusts, member_of, grants, or bound_to")
+	_ = fs.Parse(args)
+
+	if *from == "" || *to == "" || *kind == "" {
+		fmt.Fprintln(os.Stderr, "graph add-edge: -from, -to, and -kind are required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"from": *from,
+		"to":   *to,
+		"kind": *kind,
+	})
+	post("/graph/edges", body)
+}
+
+func cmdGraphNeighbors(args []string) {
+	fs := flag.NewFlagSet("graph neighbors", flag.ExitOnError)
+	id := fs.String("id", "", "node id")
+	kind := fs.String("kind", "", "edge kind to follow: owns, delegates_to, trusts, member_of, grants, or bound_to")
+	_ = fs.Parse(args)
+
+	if *id == "" || *kind == "" {
+		fmt.Fprintln(os.Stderr, "graph neighbors: -id and -kind are required")
+		os.Exit(1)
+	}
+	get("/graph/" + url.PathEscape(*id) + "/neighbors?kind=" + url.QueryEscape(*kind))
+}
+
+func cmdGraphReachable(args []string) {
+	fs := flag.NewFlagSet("graph reachable", flag.ExitOnError)
+	id := fs.String("id", "", "node id to start from")
+	kinds := fs.String("kinds", "", "comma-separated edge kinds to follow; omitted means every edge kind")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "graph reachable: -id is required")
+		os.Exit(1)
+	}
+	path := "/graph/" + url.PathEscape(*id) + "/reachable"
+	if *kinds != "" {
+		path += "?kinds=" + url.QueryEscape(*kinds)
+	}
+	get(path)
 }
 
 func post(path string, body []byte) {

@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/credentials"
+	"github.com/bogdanticu88/nia/internal/graph"
 	"github.com/bogdanticu88/nia/internal/identity"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
@@ -36,6 +38,7 @@ type server struct {
 	creds    credentials.Store
 	pol      policy.Client
 	auditLog audit.Store
+	graph    graph.Graph
 }
 
 // newServer wires every control-plane dependency. The policy client comes
@@ -65,6 +68,7 @@ func newServer(ctx context.Context) (*server, error) {
 		creds:    credentials.NewInMemoryStore(),
 		pol:      pol,
 		auditLog: auditLog,
+		graph:    graph.NewInMemoryGraph(),
 	}, nil
 }
 
@@ -349,6 +353,165 @@ func (s *server) handleGetTool(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, tool)
 }
 
+type addGraphNodeRequest struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+}
+
+// handleAddGraphNode adds one node to the identity graph. This is
+// separate bookkeeping from agent registration, not a mirror of it: a
+// node here can be a human or a tool or a data resource too, things
+// internal/registry has no concept of, and registering an agent through
+// internal/registry does not implicitly add it to the graph, the two
+// are kept independent on purpose until there's a real reason to couple
+// them (see docs/ARCHITECTURE.md's identity graph section).
+func (s *server) handleAddGraphNode(w http.ResponseWriter, r *http.Request) {
+	var req addGraphNodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.ID == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	kind := graph.NodeKind(req.Kind)
+	switch kind {
+	case graph.NodeHuman, graph.NodeAgent, graph.NodeTool, graph.NodeData:
+	default:
+		niahttp.WriteError(w, http.StatusBadRequest, "kind must be one of human, agent, tool, data")
+		return
+	}
+
+	node := graph.Node{ID: req.ID, Kind: kind}
+	if err := s.graph.AddNode(r.Context(), node); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusCreated, node)
+}
+
+type addGraphEdgeRequest struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Kind string `json:"kind"`
+}
+
+// validGraphEdgeKind is shared by the add-edge, neighbors, and reachable
+// handlers, all three take an EdgeKind off the wire and need the same
+// check against the six kinds internal/graph actually defines.
+func validGraphEdgeKind(k graph.EdgeKind) bool {
+	switch k {
+	case graph.EdgeOwns, graph.EdgeDelegatesTo, graph.EdgeTrusts, graph.EdgeMemberOf, graph.EdgeGrants, graph.EdgeBoundTo:
+		return true
+	default:
+		return false
+	}
+}
+
+const graphEdgeKindHelp = "kind must be one of owns, delegates_to, trusts, member_of, grants, bound_to"
+
+// handleAddGraphEdge adds one edge. It does not require either endpoint
+// to already exist as a node, InMemoryGraph.AddEdge itself has no such
+// constraint (see internal/graph/graph.go), Neighbors and Reachable
+// simply won't resolve an edge whose target was never added as a node.
+// Enforcing referential integrity here would be a real feature, not
+// free, and nothing has needed it yet.
+func (s *server) handleAddGraphEdge(w http.ResponseWriter, r *http.Request) {
+	var req addGraphEdgeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.From == "" || req.To == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "from and to are required")
+		return
+	}
+	kind := graph.EdgeKind(req.Kind)
+	if !validGraphEdgeKind(kind) {
+		niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
+		return
+	}
+
+	edge := graph.Edge{From: req.From, To: req.To, Kind: kind}
+	if err := s.graph.AddEdge(r.Context(), edge); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusCreated, edge)
+}
+
+// handleGraphNeighbors answers "what does this node point at directly
+// through one specific edge kind," the one-hop version of the
+// blast-radius question handleGraphReachable answers transitively.
+func (s *server) handleGraphNeighbors(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "node id is required")
+		return
+	}
+	raw := r.URL.Query().Get("kind")
+	if raw == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "kind query parameter is required")
+		return
+	}
+	kind := graph.EdgeKind(raw)
+	if !validGraphEdgeKind(kind) {
+		niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
+		return
+	}
+
+	nodes, err := s.graph.Neighbors(r.Context(), id, kind)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, nodes)
+}
+
+// allGraphEdgeKinds is handleGraphReachable's default when the caller
+// doesn't narrow the query with ?kinds=, the blast-radius question
+// usually wants "everything reachable, however it's reachable," not one
+// relation type at a time.
+var allGraphEdgeKinds = []graph.EdgeKind{
+	graph.EdgeOwns, graph.EdgeDelegatesTo, graph.EdgeTrusts, graph.EdgeMemberOf, graph.EdgeGrants, graph.EdgeBoundTo,
+}
+
+// handleGraphReachable is the blast-radius query from
+// docs/DATA_MODEL.md and internal/graph/graph_test.go: given a node,
+// what else can it reach, directly or transitively, through the given
+// edge kinds. This is the question a live OpenFGA check can't answer on
+// its own, see internal/graph's package doc comment for why the two are
+// kept separate.
+func (s *server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "node id is required")
+		return
+	}
+
+	kinds := allGraphEdgeKinds
+	if raw := r.URL.Query().Get("kinds"); raw != "" {
+		parts := strings.Split(raw, ",")
+		kinds = make([]graph.EdgeKind, 0, len(parts))
+		for _, p := range parts {
+			kind := graph.EdgeKind(strings.TrimSpace(p))
+			if !validGraphEdgeKind(kind) {
+				niahttp.WriteError(w, http.StatusBadRequest, graphEdgeKindHelp)
+				return
+			}
+			kinds = append(kinds, kind)
+		}
+	}
+
+	nodes, err := s.graph.Reachable(r.Context(), id, kinds)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, nodes)
+}
+
 // audit appends one event, logging rather than silently dropping a
 // failure: on a security control plane, an action that didn't make it
 // into the trail is worth knowing about even when there's nothing this
@@ -417,6 +580,10 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /tools/{name}", s.handleGetTool)
 	mux.HandleFunc("GET /audit", s.handleRecentAudit)
 	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
+	mux.HandleFunc("POST /graph/nodes", s.handleAddGraphNode)
+	mux.HandleFunc("POST /graph/edges", s.handleAddGraphEdge)
+	mux.HandleFunc("GET /graph/{id}/neighbors", s.handleGraphNeighbors)
+	mux.HandleFunc("GET /graph/{id}/reachable", s.handleGraphReachable)
 	return mux
 }
 

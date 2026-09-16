@@ -9,6 +9,7 @@ import (
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/credentials"
+	"github.com/bogdanticu88/nia/internal/graph"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -21,6 +22,7 @@ func newTestServer() *server {
 		creds:    credentials.NewInMemoryStore(),
 		pol:      policy.NewInMemoryClient(),
 		auditLog: audit.NewInMemorySink(10_000),
+		graph:    graph.NewInMemoryGraph(),
 	}
 }
 
