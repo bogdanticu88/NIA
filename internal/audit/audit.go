@@ -56,10 +56,24 @@ type Store interface {
 // InMemorySink keeps the last N events in memory. Useful for local dev
 // and tests; a production deployment points this interface at a real
 // store (Postgres, a SIEM forwarder) instead.
+//
+// It also chains every event it appends (see chain.go): each event's
+// hash is computed from its own data plus the previous event's hash,
+// so InMemorySink implements Chained too, chain_test.go exercises
+// Verify against it directly without needing Postgres. Because this
+// sink evicts older events past max, its window can genuinely start
+// partway through a real chain, not because anything was tampered
+// with, just because this is a capacity-bounded, in-memory
+// implementation. truncated tracks whether that's ever happened, and
+// Chain reports it as StartsAtGenesis=false so Verify doesn't mistake
+// routine eviction for a broken chain.
 type InMemorySink struct {
-	mu     sync.Mutex
-	events []Event
-	max    int
+	mu        sync.Mutex
+	chain     []ChainedEvent // events plus chain metadata, oldest first
+	lastHash  string
+	truncated bool
+	nextSeq   int64
+	max       int
 }
 
 func NewInMemorySink(max int) *InMemorySink {
@@ -75,9 +89,19 @@ func (s *InMemorySink) Append(_ context.Context, evt Event) error {
 	if evt.At.IsZero() {
 		evt.At = time.Now()
 	}
-	s.events = append(s.events, evt)
-	if len(s.events) > s.max {
-		s.events = s.events[len(s.events)-s.max:]
+
+	prev := s.lastHash
+	if prev == "" {
+		prev = GenesisHash
+	}
+	hash := chainHash(evt, prev)
+	s.nextSeq++
+
+	s.chain = append(s.chain, ChainedEvent{Event: evt, Seq: s.nextSeq, Hash: hash, PrevHash: prev})
+	s.lastHash = hash
+	if len(s.chain) > s.max {
+		s.chain = s.chain[len(s.chain)-s.max:]
+		s.truncated = true
 	}
 	return nil
 }
@@ -88,11 +112,13 @@ func (s *InMemorySink) Append(_ context.Context, evt Event) error {
 func (s *InMemorySink) Recent(_ context.Context, n int) ([]Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if n <= 0 || n > len(s.events) {
-		n = len(s.events)
+	if n <= 0 || n > len(s.chain) {
+		n = len(s.chain)
 	}
 	out := make([]Event, n)
-	copy(out, s.events[len(s.events)-n:])
+	for i, ce := range s.chain[len(s.chain)-n:] {
+		out[i] = ce.Event
+	}
 	return out, nil
 }
 
@@ -102,17 +128,32 @@ func (s *InMemorySink) ForAgent(_ context.Context, agentRef string) ([]Event, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []Event
-	for _, e := range s.events {
-		if e.AgentRef == agentRef {
-			out = append(out, e)
+	for _, ce := range s.chain {
+		if ce.AgentRef == agentRef {
+			out = append(out, ce.Event)
 		}
 	}
 	return out, nil
 }
 
+// Chain returns every currently-retained event with its hash-chain
+// metadata, see chain.go's Chained interface. StartsAtGenesis is false
+// once this sink has ever evicted an event past its capacity, the
+// retained window's first entry then genuinely chains from a real,
+// just-no-longer-visible predecessor, not from GenesisHash, and Verify
+// needs to know that to avoid flagging routine eviction as tampering.
+func (s *InMemorySink) Chain(_ context.Context) (Chain, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ChainedEvent, len(s.chain))
+	copy(out, s.chain)
+	return Chain{Events: out, StartsAtGenesis: !s.truncated}, nil
+}
+
 var (
-	_ Sink  = (*InMemorySink)(nil)
-	_ Store = (*InMemorySink)(nil)
+	_ Sink    = (*InMemorySink)(nil)
+	_ Store   = (*InMemorySink)(nil)
+	_ Chained = (*InMemorySink)(nil)
 )
 
 // PostgresSink (postgres_sink.go) is the shared backend: point cmd/api

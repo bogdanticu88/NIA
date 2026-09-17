@@ -29,6 +29,33 @@ CREATE INDEX IF NOT EXISTS audit_events_agent_ref_idx ON audit_events (agent_ref
 CREATE INDEX IF NOT EXISTS audit_events_at_idx ON audit_events (at);
 `
 
+// chainSchemaSQL is the hash-chain addition to a table that may
+// already exist from before this feature: ADD COLUMN IF NOT EXISTS
+// rather than a fresh CREATE TABLE, this is exactly the "first thing
+// to replace" schemaSQL's own doc comment warned about the day this
+// table's shape needed to change. A row written before this migration
+// ran keeps hash and prev_hash empty, see chain.go's own doc comment
+// on why Verify treats that as "predates chaining," excluded rather
+// than either trusted or flagged.
+//
+// audit_chain_state is a one-row table, not a column on audit_events,
+// because Append needs a lockable row to serialize concurrent writers
+// against, `SELECT ... FOR UPDATE` on a query that might return zero
+// rows (an empty or all-legacy audit_events table) can't lock anything.
+// This table always has exactly one row, enforced by the boolean
+// primary key plus the CHECK, so there's always something to lock,
+// from the very first Append this process or any other process sharing
+// this database ever makes.
+const chainSchemaSQL = `
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+	id        BOOLEAN PRIMARY KEY DEFAULT TRUE,
+	last_hash TEXT NOT NULL,
+	CONSTRAINT audit_chain_state_singleton CHECK (id)
+);
+`
+
 // recentUnboundedCap is what Recent asks Postgres for when the caller
 // passes n <= 0, meaning "no limit" per the Store doc comment. Actually
 // unbounded would let one bad call scan and return the entire table;
@@ -68,6 +95,23 @@ func NewPostgresSink(ctx context.Context, dsn string) (*PostgresSink, error) {
 		db.Close()
 		return nil, fmt.Errorf("audit: creating audit_events schema: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, chainSchemaSQL); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("audit: creating audit chain schema: %w", err)
+	}
+	// Seed the singleton chain-state row with GenesisHash if this is
+	// the very first time this feature has run against this database,
+	// ON CONFLICT DO NOTHING so a second process starting up against
+	// the same database (cmd/api and cmd/gateway both point at one
+	// audit database, see docker-compose.yml) doesn't clobber a chain
+	// the first process already started.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO audit_chain_state (id, last_hash) VALUES (TRUE, $1) ON CONFLICT (id) DO NOTHING`,
+		GenesisHash,
+	); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("audit: seeding chain state: %w", err)
+	}
 	return &PostgresSink{db: db}, nil
 }
 
@@ -78,16 +122,62 @@ func (s *PostgresSink) Close() error {
 	return s.db.Close()
 }
 
+// Append writes evt and extends the hash chain in the same
+// transaction. `SELECT last_hash ... FOR UPDATE` on the singleton
+// audit_chain_state row locks out any other concurrent Append,
+// including one from a different process sharing this database, until
+// this transaction commits or rolls back, which is what makes the
+// chain correct under concurrent writers rather than merely correct in
+// a single-process test: two goroutines, or two processes, appending
+// at the same moment cannot both read the same "last hash" and produce
+// two events claiming the same prev_hash, one of them blocks until the
+// other's transaction finishes and the locked row reflects the new
+// last_hash.
 func (s *PostgresSink) Append(ctx context.Context, evt Event) error {
 	if evt.At.IsZero() {
 		evt.At = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_events (action, agent_ref, operator, incident, detail, at) VALUES ($1, $2, $3, $4, $5, $6)`,
-		evt.Action, evt.AgentRef, evt.Operator, evt.Incident, evt.Detail, evt.At,
-	)
+	// TIMESTAMPTZ stores microsecond precision and rounds to the
+	// nearest microsecond on insert, it does not truncate, so a Go
+	// time.Time's nanosecond remainder can round either up or down
+	// depending on its exact value. Truncating here, before both the
+	// hash is computed and the row is inserted, means the value this
+	// process hashes and the value Postgres actually stores are
+	// already identical, nothing is left for Postgres's own rounding
+	// to disagree with. Without this, canonicalize's own truncation
+	// (see chain.go) would floor the value at verification time while
+	// Postgres had rounded it up at write time, and every event whose
+	// nanosecond remainder happened to round up would look "modified"
+	// the moment it was read back, not because anything was tampered
+	// with.
+	evt.At = evt.At.UTC().Truncate(time.Microsecond)
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("audit: append: beginning transaction: %w", err)
+	}
+	defer tx.Rollback() // no-op once Commit has succeeded
+
+	var prevHash string
+	if err := tx.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = TRUE FOR UPDATE`).Scan(&prevHash); err != nil {
+		return fmt.Errorf("audit: append: locking chain state: %w", err)
+	}
+
+	hash := chainHash(evt, prevHash)
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO audit_events (action, agent_ref, operator, incident, detail, at, hash, prev_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		evt.Action, evt.AgentRef, evt.Operator, evt.Incident, evt.Detail, evt.At, hash, prevHash,
+	); err != nil {
 		return fmt.Errorf("audit: append: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE audit_chain_state SET last_hash = $1 WHERE id = TRUE`, hash); err != nil {
+		return fmt.Errorf("audit: append: updating chain state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("audit: append: committing: %w", err)
 	}
 	return nil
 }
@@ -129,6 +219,37 @@ func (s *PostgresSink) ForAgent(ctx context.Context, agentRef string) ([]Event, 
 	return scanEvents(rows)
 }
 
+// Chain returns every row in audit_events in insertion order (by id,
+// the table's own serial primary key, which is exactly the storage
+// layer's real append order, not the caller-supplied At timestamp) with
+// its hash-chain metadata. StartsAtGenesis is always true: unlike
+// InMemorySink, this table has no capacity eviction, whatever rows
+// exist are the complete on-disk history, minus anything an attacker
+// or operator explicitly deleted, which is exactly what Verify's
+// prev_hash check is there to catch.
+func (s *PostgresSink) Chain(ctx context.Context) (Chain, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, action, agent_ref, operator, incident, detail, at, hash, prev_hash FROM audit_events ORDER BY id ASC`,
+	)
+	if err != nil {
+		return Chain{}, fmt.Errorf("audit: chain: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ChainedEvent
+	for rows.Next() {
+		var ce ChainedEvent
+		if err := rows.Scan(&ce.Seq, &ce.Action, &ce.AgentRef, &ce.Operator, &ce.Incident, &ce.Detail, &ce.At, &ce.Hash, &ce.PrevHash); err != nil {
+			return Chain{}, fmt.Errorf("audit: chain: scanning row: %w", err)
+		}
+		out = append(out, ce)
+	}
+	if err := rows.Err(); err != nil {
+		return Chain{}, fmt.Errorf("audit: chain: iterating rows: %w", err)
+	}
+	return Chain{Events: out, StartsAtGenesis: true}, nil
+}
+
 func scanEvents(rows *sql.Rows) ([]Event, error) {
 	var out []Event
 	for rows.Next() {
@@ -151,6 +272,7 @@ func reverseEvents(events []Event) {
 }
 
 var (
-	_ Sink  = (*PostgresSink)(nil)
-	_ Store = (*PostgresSink)(nil)
+	_ Sink    = (*PostgresSink)(nil)
+	_ Store   = (*PostgresSink)(nil)
+	_ Chained = (*PostgresSink)(nil)
 )

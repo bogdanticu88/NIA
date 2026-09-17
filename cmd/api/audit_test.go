@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -110,6 +111,118 @@ func TestHandleRecentAudit_RejectsBadLimit(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for a non-numeric limit", rec.Code)
 	}
 }
+
+func TestHandleVerifyAudit_UntamperedTrail_ReportsOK(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/policy/kill", strings.NewReader(`{"agent_ref":"agent:billing","incident":"INC-1","operator":"bogdan"}`)))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit/verify", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	var result audit.VerifyResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("got %+v, want OK for an untampered trail", result)
+	}
+	if result.Checked != 2 {
+		t.Fatalf("Checked = %d, want 2 (register + kill)", result.Checked)
+	}
+	if len(result.Breaks) != 0 {
+		t.Fatalf("Breaks = %v, want none", result.Breaks)
+	}
+}
+
+// tamperedChainStore wraps a real *audit.InMemorySink, delegating
+// every Store method to it unchanged (Append, Recent, ForAgent are all
+// promoted from the embedded field) except Chain, which is overridden
+// to mutate whatever the real sink reports before returning it. This
+// is how TestHandleVerifyAudit_TamperedTrail_ReportsBreaks simulates a
+// database-level tamper from outside the audit package, where
+// InMemorySink's internal storage is unexported and genuinely not
+// reachable directly: audit events are never editable through the real
+// API by design, so there is no legitimate HTTP path to corrupt one,
+// this stands in for an attacker with direct store access instead.
+type tamperedChainStore struct {
+	*audit.InMemorySink
+	mutate func([]audit.ChainedEvent)
+}
+
+func (t tamperedChainStore) Chain(ctx context.Context) (audit.Chain, error) {
+	chain, err := t.InMemorySink.Chain(ctx)
+	if err != nil {
+		return audit.Chain{}, err
+	}
+	t.mutate(chain.Events)
+	return chain, nil
+}
+
+func TestHandleVerifyAudit_TamperedTrail_ReportsBreaks(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	realSink, ok := s.auditLog.(*audit.InMemorySink)
+	if !ok {
+		t.Fatalf("newTestServer's auditLog is %T, want *audit.InMemorySink", s.auditLog)
+	}
+	s.auditLog = tamperedChainStore{
+		InMemorySink: realSink,
+		mutate: func(events []audit.ChainedEvent) {
+			if len(events) == 0 {
+				t.Fatal("test setup broken: expected at least one event to tamper with")
+			}
+			events[0].Detail = "tampered via direct store access"
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit/verify", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (verify itself succeeded, it just found a problem): %s", rec.Code, rec.Body.String())
+	}
+
+	var result audit.VerifyResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.OK {
+		t.Fatal("got OK=true, want the tampered event to be caught over the HTTP endpoint")
+	}
+	if len(result.Breaks) == 0 {
+		t.Fatal("got no breaks, want at least one naming the tampered event")
+	}
+}
+
+func TestHandleVerifyAudit_BackendWithoutChainSupport_501(t *testing.T) {
+	s := newTestServer()
+	s.auditLog = nonChainedStore{}
+	mux := s.routes()
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit/verify", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 when the configured audit backend doesn't implement audit.Chained: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// nonChainedStore is a minimal audit.Store that deliberately does not
+// implement audit.Chained, proving handleVerifyAudit's type assertion
+// fails closed (501) rather than panicking if a future Sink
+// implementation doesn't support chain verification.
+type nonChainedStore struct{}
+
+func (nonChainedStore) Append(context.Context, audit.Event) error               { return nil }
+func (nonChainedStore) Recent(context.Context, int) ([]audit.Event, error)      { return nil, nil }
+func (nonChainedStore) ForAgent(context.Context, string) ([]audit.Event, error) { return nil, nil }
 
 func TestHandleKill_WritesAuditEvent(t *testing.T) {
 	s := newTestServer()

@@ -1387,6 +1387,33 @@ func (s *server) handleAgentAudit(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, events)
 }
 
+// handleVerifyAudit is the verification operation the hardening
+// directive asked for as its own thing, not folded into a general
+// health check: it walks the entire stored audit chain and reports,
+// in full, whether it's intact, not just yes or no, see
+// internal/audit/chain.go's Verify and VerifyResult. s.auditLog is
+// typed as audit.Store, the narrower read/write interface every other
+// audit handler in this file uses, so this handler type-asserts to
+// audit.Chained rather than widening that field's declared type for
+// one endpoint; both concrete Stores this codebase ships
+// (InMemorySink, PostgresSink) implement Chained, a Store that
+// doesn't (a future SIEM-forwarding Sink, say) reports 501 here
+// rather than panicking or silently claiming a clean chain it never
+// actually checked.
+func (s *server) handleVerifyAudit(w http.ResponseWriter, r *http.Request) {
+	chained, ok := s.auditLog.(audit.Chained)
+	if !ok {
+		niahttp.WriteError(w, http.StatusNotImplemented, "this audit backend does not support chain verification")
+		return
+	}
+	result, err := audit.Verify(r.Context(), chained)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, result)
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -1409,6 +1436,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /tools/{name}", s.handleGetTool)
 	mux.HandleFunc("GET /audit", s.handleRecentAudit)
 	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
+	mux.HandleFunc("GET /audit/verify", s.handleVerifyAudit)
 	mux.HandleFunc("POST /graph/nodes", s.handleAddGraphNode)
 	mux.HandleFunc("POST /graph/edges", s.handleAddGraphEdge)
 	mux.HandleFunc("GET /graph/{id}/neighbors", s.handleGraphNeighbors)

@@ -43,6 +43,7 @@ Usage:
   niactl kill -ref <agent_ref> -incident <incident_id> [-operator <name>]
   niactl restore -ref <agent_ref> [-operator <name>]
   niactl audit [-ref <agent_ref>] [-limit <n>]
+  niactl audit verify
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
   niactl credential list -ref <agent_ref>
   niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
@@ -68,7 +69,15 @@ Usage:
 audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
 incident review starts with. Without -ref it shows the n most recent
-events across every agent (default 100).
+events across every agent (default 100). audit verify walks the entire
+stored hash chain (see internal/audit/chain.go) and reports whether
+it's intact: how many events were checked, how many predate chaining
+and were skipped, and, if anything's wrong, exactly which events and
+why, a modified event, a broken link where one was deleted, inserted,
+or reordered. This proves the trail wasn't tampered with after the
+fact, it does not by itself stop someone with direct database access
+from rewriting both the events and the chain together, see that
+package's own doc comment for the full reasoning.
 
 agent inspect is the one command that composes several endpoints into a
 single report: identity, credentials, grants, the most recent audit
@@ -417,6 +426,11 @@ func cmdKill(args []string) {
 }
 
 func cmdAudit(args []string) {
+	if len(args) > 0 && args[0] == "verify" {
+		get("/audit/verify")
+		return
+	}
+
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	ref := fs.String("ref", "", "show only events for this agent ref")
 	limit := fs.Int("limit", 100, "max events to show when -ref is not given")
