@@ -171,6 +171,7 @@ func apiCall(method, path string, body []byte) (*http.Response, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	setOperatorAuth(req)
 	return http.DefaultClient.Do(req)
 }
 

@@ -810,6 +810,26 @@ func callGateway(ref, credential, tool, arguments string) (*http.Response, error
 	return http.DefaultClient.Do(req)
 }
 
+// operatorToken is NIA_OPERATOR_TOKEN, distinct from cmd/api's own
+// NIA_OPERATOR_TOKENS_PATH (the server-side file naming which tokens
+// are valid and who each belongs to): this is the one token this
+// invocation of niactl presents. Empty when unset, which is the
+// correct default against a cmd/api that has no NIA_OPERATOR_TOKENS_PATH
+// of its own, operatorAuthMiddleware never runs there and no
+// Authorization header is expected, see cmd/api/opauth.go. Against a
+// cmd/api that does have operator auth configured, every del/post/get
+// call below would otherwise get a 401, same failure shape
+// callGateway's own credential parameter closes for the gateway.
+func operatorToken() string {
+	return os.Getenv("NIA_OPERATOR_TOKEN")
+}
+
+func setOperatorAuth(req *http.Request) {
+	if tok := operatorToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+}
+
 func del(path string, body []byte) {
 	req, err := http.NewRequest(http.MethodDelete, apiAddr()+path, bytes.NewReader(body))
 	if err != nil {
@@ -817,6 +837,7 @@ func del(path string, body []byte) {
 		os.Exit(1)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setOperatorAuth(req)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
@@ -827,7 +848,14 @@ func del(path string, body []byte) {
 }
 
 func post(path string, body []byte) {
-	resp, err := http.Post(apiAddr()+path, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, apiAddr()+path, bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setOperatorAuth(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
 		os.Exit(1)
@@ -837,7 +865,13 @@ func post(path string, body []byte) {
 }
 
 func get(path string) {
-	resp, err := http.Get(apiAddr() + path)
+	req, err := http.NewRequest(http.MethodGet, apiAddr()+path, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	setOperatorAuth(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
 		os.Exit(1)

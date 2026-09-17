@@ -22,6 +22,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/graph"
 	"github.com/bogdanticu88/nia/internal/identity"
 	"github.com/bogdanticu88/nia/internal/metrics"
+	"github.com/bogdanticu88/nia/internal/opauth"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -42,6 +43,7 @@ type server struct {
 	auditLog   audit.Store
 	graph      graph.Graph
 	sensitive  sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
+	opStore    opauth.Store           // optional, nil means operator authentication is off, see opauth.go and opauth.FromEnv's own doc comment
 	metrics    *serverMetrics
 	metricsReg *metrics.Registry // handleFunc target for GET /metrics, metrics is the typed counters callers actually use
 }
@@ -138,6 +140,16 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
+	// opauth.FromEnv: unset NIA_OPERATOR_TOKENS_PATH means opStore is
+	// nil and routes() never wraps the mux in operatorAuthMiddleware,
+	// this process authenticates callers exactly the way it always
+	// has, none, see opauth.go's own doc comment and
+	// docs/SECURITY_INVARIANTS.md invariant 11 for what setting it
+	// actually closes and what it still doesn't.
+	opStore, err := opauth.FromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
 	s := &server{
 		agents:    registry.NewInMemoryAgentRegistry(),
 		toolCat:   tools.NewInMemoryCatalog(),
@@ -146,6 +158,7 @@ func newServer(ctx context.Context) (*server, error) {
 		auditLog:  auditLog,
 		graph:     graph.NewInMemoryGraph(),
 		sensitive: sensitive,
+		opStore:   opStore,
 	}
 	reg := metrics.NewRegistry()
 	s.metrics = newServerMetrics(reg, s)
@@ -297,7 +310,12 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	result, err := s.pol.Kill(ctx, req.AgentRef, req.Incident, req.Operator)
+	// operator prefers the authenticated caller (see opauth.go) over
+	// whatever the request body claims, when operator auth is
+	// configured at all; unconfigured, this is exactly req.Operator,
+	// unchanged from before opauth existed.
+	operator := resolveOperator(ctx, req.Operator)
+	result, err := s.pol.Kill(ctx, req.AgentRef, req.Incident, operator)
 	if err != nil {
 		s.metrics.kills.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -326,11 +344,11 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	// already denied them. Same fail-open posture as everything else in
 	// this handler, a revoke failure here doesn't undo or block the
 	// kill that already happened.
-	revoked := s.revokeAllCredentials(ctx, req.AgentRef, req.Operator, "agent killed: "+req.Incident)
+	revoked := s.revokeAllCredentials(ctx, req.AgentRef, operator, "agent killed: "+req.Incident)
 	s.audit(ctx, audit.Event{
 		Action:   "agent.killed",
 		AgentRef: req.AgentRef,
-		Operator: req.Operator,
+		Operator: operator,
 		Incident: req.Incident,
 		Detail:   fmt.Sprintf("revoked %d credential(s)", revoked),
 		At:       time.Now(),
@@ -392,6 +410,7 @@ func (s *server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	operator := resolveOperator(ctx, req.Operator)
 	if err := s.pol.Restore(ctx, req.AgentRef); err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -402,7 +421,7 @@ func (s *server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, audit.Event{
 		Action:   "agent.restored",
 		AgentRef: req.AgentRef,
-		Operator: req.Operator,
+		Operator: operator,
 		At:       time.Now(),
 	})
 	niahttp.WriteJSON(w, http.StatusOK, map[string]string{
@@ -464,7 +483,7 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, audit.Event{
 		Action:   "credential.issued",
 		AgentRef: ref,
-		Operator: req.Operator,
+		Operator: resolveOperator(ctx, req.Operator),
 		Detail:   string(kind) + " " + cred.ID,
 		At:       time.Now(),
 	})
@@ -520,6 +539,7 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ctx := r.Context()
+	operator := resolveOperator(ctx, req.RevokedBy)
 	cred, err := s.creds.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, credentials.ErrNotFound) {
@@ -529,7 +549,7 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.creds.Revoke(ctx, id, req.RevokedBy, req.Reason); err != nil {
+	if err := s.creds.Revoke(ctx, id, operator, req.Reason); err != nil {
 		s.metrics.credentialsRevoked.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -538,7 +558,7 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 	s.audit(ctx, audit.Event{
 		Action:   "credential.revoked",
 		AgentRef: cred.AgentRef,
-		Operator: req.RevokedBy,
+		Operator: operator,
 		Detail:   req.Reason,
 		At:       time.Now(),
 	})
@@ -572,6 +592,7 @@ func (s *server) handleDisableCredential(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	ctx := r.Context()
+	operator := resolveOperator(ctx, req.DisabledBy)
 	cred, err := s.creds.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, credentials.ErrNotFound) {
@@ -581,14 +602,14 @@ func (s *server) handleDisableCredential(w http.ResponseWriter, r *http.Request)
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.creds.Disable(ctx, id, req.DisabledBy, req.Reason); err != nil {
+	if err := s.creds.Disable(ctx, id, operator, req.Reason); err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.audit(ctx, audit.Event{
 		Action:   "credential.disabled",
 		AgentRef: cred.AgentRef,
-		Operator: req.DisabledBy,
+		Operator: operator,
 		Detail:   req.Reason,
 		At:       time.Now(),
 	})
@@ -616,6 +637,7 @@ func (s *server) handleEnableCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	ctx := r.Context()
+	operator := resolveOperator(ctx, req.EnabledBy)
 	cred, err := s.creds.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, credentials.ErrNotFound) {
@@ -625,7 +647,7 @@ func (s *server) handleEnableCredential(w http.ResponseWriter, r *http.Request) 
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.creds.Enable(ctx, id, req.EnabledBy); err != nil {
+	if err := s.creds.Enable(ctx, id, operator); err != nil {
 		if errors.Is(err, credentials.ErrInvalidCredential) {
 			niahttp.WriteError(w, http.StatusConflict, "credential is revoked, revocation is one-way, issue a new credential instead")
 			return
@@ -636,7 +658,7 @@ func (s *server) handleEnableCredential(w http.ResponseWriter, r *http.Request) 
 	s.audit(ctx, audit.Event{
 		Action:   "credential.enabled",
 		AgentRef: cred.AgentRef,
-		Operator: req.EnabledBy,
+		Operator: operator,
 		At:       time.Now(),
 	})
 	updated, err := s.creds.Get(ctx, id)
@@ -671,6 +693,7 @@ func (s *server) handleRotateCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	ctx := r.Context()
+	operator := resolveOperator(ctx, req.RotatedBy)
 	old, err := s.creds.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, credentials.ErrNotFound) {
@@ -684,7 +707,7 @@ func (s *server) handleRotateCredential(w http.ResponseWriter, r *http.Request) 
 	if req.TTLSeconds > 0 {
 		ttl = time.Duration(req.TTLSeconds) * time.Second
 	}
-	next, secret, err := s.creds.Rotate(ctx, id, req.RotatedBy, ttl)
+	next, secret, err := s.creds.Rotate(ctx, id, operator, ttl)
 	if err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -694,7 +717,7 @@ func (s *server) handleRotateCredential(w http.ResponseWriter, r *http.Request) 
 	s.audit(ctx, audit.Event{
 		Action:   "credential.rotated",
 		AgentRef: old.AgentRef,
-		Operator: req.RotatedBy,
+		Operator: operator,
 		Detail:   fmt.Sprintf("%s superseded by %s", id, next.ID),
 		At:       time.Now(),
 	})
@@ -894,7 +917,7 @@ func (s *server) handleWriteGrants(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, audit.Event{
 		Action:   "grant.written",
 		AgentRef: ref,
-		Operator: req.Operator,
+		Operator: resolveOperator(ctx, req.Operator),
 		Detail:   grantSummary(grants),
 		At:       time.Now(),
 	})
@@ -946,7 +969,7 @@ func (s *server) handleDeleteGrants(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, audit.Event{
 		Action:   "grant.deleted",
 		AgentRef: ref,
-		Operator: req.Operator,
+		Operator: resolveOperator(ctx, req.Operator),
 		Detail:   grantSummary(grants),
 		At:       time.Now(),
 	})
@@ -1364,7 +1387,7 @@ func (s *server) handleAgentAudit(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, events)
 }
 
-func (s *server) routes() *http.ServeMux {
+func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
@@ -1392,6 +1415,16 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /graph/{id}/reachable", s.handleGraphReachable)
 	mux.HandleFunc("GET /graph/{id}/blast-radius", s.handleBlastRadius)
 	mux.Handle("GET /metrics", s.metricsReg)
+	// routes() returns http.Handler rather than *http.ServeMux
+	// specifically so this wrap is possible: when operator auth is
+	// configured, every request goes through operatorAuthMiddleware
+	// before it ever reaches a handler; when it isn't, this returns
+	// the bare mux, identical to before opauth existed. Every caller
+	// (main, and every test in this package) only ever calls
+	// ServeHTTP on the result, which http.Handler still provides.
+	if s.opStore != nil {
+		return operatorAuthMiddleware(s.opStore, mux)
+	}
 	return mux
 }
 
@@ -1404,6 +1437,11 @@ func main() {
 	s, err := newServer(context.Background())
 	if err != nil {
 		log.Fatalf("nia-api: %v", err)
+	}
+	if s.opStore != nil {
+		log.Printf("nia-api: NIA_OPERATOR_TOKENS_PATH is set, every request except GET /healthz and GET /metrics requires Authorization: Bearer <operator token>")
+	} else {
+		log.Printf("nia-api: NIA_OPERATOR_TOKENS_PATH is not set, this process accepts every request unauthenticated, operator/*_by fields are trusted at face value, see docs/SECURITY_INVARIANTS.md invariant 11")
 	}
 	srv := &http.Server{
 		Addr:              addr,

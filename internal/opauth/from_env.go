@@ -1,0 +1,73 @@
+package opauth
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+// envTokensPath names a JSON file of operator tokens. Unset means
+// operator authentication is not configured at all, cmd/api runs the
+// way it always has, trusting whatever operator/*_by field a request
+// body supplies, see cmd/api/opauth.go's middleware for exactly what
+// changes when this is set. This is a stronger "off" than
+// internal/sensitivity's or internal/registry/tools's FromEnv
+// constructors: those return a real, usable value in the empty state
+// (every resource Public, an empty catalog); this one returns a nil
+// Store, because there is no safe non-nil default for "verify a
+// caller's identity", an empty StaticStore would just reject every
+// token, indistinguishable from a misconfigured deployment locking
+// itself out.
+const envTokensPath = "NIA_OPERATOR_TOKENS_PATH"
+
+// tokenFile is one entry in the JSON file NIA_OPERATOR_TOKENS_PATH
+// points at: a flat array of {"token": "...", "name": "..."}. The
+// plaintext token lives in this file because something has to, the
+// same tradeoff NIA_TESSERA_JWT_SIGNING_KEY and TESSERA_JWT_SIGNING_KEY
+// already make for a different shared secret, an operator managing
+// this file is expected to treat it like any other credential store
+// and keep it out of version control.
+type tokenFile struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
+
+// FromEnv builds a Store from the tokens file named by
+// NIA_OPERATOR_TOKENS_PATH. Unset returns (nil, nil), not an error,
+// and not a usable Store either, see envTokensPath's own doc comment;
+// cmd/api's caller must treat a nil Store as "operator auth is off",
+// the same way it already treats a nil sensitivity.Classifier as
+// impossible (that package's FromEnv never returns nil) versus a nil
+// credentials.Store as impossible too, this package is the one place
+// in this codebase where nil, no error is the expected default rather
+// than something a caller has to guard defensively against.
+func FromEnv() (Store, error) {
+	path := os.Getenv(envTokensPath)
+	if path == "" {
+		return nil, nil
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("opauth: reading %s (%s): %w", envTokensPath, path, err)
+	}
+	var files []tokenFile
+	if err := json.Unmarshal(raw, &files); err != nil {
+		return nil, fmt.Errorf("opauth: parsing %s: %w", path, err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("opauth: %s is set but %s contains no tokens, a deployment would lock every operator out, remove the env var instead if that's genuinely intended", envTokensPath, path)
+	}
+
+	tokens := make(map[string]string, len(files))
+	for i, f := range files {
+		if f.Token == "" {
+			return nil, fmt.Errorf("opauth: entry %d in %s has an empty token", i, path)
+		}
+		if f.Name == "" {
+			return nil, fmt.Errorf("opauth: entry %d in %s (token present) has an empty name", i, path)
+		}
+		tokens[f.Token] = f.Name
+	}
+	return NewStaticStore(tokens), nil
+}
