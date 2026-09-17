@@ -140,3 +140,103 @@ func TestHandleRevokeCredential_NotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404 for an unknown credential id: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHandleDisableCredential_ThenEnable_RestoresActiveStatus(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/credentials", strings.NewReader(`{"kind":"api_key"}`)))
+	cred := decodeCredential(t, rec)
+
+	rec = httptest.NewRecorder()
+	disableReq := `{"disabled_by":"bogdan","reason":"rotating keys, pausing the old one first"}`
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/credentials/"+cred.ID+"/disable", strings.NewReader(disableReq)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	disabled := decodeCredential(t, rec)
+	if disabled.Status != credentials.StatusDisabled || disabled.DisabledBy != "bogdan" {
+		t.Fatalf("got %+v, want a disabled credential attributed to bogdan", disabled)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/credentials/"+cred.ID+"/enable", strings.NewReader(`{"enabled_by":"bogdan"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	enabled := decodeCredential(t, rec)
+	if enabled.Status != credentials.StatusActive {
+		t.Fatalf("Status = %q after enable, want active", enabled.Status)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/agent:billing/audit", nil))
+	events := decodeEvents(t, rec)
+	if len(events) != 4 || events[2].Action != "credential.disabled" || events[3].Action != "credential.enabled" {
+		t.Fatalf("got %v, want registered, issued, disabled, enabled", events)
+	}
+}
+
+func TestHandleEnableCredential_RefusesARevokedCredential(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/credentials", strings.NewReader(`{"kind":"api_key"}`)))
+	cred := decodeCredential(t, rec)
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/credentials/"+cred.ID+"/revoke", strings.NewReader(`{"revoked_by":"bogdan","reason":"compromised"}`)))
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/credentials/"+cred.ID+"/enable", strings.NewReader(`{"enabled_by":"bogdan"}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: revocation is one-way, enable must not undo it: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleRotateCredential_OldSecretStopsWorkingNewOneStarts(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/credentials", strings.NewReader(`{"kind":"api_key"}`)))
+	old := decodeCredential(t, rec)
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/credentials/"+old.ID+"/rotate", strings.NewReader(`{"rotated_by":"bogdan"}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("rotate status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	next := decodeCredential(t, rec)
+	if next.ID == old.ID {
+		t.Fatalf("rotate returned the same id %q, want a new credential", next.ID)
+	}
+	if next.RotatedFrom != old.ID {
+		t.Fatalf("RotatedFrom = %q, want %q", next.RotatedFrom, old.ID)
+	}
+
+	// The atomic guarantee rotate exists for: fetch both rows back and
+	// confirm the old one is Revoked (not just "replaced" in name) and
+	// the new one is Active, there is never a window with both or
+	// neither valid, see credentials.Store.Rotate's own doc comment.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/agent:billing/credentials", nil))
+	creds := decodeCredentials(t, rec)
+	byID := map[string]credentials.Credential{}
+	for _, c := range creds {
+		byID[c.ID] = c
+	}
+	if byID[old.ID].Status != credentials.StatusRevoked {
+		t.Fatalf("old credential status = %q, want revoked after rotate", byID[old.ID].Status)
+	}
+	if byID[old.ID].RotatedTo != next.ID {
+		t.Fatalf("old credential RotatedTo = %q, want %q", byID[old.ID].RotatedTo, next.ID)
+	}
+	if byID[next.ID].Status != credentials.StatusActive {
+		t.Fatalf("new credential status = %q, want active", byID[next.ID].Status)
+	}
+}

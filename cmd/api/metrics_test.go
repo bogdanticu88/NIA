@@ -30,8 +30,8 @@ import (
 // handleIssueCredential does before ever calling Issue.
 type failIssueCredStore struct{ credentials.Store }
 
-func (failIssueCredStore) Issue(context.Context, string, credentials.Kind, time.Duration) (credentials.Credential, error) {
-	return credentials.Credential{}, errBackendDown
+func (failIssueCredStore) Issue(context.Context, string, credentials.Kind, time.Duration) (credentials.Credential, string, error) {
+	return credentials.Credential{}, "", errBackendDown
 }
 
 // failRevokeCredStore fails only Revoke, the shape needed to prove
@@ -135,7 +135,7 @@ func TestMetrics_RevokeCredential_CountsSuccessAndError(t *testing.T) {
 	if err := s.agents.Register(context.Background(), identity.AgentRef{Ref: "agent:x", Owner: "bogdan"}); err != nil {
 		t.Fatalf("seed register: %v", err)
 	}
-	cred, err := s.creds.Issue(context.Background(), "agent:x", credentials.KindAPIKey, 0)
+	cred, _, err := s.creds.Issue(context.Background(), "agent:x", credentials.KindAPIKey, 0)
 	if err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestMetrics_RevokeCredential_CountsSuccessAndError(t *testing.T) {
 	if err := s2.agents.Register(context.Background(), identity.AgentRef{Ref: "agent:x", Owner: "bogdan"}); err != nil {
 		t.Fatalf("seed register: %v", err)
 	}
-	cred2, err := s2.creds.Issue(context.Background(), "agent:x", credentials.KindAPIKey, 0)
+	cred2, _, err := s2.creds.Issue(context.Background(), "agent:x", credentials.KindAPIKey, 0)
 	if err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}

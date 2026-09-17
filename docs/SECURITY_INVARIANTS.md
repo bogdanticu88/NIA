@@ -124,6 +124,30 @@ When `Monitor.Observe` decides to flag, revoke, or kill, it also writes an `inte
 
 * * *
 
+### 11. A gateway request without a valid, active credential for a non-killed agent never reaches authorization
+
+Before `policy.Check` runs, the caller must present `Authorization: Bearer <credential-id>.<secret>` for a credential that exists, whose secret matches, whose `Effective(now)` status is `Active`, and whose owning agent is not killed. Any other case, no header, wrong scheme, malformed token, unknown id, wrong secret, revoked, expired, disabled, or a killed owning agent, resolves to no identity at all, and `handleToolCall` returns 401 without ever calling `policy.Check`.
+
+**Enforced:** `cmd/gateway/authn.go`'s `credentialResolver` is the gateway's default `identity.Resolver` (see invariant 12 below for the opt-out). It checks `credentials.Store.Verify` (which itself checks `Credential.Effective`) and then, independently, `policy.Client.IsKilled`, both before returning anything to `handleToolCall`, and `handleToolCall` calls the resolver before it ever calls `policy.Check`.
+
+**Tested:** `cmd/gateway/authn_test.go`: eleven unit tests against `credentialResolver.Resolve` directly, covering every failure mode listed above plus the two fail-closed cases (the credential store or the kill check itself failing, which must return a real error, not an unresolved identity, see invariant 12), and four `handleToolCall`-level integration tests, the most direct being `TestHandleToolCall_FakeAgentRefAloneNoLongerAuthenticates`, which asserts a bare `X-Agent-Ref` header gets 401 and that `policy.Check` was called zero times, the regression test for the exact vulnerability this invariant closes.
+
+**Status:** Holds, for the gateway's default configuration. Does not hold when an operator sets `NIA_GATEWAY_INSECURE_HEADER_AUTH=1`, which is the point, a named, logged, local-dev-only escape hatch, not a silent gap, see docs/ARCHITECTURE.md's "Credential-backed authentication and state convergence". Does not cover `cmd/api`, which remains unauthenticated, see the section below.
+
+* * *
+
+### 12. Authentication infrastructure failures fail closed, never open
+
+If the credential store or the policy client cannot answer whether a presented credential is valid, that is not the same outcome as the credential being invalid, and must not be treated as either.
+
+**Enforced:** `identity.Resolver.Resolve` returning `(nil, nil)` means "no identity, and that's not an error," the gateway turns it into 401. Returning a non-nil error means "the question couldn't be answered," the gateway turns it into 500. `credentialResolver` keeps these separate deliberately: `credentials.ErrInvalidCredential` from `Verify` collapses to `(nil, nil)`, any other error from `Verify` or from `policy.Client.IsKilled` propagates as a real error.
+
+**Tested:** `cmd/gateway/authn_test.go`'s `TestCredentialResolver_StoreFailureFailsClosedNotUnresolved` and `TestCredentialResolver_KillCheckFailureFailsClosed`, both using a failing test double and asserting the resolver returns a non-nil error, not a nil identity with no error.
+
+**Status:** Holds.
+
+* * *
+
 ### What this document does not cover
 
-Multi-replica correctness, more than one `cmd/api`, `cmd/gateway`, or `Tessera.Service` instance against the same backing store, is not a stated invariant here because it isn't proven in either direction, see docs/THREAT_MODEL.md's threat 11 and docs/ARCHITECTURE.md's "Integration plan for Tessera" section for what's known and what isn't. Identity resolution at the gateway, whether the caller actually is who it claims to be, is also not listed as an invariant here because there currently isn't one to state, `headerResolver` trusts a header outright, see docs/THREAT_MODEL.md's threats 1 and 2. Both are named directly rather than implied covered by their absence from this list.
+Multi-replica correctness, more than one `cmd/api`, `cmd/gateway`, or `Tessera.Service` instance against the same backing store, is not a stated invariant here because it isn't proven in either direction, see docs/THREAT_MODEL.md's threat 11 and docs/ARCHITECTURE.md's "Integration plan for Tessera" section for what's known and what isn't. Authenticating a caller to `cmd/api` itself is also not listed as an invariant here because there currently isn't one to state: invariants 11 and 12 above cover the gateway's hot path, `cmd/gateway`, but `cmd/api`'s own twenty-odd endpoints remain unauthenticated, `operator` and similar fields are client-supplied free text, not verified against anything. Both gaps are named directly rather than implied covered by their absence from this list.

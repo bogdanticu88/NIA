@@ -76,14 +76,32 @@
 # next full stack run rather than assuming it behaves like the
 # unit-tested version against a fake server.
 #
+# NIA_CREDENTIALS_DATABASE_URL, same postgres and database as
+# NIA_AUDIT_DATABASE_URL above, a different table (credentials, see
+# internal/credentials/postgres.go). This one matters for a reason the
+# audit trail doesn't: cmd/gateway's default identity resolver,
+# credentialResolver, actually authenticates callers against this
+# store now (see cmd/gateway/authn.go), so without both services
+# pointed at the same one, a credential issued through nia-api is
+# invisible to nia-gateway's own check and every gateway call gets a
+# real 401, not because anything is broken, the same "genuinely
+# nothing shared" failure mode NIA_TESSERA_BASE_URL has when it's
+# missing. Verified this pass against real nia-api and nia-gateway
+# binaries pointed at the same local Postgres and a real Tessera.Service,
+# not against this exact compose stack, no Docker daemon was available
+# to run it through, that's still open, add it to the next full stack
+# run rather than assuming compose behaves identically to two bare
+# processes.
+#
 # NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT turn on
 # risk-based monitoring in nia-gateway, see internal/monitoring and
-# internal/risk.HistoryScorer. Deliberately not set here: nia-gateway
-# has no credential store wired into it yet, so a revoke threshold
-# would only ever degrade to an audited no-op, and turning on a kill
-# threshold in the shared dev stack by default is the kind of surprise
-# ("why did my agent just get killed") this file shouldn't spring on
-# someone who didn't opt into it. Add the three variables to
+# internal/risk.HistoryScorer. Deliberately not set here: turning on a
+# kill threshold in the shared dev stack by default is the kind of
+# surprise ("why did my agent just get killed") this file shouldn't
+# spring on someone who didn't opt into it. crossing a revoke or kill
+# threshold now genuinely revokes credentials through the shared store
+# above, not the audited no-op it used to degrade to when nia-gateway
+# had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
 services:
   nia-api:
@@ -97,6 +115,7 @@ services:
       NIA_TESSERA_BASE_URL: "http://tessera:8080"
       NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     depends_on:
       tessera:
         condition: service_healthy
@@ -114,6 +133,7 @@ services:
       NIA_TESSERA_BASE_URL: "http://tessera:8080"
       NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_TOOLS_API_URL: "http://nia-api:8080"
     depends_on:
       tessera:

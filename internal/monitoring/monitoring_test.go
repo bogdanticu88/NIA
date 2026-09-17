@@ -3,6 +3,7 @@ package monitoring
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,18 +98,18 @@ func TestObserve_RevokeThreshold_RevokesOnlyActiveCredentialsForThatAgent(t *tes
 	store := credentials.NewInMemoryStore()
 	ctx := context.Background()
 
-	billingCred, err := store.Issue(ctx, "agent:billing", credentials.KindAPIKey, 0)
+	billingCred, _, err := store.Issue(ctx, "agent:billing", credentials.KindAPIKey, 0)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-	alreadyRevoked, err := store.Issue(ctx, "agent:billing", credentials.KindOAuthToken, 0)
+	alreadyRevoked, _, err := store.Issue(ctx, "agent:billing", credentials.KindOAuthToken, 0)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 	if err := store.Revoke(ctx, alreadyRevoked.ID, "bogdan", "unrelated cleanup"); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	otherAgentCred, err := store.Issue(ctx, "agent:reporting", credentials.KindAPIKey, 0)
+	otherAgentCred, _, err := store.Issue(ctx, "agent:reporting", credentials.KindAPIKey, 0)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -141,6 +142,87 @@ func TestObserve_RevokeThreshold_RevokesOnlyActiveCredentialsForThatAgent(t *tes
 	events, _ := sink.Recent(ctx, 10)
 	if len(events) != 1 || events[0].Action != "monitoring.revoke" {
 		t.Fatalf("got %v, want exactly one monitoring.revoke event", events)
+	}
+}
+
+func TestObserve_KillThreshold_NoCredentialStoreConfigured_KillsButDoesNotClaimRevocation(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
+
+	action, err := m.Observe(context.Background(), newScore("agent:billing", 20), "INC-004")
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if action != ActionKill {
+		t.Fatalf("action = %q, want kill", action)
+	}
+	events, _ := sink.Recent(context.Background(), 10)
+	if len(events) != 1 || events[0].Action != "monitoring.kill" {
+		t.Fatalf("got %v, want exactly one monitoring.kill event", events)
+	}
+	if !strings.Contains(events[0].Detail, "no credentials.Store configured") {
+		t.Fatalf("Detail = %q, want it to say plainly that credentials were not revoked because no store is configured, same posture as the revoke threshold", events[0].Detail)
+	}
+}
+
+func TestObserve_KillThreshold_CascadesRevocationToEveryActiveCredentialForThatAgent(t *testing.T) {
+	// This is the specific gap the security hardening pass closed:
+	// before it, ActionKill only ever called policy.Kill, an agent's
+	// credentials kept reporting Active in credentials.Store forever
+	// even though every authorization check already denied them. See
+	// docs/ARCHITECTURE.md's "Credential-backed authentication and
+	// state convergence".
+	sink := audit.NewInMemorySink(10)
+	store := credentials.NewInMemoryStore()
+	ctx := context.Background()
+
+	billingCred, _, err := store.Issue(ctx, "agent:billing", credentials.KindAPIKey, 0)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	alreadyRevoked, _, err := store.Issue(ctx, "agent:billing", credentials.KindOAuthToken, 0)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if err := store.Revoke(ctx, alreadyRevoked.ID, "bogdan", "unrelated cleanup"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	otherAgentCred, _, err := store.Issue(ctx, "agent:reporting", credentials.KindAPIKey, 0)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), store, nil, sink)
+	action, err := m.Observe(ctx, newScore("agent:billing", 20), "INC-005")
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if action != ActionKill {
+		t.Fatalf("action = %q, want kill", action)
+	}
+
+	got, err := store.Get(ctx, billingCred.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != credentials.StatusRevoked || got.RevokedBy != "monitoring" {
+		t.Fatalf("got %+v, want the active billing credential revoked by monitoring as part of the kill", got)
+	}
+
+	other, err := store.Get(ctx, otherAgentCred.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if other.Status != credentials.StatusActive {
+		t.Fatalf("got %+v, want agent:reporting's credential left untouched by a different agent's kill", other)
+	}
+
+	events, _ := sink.Recent(ctx, 10)
+	if len(events) != 1 || events[0].Action != "monitoring.kill" {
+		t.Fatalf("got %v, want exactly one monitoring.kill event", events)
+	}
+	if !strings.Contains(events[0].Detail, "revoked 1 active credential(s)") {
+		t.Fatalf("Detail = %q, want it to report exactly one newly revoked credential (the second was already revoked, the third belongs to a different agent)", events[0].Detail)
 	}
 }
 

@@ -38,6 +38,15 @@ type fakePolicyClient struct {
 	calls         int
 	killedRef     string
 	deniedObjects map[string]bool
+	isKilled      bool  // what IsKilled reports, see authn_test.go's credentialResolver tests
+	isKilledErr   error // forces IsKilled to fail, proving the fail-closed path
+}
+
+func (f *fakePolicyClient) IsKilled(_ context.Context, _ string) (bool, error) {
+	if f.isKilledErr != nil {
+		return false, f.isKilledErr
+	}
+	return f.isKilled, nil
 }
 
 func (f *fakePolicyClient) Check(_ context.Context, _ string, grant policy.Grant) (bool, error) {

@@ -156,6 +156,11 @@ func newFakeControlPlane(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode([]map[string]string{})
 	})
+	mux.HandleFunc("POST /agents/{ref}/credentials", func(w http.ResponseWriter, r *http.Request) {
+		fc.paths = append(fc.paths, "POST /agents/"+r.PathValue("ref")+"/credentials")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"ID": "cred-fake", "secret": "fake-secret"})
+	})
 	mux.HandleFunc("GET /agents/{ref}/audit", func(w http.ResponseWriter, r *http.Request) {
 		fc.paths = append(fc.paths, "GET /agents/"+r.PathValue("ref")+"/audit")
 		w.WriteHeader(http.StatusOK)
@@ -184,8 +189,10 @@ func TestRunScenario_DrivesRealSetupCallsAndDetectsContainment(t *testing.T) {
 	defer api.Close()
 
 	callCount := 0
+	var sawAuth []string
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		sawAuth = append(sawAuth, r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
 		if callCount == 1 {
 			w.WriteHeader(http.StatusOK)
@@ -233,6 +240,11 @@ func TestRunScenario_DrivesRealSetupCallsAndDetectsContainment(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("gateway received %d calls, want 2", callCount)
+	}
+	for i, got := range sawAuth {
+		if got != "Bearer cred-fake.fake-secret" {
+			t.Fatalf("call %d: Authorization = %q, want the credential issueScenarioCredential minted, proving the scenario authenticates the same way a real caller now must", i+1, got)
+		}
 	}
 	if !strings.Contains(got, "severity MEDIUM") {
 		t.Fatalf("transcript missing the blast-radius summary read back from the graph:\n%s", got)

@@ -8,7 +8,10 @@
 // to "agent."
 package identity
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Assurance is how confident NIA is in an identity resolution. Gate
 // high-value operations (credential issuance, delegation grants, kill
@@ -76,14 +79,31 @@ type ResolveContext struct {
 }
 
 // ResolvedIdentity is the outcome of resolving a request to an AgentRef.
+// CredentialID is set when a real credential authenticated this
+// request (see cmd/gateway/authn.go's credentialResolver), empty for
+// anything that isn't credential-backed. It exists so a caller further
+// down the chain, internal/audit, internal/monitoring, can attribute a
+// specific request to the specific credential that authenticated it,
+// something the pre-hardening headerResolver had no way to do at all,
+// see internal/monitoring.Monitor.revokeCredentials's own doc comment
+// on the coarser "revoke everything" behavior that gap used to force.
 type ResolvedIdentity struct {
-	Ref       string
-	Assurance Assurance
+	Ref          string
+	Assurance    Assurance
+	CredentialID string
 }
 
 // Resolver maps an inbound request to a canonical AgentRef. The gateway
 // calls this before it ever asks the policy client for an authorization
-// decision.
+// decision. Resolve returning (nil, nil) means "no identity could be
+// established, and that's not itself an error," the caller treats it
+// as unauthenticated (401); Resolve returning a non-nil error means
+// something needed to answer the question failed (a credential store
+// or policy client unreachable), the caller must not treat that as
+// "unauthenticated," see cmd/gateway's handleToolCall, an authentication
+// infrastructure failure fails closed (500), it is never silently
+// treated as "let it through" or quietly downgraded to a plain
+// unresolved identity.
 type Resolver interface {
-	Resolve(ctx ResolveContext) (*ResolvedIdentity, error)
+	Resolve(ctx context.Context, rc ResolveContext) (*ResolvedIdentity, error)
 }

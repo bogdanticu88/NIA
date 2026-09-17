@@ -41,10 +41,14 @@ Usage:
   niactl agent inspect -ref <agent_ref> [-audit-limit <n>]
   niactl risk -ref <agent_ref>
   niactl kill -ref <agent_ref> -incident <incident_id> [-operator <name>]
+  niactl restore -ref <agent_ref> [-operator <name>]
   niactl audit [-ref <agent_ref>] [-limit <n>]
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
   niactl credential list -ref <agent_ref>
   niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
+  niactl credential disable -id <credential_id> [-reason <reason>] [-operator <name>]
+  niactl credential enable -id <credential_id> [-operator <name>]
+  niactl credential rotate -id <credential_id> [-ttl <duration>] [-operator <name>]
   niactl tool register -name <tool_name> [-description <text>] [-transport <mcp|http|grpc>] [-risk <read_only|write|destructive>] [-owner <owner>]
   niactl tool list
   niactl tool get -name <tool_name>
@@ -56,7 +60,7 @@ Usage:
   niactl grant write -ref <agent_ref> -kind <api_group|endpoint|tool|data> [-group <g>] [-method <m>] [-path <p>] [-object <o>] [-operator <name>]
   niactl grant delete -ref <agent_ref> -kind <...> [-group|-method|-path|-object matching what was written] [-operator <name>]
   niactl grant list -ref <agent_ref>
-  niactl gateway call -ref <agent_ref> -tool <tool_name> [-arguments '<json object>']
+  niactl gateway call -ref <agent_ref> -credential <id.secret> -tool <tool_name> [-arguments '<json object>']
   niactl simulate attack -scenario <agent-hijack>
   niactl incident list [-ref <agent_ref>] [-limit <n>]
   niactl incident get -id <incident_id>
@@ -81,11 +85,25 @@ being compared against, and its most recent incidents on that gateway.
 configured:false in the response means that gateway has no monitoring
 set up at all, not that the agent has a clean history.
 
-credential issue only mints metadata, an id, kind, and expiry, NIA does not
-generate the credential material itself, see internal/credentials's package
-doc for why. -ttl takes a Go duration (24h, 30m); omitted or zero means no
-expiry. credential revoke retires one key without touching the agent's
-grants or identity, use kill instead when the agent itself is compromised.
+credential issue mints a real bearer credential now: the response's "secret"
+field is shown exactly once, this command does not store it and cannot show
+it again, save it immediately. Present it to the gateway as
+"Authorization: Bearer <id>.<secret>", see cmd/gateway/authn.go. -ttl takes
+a Go duration (24h, 30m); omitted or zero means no expiry. credential revoke
+retires one key permanently, use kill instead when the agent itself is
+compromised, that also cascades into revoking every active credential the
+killed agent holds. credential disable is the reversible counterpart, an
+administrative pause credential enable can undo, revoke cannot be undone.
+credential rotate atomically revokes the named credential and issues a
+replacement in one call, the old secret stops authenticating and the new one
+starts in the same operation, no window where both or neither work, see
+internal/credentials.Store.Rotate's doc comment.
+
+restore clears the kill sentinel through internal/policy.Client.Restore. It
+does not resurrect grants or credentials on its own, an operator must
+separately call grant write with the intended grants and credential issue
+for a fresh credential, restoring access is deliberately not "undo the
+kill," see handleRestore's own doc comment in cmd/api/main.go.
 
 tool register onboards a callable tool into the catalog, -risk defaults to
 read_only, set it honestly, it's what internal/risk will eventually score
@@ -123,17 +141,25 @@ grow, treat it as a superset of what's actually still granted, not a
 stale-safe mirror, check niactl grant list for the current truth.
 
 gateway call drives the gateway's own hot path directly, POST /tools/{tool}/call
-with -ref sent as X-Agent-Ref and -arguments (a JSON object, optional) as the
-request body's arguments field, the exact request an MCP-aware caller sends.
-This is what makes niactl simulate possible: every step it prints is a real
-gateway call through this same path, not printed output pretending to be one.
+with -credential presented as "Authorization: Bearer <id.secret>" (issue one
+first with credential issue, -ref is for the human reading the output, the
+gateway's default resolver, credentialResolver, does not read it at all, see
+cmd/gateway/authn.go) and -arguments (a JSON object, optional) as the request
+body's arguments field, the exact request an MCP-aware caller sends. Omitting
+-credential only works against a gateway started with
+NIA_GATEWAY_INSECURE_HEADER_AUTH=1, local dev only, see that variable's own
+warning at gateway startup. This is what makes niactl simulate possible:
+every step it prints is a real gateway call through this same path, not
+printed output pretending to be one.
 
 simulate attack drives a scripted, deterministic scenario end to end through
 the real control-plane API and the real gateway: registers the scenario's
-agent, registers its tools, writes its starting grants, then issues the
-scenario's sequence of gateway calls in order, printing each one's real
-outcome, allowed, denied, and, once configured with risk thresholds (see
-deployments/docker-compose.yml's comment on NIA_RISK_FLAG_AT and friends),
+agent, registers its tools, writes its starting grants, issues the scenario
+agent a real credential the same way credential issue does, then presents
+that credential on every one of the scenario's sequence of gateway calls,
+printing each one's real outcome, allowed, denied, and, once configured with
+risk thresholds (see deployments/docker-compose.yml's comment on
+NIA_RISK_FLAG_AT and friends),
 watches containment actually fire and the agent's next request actually get
 blocked. A re-run against an already-registered agent picks up where the
 grants and tool catalog left off rather than failing, registration and
@@ -178,6 +204,8 @@ func main() {
 		cmdRisk(os.Args[2:])
 	case "kill":
 		cmdKill(os.Args[2:])
+	case "restore":
+		cmdRestore(os.Args[2:])
 	case "audit":
 		cmdAudit(os.Args[2:])
 	case "credential":
@@ -230,6 +258,12 @@ func cmdCredential(args []string) {
 		cmdCredentialList(args[1:])
 	case "revoke":
 		cmdCredentialRevoke(args[1:])
+	case "disable":
+		cmdCredentialDisable(args[1:])
+	case "enable":
+		cmdCredentialEnable(args[1:])
+	case "rotate":
+		cmdCredentialRotate(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -447,6 +481,77 @@ func cmdCredentialRevoke(args []string) {
 	post("/credentials/"+url.PathEscape(*id)+"/revoke", body)
 }
 
+func cmdCredentialDisable(args []string) {
+	fs := flag.NewFlagSet("credential disable", flag.ExitOnError)
+	id := fs.String("id", "", "credential id to disable")
+	reason := fs.String("reason", "", "why this credential is being paused")
+	operator := fs.String("operator", "niactl", "who is disabling this")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "credential disable: -id is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"disabled_by": *operator,
+		"reason":      *reason,
+	})
+	post("/credentials/"+url.PathEscape(*id)+"/disable", body)
+}
+
+func cmdCredentialEnable(args []string) {
+	fs := flag.NewFlagSet("credential enable", flag.ExitOnError)
+	id := fs.String("id", "", "credential id to re-enable")
+	operator := fs.String("operator", "niactl", "who is enabling this")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "credential enable: -id is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{"enabled_by": *operator})
+	post("/credentials/"+url.PathEscape(*id)+"/enable", body)
+}
+
+func cmdCredentialRotate(args []string) {
+	fs := flag.NewFlagSet("credential rotate", flag.ExitOnError)
+	id := fs.String("id", "", "credential id to rotate")
+	ttl := fs.Duration("ttl", 0, "how long the replacement is valid for, e.g. 24h; 0 means no expiry")
+	operator := fs.String("operator", "niactl", "who is rotating this")
+	_ = fs.Parse(args)
+
+	if *id == "" {
+		fmt.Fprintln(os.Stderr, "credential rotate: -id is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"rotated_by":  *operator,
+		"ttl_seconds": int64(*ttl / time.Second),
+	})
+	post("/credentials/"+url.PathEscape(*id)+"/rotate", body)
+}
+
+func cmdRestore(args []string) {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref to restore")
+	operator := fs.String("operator", "niactl", "who is restoring this agent")
+	_ = fs.Parse(args)
+
+	if *ref == "" {
+		fmt.Fprintln(os.Stderr, "restore: -ref is required")
+		os.Exit(1)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"agent_ref": *ref,
+		"operator":  *operator,
+	})
+	post("/policy/restore", body)
+}
+
 func cmdToolRegister(args []string) {
 	fs := flag.NewFlagSet("tool register", flag.ExitOnError)
 	name := fs.String("name", "", "tool name")
@@ -642,7 +747,8 @@ func cmdGrantList(args []string) {
 
 func cmdGatewayCall(args []string) {
 	fs := flag.NewFlagSet("gateway call", flag.ExitOnError)
-	ref := fs.String("ref", "", "agent ref making the call, sent as X-Agent-Ref")
+	ref := fs.String("ref", "", "agent ref making the call, informational only, credentialResolver does not read it, see -credential")
+	credential := fs.String("credential", "", "bearer credential as id.secret, from credential issue's response; sent as Authorization: Bearer <credential>")
 	tool := fs.String("tool", "", "tool to call")
 	arguments := fs.String("arguments", "", "JSON object of arguments to pass, e.g. {\"table\":\"customers\",\"columns\":[\"ssn\"]}")
 	_ = fs.Parse(args)
@@ -652,7 +758,7 @@ func cmdGatewayCall(args []string) {
 		os.Exit(1)
 	}
 
-	resp, err := callGateway(*ref, *tool, *arguments)
+	resp, err := callGateway(*ref, *credential, *tool, *arguments)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
 		os.Exit(1)
@@ -663,13 +769,22 @@ func cmdGatewayCall(args []string) {
 
 // callGateway is the shared primitive both cmdGatewayCall and
 // cmd/niactl's simulate command use: a real HTTP call to the gateway's
-// tool-call endpoint, X-Agent-Ref set from ref, arguments (raw JSON
-// object text, may be empty) wrapped in the {"arguments": ...} body
-// shape cmd/gateway's toolCallRequest decodes. Returns the response
-// unconsumed so callers can inspect status and body their own way
-// rather than always printing it, simulate needs to interpret the
-// result, not just show it.
-func callGateway(ref, tool, arguments string) (*http.Response, error) {
+// tool-call endpoint, arguments (raw JSON object text, may be empty)
+// wrapped in the {"arguments": ...} body shape cmd/gateway's
+// toolCallRequest decodes. Returns the response unconsumed so callers
+// can inspect status and body their own way rather than always
+// printing it, simulate needs to interpret the result, not just show
+// it.
+//
+// credential is presented as "Authorization: Bearer <credential>",
+// cmd/gateway's default resolver, credentialResolver, is what actually
+// authenticates the call, see cmd/gateway/authn.go. X-Agent-Ref is
+// still sent alongside it, for a human reading a request log or
+// running against a gateway started with
+// NIA_GATEWAY_INSECURE_HEADER_AUTH=1 (headerResolver, local dev only),
+// but credentialResolver itself never reads that header, an empty
+// credential against the default gateway gets a 401, not a fallback.
+func callGateway(ref, credential, tool, arguments string) (*http.Response, error) {
 	body := []byte(`{}`)
 	if arguments != "" {
 		var probe map[string]any
@@ -689,6 +804,9 @@ func callGateway(ref, tool, arguments string) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-Ref", ref)
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
 	return http.DefaultClient.Do(req)
 }
 

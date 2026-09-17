@@ -128,10 +128,20 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
+	// credentials.FromEnv: unset NIA_CREDENTIALS_DATABASE_URL means an
+	// in-memory store private to this process, same posture as audit and
+	// policy above. Set it (to the same value cmd/gateway is started
+	// with) and both processes verify against one real credential store
+	// instead of cmd/gateway never being able to see a credential this
+	// process issued at all, see internal/credentials/from_env.go.
+	creds, err := credentials.FromEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
 	s := &server{
 		agents:    registry.NewInMemoryAgentRegistry(),
 		toolCat:   tools.NewInMemoryCatalog(),
-		creds:     credentials.NewInMemoryStore(),
+		creds:     creds,
 		pol:       pol,
 		auditLog:  auditLog,
 		graph:     graph.NewInMemoryGraph(),
@@ -219,13 +229,39 @@ func (s *server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 // this is the one piece, the identity record itself, that had no direct
 // lookup until niactl agent inspect needed to show it without pulling
 // the entire agent list and filtering client side.
+// agentReport is what GET /agents/{ref} returns. State is the local
+// registry's own cached field, set by handleRegisterAgent, handleKill,
+// and handleRestore; it can lag reality when something killed the agent
+// through a different process, see docs/ARCHITECTURE.md's "State
+// convergence" section for the exact gap this closes: cmd/gateway's
+// automatic, risk-triggered kills go through internal/policy directly
+// and never touched this registry before this pass. EffectiveState is
+// what actually matters operationally: it's State unless a live query
+// against s.pol (the same policy client cmd/gateway checks on every
+// request, the one genuinely shared source of truth across processes
+// when both point at a real Tessera instance rather than each running
+// its own in-memory default, see cmd/gateway's own package doc comment)
+// says the kill sentinel is set, in which case EffectiveState is forced
+// to killed regardless of what the cache says. KillSentinelChecked is
+// false when that live query itself failed, so a caller can tell "we
+// confirmed this against the real enforcement state" apart from "we're
+// only showing you the cache because we couldn't reach the policy
+// client," rather than silently falling back to a possibly-stale
+// answer and calling it the same thing.
+type agentReport struct {
+	identity.AgentRef
+	EffectiveState      identity.LifecycleState `json:"effective_state"`
+	KillSentinelChecked bool                    `json:"kill_sentinel_checked"`
+}
+
 func (s *server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	ref := r.PathValue("ref")
 	if ref == "" {
 		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
 		return
 	}
-	agent, err := s.agents.Get(r.Context(), ref)
+	ctx := r.Context()
+	agent, err := s.agents.Get(ctx, ref)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
@@ -234,7 +270,18 @@ func (s *server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	niahttp.WriteJSON(w, http.StatusOK, agent)
+
+	report := agentReport{AgentRef: agent, EffectiveState: agent.State}
+	killed, err := s.pol.IsKilled(ctx, ref)
+	if err != nil {
+		log.Printf("nia-api: live kill-sentinel check failed for %s: %v", ref, err)
+	} else {
+		report.KillSentinelChecked = true
+		if killed {
+			report.EffectiveState = identity.StateKilled
+		}
+	}
+	niahttp.WriteJSON(w, http.StatusOK, report)
 }
 
 type killRequest struct {
@@ -263,18 +310,106 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	// auto-population helpers, see docs/SECURITY_INVARIANTS.md. Silently
 	// discarding this error used to mean the registry could report an
 	// agent as active that Tessera/OpenFGA had actually killed, with
-	// nothing to show for it, not even a log line.
+	// nothing to show for it, not even a log line. This is a local cache
+	// update, not the source of truth, see handleGetAgent, which reads
+	// the live kill sentinel from s.pol on every call rather than
+	// trusting this field alone, that's what actually closes the state
+	// convergence gap docs/ARCHITECTURE.md describes, this SetState call
+	// just keeps the cache from being needlessly stale in the meantime.
 	if err := s.agents.SetState(ctx, req.AgentRef, identity.StateKilled); err != nil {
 		log.Printf("nia-api: registry state update to killed failed for %s: %v", req.AgentRef, err)
 	}
+	// Convergence means credential state = REVOKED too, not just the
+	// policy sentinel, see docs/ARCHITECTURE.md's "State convergence"
+	// section: a killed agent's old credentials used to sit around
+	// reporting Active forever even though every authorization check
+	// already denied them. Same fail-open posture as everything else in
+	// this handler, a revoke failure here doesn't undo or block the
+	// kill that already happened.
+	revoked := s.revokeAllCredentials(ctx, req.AgentRef, req.Operator, "agent killed: "+req.Incident)
 	s.audit(ctx, audit.Event{
 		Action:   "agent.killed",
 		AgentRef: req.AgentRef,
 		Operator: req.Operator,
 		Incident: req.Incident,
+		Detail:   fmt.Sprintf("revoked %d credential(s)", revoked),
 		At:       time.Now(),
 	})
 	niahttp.WriteJSON(w, http.StatusOK, result)
+}
+
+// revokeAllCredentials retires every currently-active credential for
+// agentRef. Used by both handleKill (a manual, operator-initiated kill)
+// and, via the equivalent helper in internal/monitoring, an automatic
+// risk-triggered kill, so both paths converge on the same "kill also
+// means credentials are gone" guarantee rather than one of them being a
+// partial containment action. Best-effort: a single credential's
+// revoke failing is logged and the loop continues, one bad row
+// shouldn't stop the rest from being retired.
+func (s *server) revokeAllCredentials(ctx context.Context, agentRef, revokedBy, reason string) int {
+	creds, err := s.creds.ListForAgent(ctx, agentRef)
+	if err != nil {
+		log.Printf("nia-api: listing credentials for %s during kill failed: %v", agentRef, err)
+		return 0
+	}
+	revoked := 0
+	for _, c := range creds {
+		if c.Effective(time.Now()) != credentials.StatusActive {
+			continue
+		}
+		if err := s.creds.Revoke(ctx, c.ID, revokedBy, reason); err != nil {
+			log.Printf("nia-api: revoking credential %s for %s during kill failed: %v", c.ID, agentRef, err)
+			continue
+		}
+		revoked++
+	}
+	return revoked
+}
+
+type restoreRequest struct {
+	AgentRef string `json:"agent_ref"`
+	Operator string `json:"operator"`
+}
+
+// handleRestore is new: the package doc comment and niactl's own usage
+// text both claimed "kill/restore" existed, but no restore endpoint was
+// ever wired up, see the audit findings for this pass. internal/policy's
+// Restore only clears the kill sentinel, it deliberately does not
+// resurrect grants on its own (see Client.Restore's doc comment), so
+// this handler doesn't either: an operator who restores an agent must
+// separately call handleWriteGrants with the intended grants. It also
+// does not un-revoke credentials, revocation is one-way by design (see
+// credentials.Store.Revoke), a restored agent needs a freshly issued
+// credential, not its old one back.
+func (s *server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	var req restoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.AgentRef == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent_ref is required")
+		return
+	}
+	ctx := r.Context()
+	if err := s.pol.Restore(ctx, req.AgentRef); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.agents.SetState(ctx, req.AgentRef, identity.StateActive); err != nil {
+		log.Printf("nia-api: registry state update to active failed for %s: %v", req.AgentRef, err)
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "agent.restored",
+		AgentRef: req.AgentRef,
+		Operator: req.Operator,
+		At:       time.Now(),
+	})
+	niahttp.WriteJSON(w, http.StatusOK, map[string]string{
+		"agent_ref": req.AgentRef,
+		"status":    "restored",
+		"note":      "kill sentinel cleared; grants and credentials were not restored, write grants and issue a fresh credential separately",
+	})
 }
 
 type issueCredentialRequest struct {
@@ -317,7 +452,7 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 		ttl = time.Duration(req.TTLSeconds) * time.Second
 	}
 
-	cred, err := s.creds.Issue(ctx, ref, kind, ttl)
+	cred, secret, err := s.creds.Issue(ctx, ref, kind, ttl)
 	if err != nil {
 		s.metrics.credentialsIssued.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -333,7 +468,20 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 		Detail:   string(kind) + " " + cred.ID,
 		At:       time.Now(),
 	})
-	niahttp.WriteJSON(w, http.StatusCreated, cred)
+	niahttp.WriteJSON(w, http.StatusCreated, issuedCredential{Credential: cred, Secret: secret})
+}
+
+// issuedCredential is what handleIssueCredential and handleRotateCredential
+// return: the credential record plus the one-time plaintext secret the
+// agent needs to present at the gateway as "Bearer <id>.<secret>", see
+// cmd/gateway/authn.go. This is the only response anywhere in this API
+// that ever carries a plaintext secret; GET /agents/{ref}/credentials
+// and every other read path return bare Credential values, whose
+// SecretHash field is a digest, not the secret, safe to return over an
+// otherwise-authenticated read.
+type issuedCredential struct {
+	credentials.Credential
+	Secret string `json:"secret"`
 }
 
 func (s *server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
@@ -401,6 +549,156 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
+type disableCredentialRequest struct {
+	DisabledBy string `json:"disabled_by"`
+	Reason     string `json:"reason"`
+}
+
+// handleDisableCredential is the reversible counterpart to
+// handleRevokeCredential, see credentials.Store.Disable's own doc
+// comment for why the two are kept distinct: an administrative pause,
+// not a security decision, and one that Enable can undo.
+func (s *server) handleDisableCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "credential id is required")
+		return
+	}
+	var req disableCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ctx := r.Context()
+	cred, err := s.creds.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, credentials.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "credential not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.creds.Disable(ctx, id, req.DisabledBy, req.Reason); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "credential.disabled",
+		AgentRef: cred.AgentRef,
+		Operator: req.DisabledBy,
+		Detail:   req.Reason,
+		At:       time.Now(),
+	})
+	updated, err := s.creds.Get(ctx, id)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
+type enableCredentialRequest struct {
+	EnabledBy string `json:"enabled_by"`
+}
+
+func (s *server) handleEnableCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "credential id is required")
+		return
+	}
+	var req enableCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ctx := r.Context()
+	cred, err := s.creds.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, credentials.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "credential not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.creds.Enable(ctx, id, req.EnabledBy); err != nil {
+		if errors.Is(err, credentials.ErrInvalidCredential) {
+			niahttp.WriteError(w, http.StatusConflict, "credential is revoked, revocation is one-way, issue a new credential instead")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "credential.enabled",
+		AgentRef: cred.AgentRef,
+		Operator: req.EnabledBy,
+		At:       time.Now(),
+	})
+	updated, err := s.creds.Get(ctx, id)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, updated)
+}
+
+type rotateCredentialRequest struct {
+	RotatedBy  string `json:"rotated_by"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+}
+
+// handleRotateCredential is the fix for "credential rotation must not
+// accidentally leave the old credential valid": issuing a replacement
+// and revoking the old one used to be two separate API calls an
+// operator had to remember to both make, with a window between them
+// where a leaked old credential and a fresh new one were both live at
+// once. This is one call, backed by credentials.Store.Rotate's atomic
+// revoke-then-issue, see that method's own doc comment.
+func (s *server) handleRotateCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "credential id is required")
+		return
+	}
+	var req rotateCredentialRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ctx := r.Context()
+	old, err := s.creds.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, credentials.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "credential not found")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var ttl time.Duration
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+	next, secret, err := s.creds.Rotate(ctx, id, req.RotatedBy, ttl)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.graphAddNode(ctx, next.ID, graph.NodeCredential)
+	s.graphAddEdge(ctx, next.ID, next.AgentRef, graph.EdgeBoundTo)
+	s.audit(ctx, audit.Event{
+		Action:   "credential.rotated",
+		AgentRef: old.AgentRef,
+		Operator: req.RotatedBy,
+		Detail:   fmt.Sprintf("%s superseded by %s", id, next.ID),
+		At:       time.Now(),
+	})
+	niahttp.WriteJSON(w, http.StatusCreated, issuedCredential{Credential: next, Secret: secret})
 }
 
 type registerToolRequest struct {
@@ -1073,12 +1371,16 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /agents", s.handleListAgents)
 	mux.HandleFunc("GET /agents/{ref}", s.handleGetAgent)
 	mux.HandleFunc("POST /policy/kill", s.handleKill)
+	mux.HandleFunc("POST /policy/restore", s.handleRestore)
 	mux.HandleFunc("POST /agents/{ref}/grants", s.handleWriteGrants)
 	mux.HandleFunc("DELETE /agents/{ref}/grants", s.handleDeleteGrants)
 	mux.HandleFunc("GET /agents/{ref}/grants", s.handleListGrants)
 	mux.HandleFunc("POST /agents/{ref}/credentials", s.handleIssueCredential)
 	mux.HandleFunc("GET /agents/{ref}/credentials", s.handleListCredentials)
 	mux.HandleFunc("POST /credentials/{id}/revoke", s.handleRevokeCredential)
+	mux.HandleFunc("POST /credentials/{id}/disable", s.handleDisableCredential)
+	mux.HandleFunc("POST /credentials/{id}/enable", s.handleEnableCredential)
+	mux.HandleFunc("POST /credentials/{id}/rotate", s.handleRotateCredential)
 	mux.HandleFunc("POST /tools", s.handleRegisterTool)
 	mux.HandleFunc("GET /tools", s.handleListTools)
 	mux.HandleFunc("GET /tools/{name}", s.handleGetTool)

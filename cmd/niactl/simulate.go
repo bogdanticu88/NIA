@@ -138,11 +138,12 @@ func runScenario(sc scenario, out io.Writer) {
 		registerScenarioTool(out, t)
 	}
 	writeScenarioGrants(out, sc)
+	credential := issueScenarioCredential(out, sc)
 
 	fmt.Fprintln(out, "\n[attack sequence]")
 	contained := false
 	for i, step := range sc.steps {
-		res := runStep(sc.agentRef, step)
+		res := runStep(sc.agentRef, credential, step)
 		if printStepResult(out, i+1, sc.agentRef, step, res) {
 			contained = true
 		}
@@ -233,19 +234,58 @@ func writeScenarioGrants(out io.Writer, sc scenario) {
 	fmt.Fprintf(out, "  granted %d starting permission(s) to %s\n", len(sc.initialGrants), sc.agentRef)
 }
 
+// issueScenarioCredential mints a real bearer credential for the
+// scenario agent, the same POST /agents/{ref}/credentials handleIssueCredential
+// serves for credential issue, and returns it as "id.secret", the exact
+// shape callGateway presents as "Authorization: Bearer <id.secret>".
+// Before credentialResolver became the gateway's default, this scenario
+// authenticated with nothing but an X-Agent-Ref header, which is the
+// specific gap the security hardening pass closed, see
+// docs/ARCHITECTURE.md's "Credential-backed authentication and state
+// convergence"; the simulation has to authenticate the same way a real
+// caller now must, or it would stop proving anything about the actual
+// runtime path the moment credentialResolver shipped.
+func issueScenarioCredential(out io.Writer, sc scenario) string {
+	body, _ := json.Marshal(map[string]any{
+		"kind":     "api_key",
+		"operator": "niactl-simulate",
+	})
+	resp, err := apiCall(http.MethodPost, "/agents/"+url.PathEscape(sc.agentRef)+"/credentials", body)
+	if err != nil {
+		fmt.Fprintf(out, "  could not reach the control-plane API at %s: %v\n", apiAddr(), err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated {
+		fmt.Fprintf(out, "  unexpected status %d issuing a credential for %s: %s\n", resp.StatusCode, sc.agentRef, raw)
+		os.Exit(1)
+	}
+	var issued struct {
+		ID     string
+		Secret string
+	}
+	if err := json.Unmarshal(raw, &issued); err != nil || issued.ID == "" || issued.Secret == "" {
+		fmt.Fprintf(out, "  could not parse the credential issued for %s: %s\n", sc.agentRef, raw)
+		os.Exit(1)
+	}
+	fmt.Fprintf(out, "  issued %s a credential (%s), presenting it on every step below\n", sc.agentRef, issued.ID)
+	return issued.ID + "." + issued.Secret
+}
+
 type stepResult struct {
 	status int
 	body   map[string]any
 	err    error
 }
 
-func runStep(agentRef string, step attackStep) stepResult {
+func runStep(agentRef, credential string, step attackStep) stepResult {
 	argsJSON := ""
 	if len(step.arguments) > 0 {
 		b, _ := json.Marshal(step.arguments)
 		argsJSON = string(b)
 	}
-	resp, err := callGateway(agentRef, step.tool, argsJSON)
+	resp, err := callGateway(agentRef, credential, step.tool, argsJSON)
 	if err != nil {
 		return stepResult{err: err}
 	}

@@ -163,6 +163,26 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incidentRef str
 		// risk history shouldn't carry a pre-kill total forward
 		// forever, see this type's own doc comment.
 		m.resetCumulative(score.AgentRef)
+		// Convergence: a kill means credential state = REVOKED too, not
+		// just the policy sentinel, see docs/ARCHITECTURE.md's "State
+		// convergence" section. Before this pass, ActionKill only ever
+		// touched internal/policy, an agent's credentials kept reporting
+		// Active forever even though every authorization check already
+		// denied them, the exact gap the phase 8 demo surfaced. The
+		// kill itself already succeeded above and is what actually
+		// matters; a revoke failure here is folded into the audit
+		// detail rather than turned into a failed Observe call, same
+		// fail-open posture as everything else that runs after the
+		// containment action itself.
+		revoked, configured, revokeErr := m.revokeCredentials(ctx, score.AgentRef, incidentRef)
+		switch {
+		case revokeErr != nil:
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but revoking credentials failed: %v", total, revokeErr)
+		case !configured:
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but this process has no credentials.Store configured, credentials were not revoked", total)
+		default:
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, revoked %d active credential(s)", total, revoked)
+		}
 	case ActionRevoke:
 		revoked, configured, err := m.revokeCredentials(ctx, score.AgentRef, incidentRef)
 		if err != nil {

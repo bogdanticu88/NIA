@@ -78,6 +78,7 @@ import (
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
+	"github.com/bogdanticu88/nia/internal/credentials"
 	"github.com/bogdanticu88/nia/internal/identity"
 	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/metrics"
@@ -89,18 +90,23 @@ import (
 	niahttp "github.com/bogdanticu88/nia/internal/transport/http"
 )
 
-// headerResolver is the reference identity.Resolver: it trusts a single
-// header carrying the agent ref outright. Not production-grade, real
-// deployments resolve identity from a verified JWT claim, an mTLS
-// certificate thumbprint, or an API key lookup, the same normalization
-// problem Tessera's own IIdentityResolver solves. Swapping this out is
-// the first thing a real deployment should do.
+// headerResolver trusts a single header carrying the agent ref outright,
+// no credential, no proof of possession. This used to be the gateway's
+// only Resolver and its default. As of the security hardening pass it
+// is neither: credentialResolver (authn.go) is the default, this stays
+// only for explicit, opt-in, clearly-labeled insecure local use, see
+// NIA_GATEWAY_INSECURE_HEADER_AUTH in main() below. Anyone who can set
+// an HTTP header becomes whatever agent they name, this is exactly the
+// weakness docs/THREAT_MODEL.md's original threats 1 and 2 both reduced
+// to, kept here for local dev convenience and for tests that don't want
+// to mint a credential, never for anything reachable by an untrusted
+// caller.
 type headerResolver struct {
 	headerName string
 }
 
-func (h headerResolver) Resolve(ctx identity.ResolveContext) (*identity.ResolvedIdentity, error) {
-	ref, ok := ctx.Headers[h.headerName]
+func (h headerResolver) Resolve(_ context.Context, rc identity.ResolveContext) (*identity.ResolvedIdentity, error) {
+	ref, ok := rc.Headers[h.headerName]
 	if !ok || ref == "" {
 		return nil, nil
 	}
@@ -168,7 +174,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		headers[k] = r.Header.Get(k)
 	}
 
-	resolved, err := g.resolver.Resolve(identity.ResolveContext{Headers: headers})
+	resolved, err := g.resolver.Resolve(r.Context(), identity.ResolveContext{Headers: headers})
 	if err != nil {
 		g.metrics.requests.Inc("resolve_error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -193,7 +199,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		if _, err := g.toolCat.Get(ctx, tool); err != nil {
 			if errors.Is(err, tools.ErrNotFound) {
 				g.metrics.requests.Inc("unknown_tool")
-				g.audit(ctx, "gateway.unknown_tool", resolved.Ref, fmt.Sprintf("tool=%s", tool))
+				g.audit(ctx, "gateway.unknown_tool", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
 				niahttp.WriteError(w, http.StatusNotFound, "tool is not registered")
 				return
 			}
@@ -221,7 +227,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 	if !allowed {
 		g.metrics.requests.Inc("denied_tool")
-		g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s", tool))
+		g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
 		niahttp.WriteError(w, http.StatusForbidden, "agent is not authorized for this tool")
 		return
 	}
@@ -256,7 +262,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			}
 			if !dataAllowed {
 				g.metrics.requests.Inc("denied_resource")
-				g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s resource=%s level=%s", tool, resource, level))
+				g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s resource=%s level=%s credential=%s", tool, resource, level, resolved.CredentialID))
 				niahttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("agent is not authorized for resource %q", resource))
 				return
 			}
@@ -264,7 +270,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	g.metrics.requests.Inc("allowed")
-	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s", tool))
+	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
 
 	resp := map[string]any{
 		"agent":  resolved.Ref,
@@ -532,19 +538,32 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 
+	// credentials.FromEnv: unset NIA_CREDENTIALS_DATABASE_URL means an
+	// in-memory store private to this process, same posture as audit
+	// and policy above. This is what authn.go's credentialResolver
+	// verifies bearer credentials against, and what a crossed revoke or
+	// kill threshold below now actually revokes, see this variable's
+	// use a few lines down: before this pass cmd/gateway had no
+	// credentials.Store at all, so ActionRevoke was always an audited
+	// no-op, see docs/ARCHITECTURE.md's "State convergence" section for
+	// why that mattered. Set it to the same value cmd/api is started
+	// with and both processes verify against, revoke against, and kill
+	// against the same real store.
+	creds, err := credentials.FromEnv(context.Background())
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
 	// monitoring.ThresholdsFromEnv: none of NIA_RISK_FLAG_AT,
 	// NIA_RISK_REVOKE_AT, or NIA_RISK_KILL_AT set means monitoring is
 	// skipped entirely, scorer, monitor, and incidents all stay nil, see
 	// this file's own package doc comment above for why a zero-value
-	// Threshold is never used as the "off" state. credentials.Store is
-	// not wired into this process, so a configured revoke threshold
-	// still works, ActionRevoke degrades to an audited no-op, see
-	// monitoring.Monitor's own doc comment on NewMonitor. incidents is
-	// always the in-memory reference implementation today, same
-	// process-local, not-shared-across-replicas limitation as
-	// everything else in this scaffold that keeps state in a map, see
-	// internal/incident's own doc comment for why there's no
-	// Postgres-backed option yet, unlike internal/audit.
+	// Threshold is never used as the "off" state. incidents is always
+	// the in-memory reference implementation today, same process-local,
+	// not-shared-across-replicas limitation as everything else in this
+	// scaffold that keeps state in a map, see internal/incident's own
+	// doc comment for why there's no Postgres-backed option yet, unlike
+	// internal/audit and, as of this pass, internal/credentials.
 	var scorer risk.Scorer
 	var monitor *monitoring.Monitor
 	var incidents incident.Store
@@ -555,12 +574,27 @@ func main() {
 	if monitoringConfigured {
 		scorer = risk.NewHistoryScorer(toolCat, sensitive, risk.DefaultWeights())
 		incidents = incident.NewInMemoryStore()
-		monitor = monitoring.NewMonitor(thresholds, pol, nil, incidents, auditLog)
+		monitor = monitoring.NewMonitor(thresholds, pol, creds, incidents, auditLog)
+	}
+
+	// The default resolver is now credentialResolver: Authorization:
+	// Bearer <id>.<secret>, checked against creds and, for the kill
+	// case, against pol, see authn.go's own doc comment. headerResolver
+	// (trust X-Agent-Ref outright, no proof of possession) is kept only
+	// for local dev/testing and requires an explicit, loudly-named opt
+	// in, NIA_GATEWAY_INSECURE_HEADER_AUTH=1, so it can never be what a
+	// real deployment is quietly still running because nobody changed a
+	// default. A deployment that sets this should not be reachable by
+	// anything it doesn't fully trust.
+	var resolver identity.Resolver = credentialResolver{creds: creds, pol: pol}
+	if os.Getenv("NIA_GATEWAY_INSECURE_HEADER_AUTH") == "1" {
+		log.Printf("nia-gateway: NIA_GATEWAY_INSECURE_HEADER_AUTH=1, trusting X-Agent-Ref with no credential check, this must never be set on anything reachable by an untrusted caller")
+		resolver = headerResolver{headerName: "X-Agent-Ref"}
 	}
 
 	metricsReg := metrics.NewRegistry()
 	g := &gateway{
-		resolver:       headerResolver{headerName: "X-Agent-Ref"},
+		resolver:       resolver,
 		pol:            pol,
 		toolCat:        toolCat,
 		resourcePolicy: resourcePolicy,
