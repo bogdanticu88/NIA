@@ -21,6 +21,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/credentials"
 	"github.com/bogdanticu88/nia/internal/graph"
 	"github.com/bogdanticu88/nia/internal/identity"
+	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -34,13 +35,68 @@ import (
 // one) satisfies it. Swapping the policy client for a real Tessera HTTP
 // adapter, once it exists, touches only this constructor.
 type server struct {
-	agents    registry.AgentRegistry
-	toolCat   tools.Catalog
-	creds     credentials.Store
-	pol       policy.Client
-	auditLog  audit.Store
-	graph     graph.Graph
-	sensitive sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
+	agents     registry.AgentRegistry
+	toolCat    tools.Catalog
+	creds      credentials.Store
+	pol        policy.Client
+	auditLog   audit.Store
+	graph      graph.Graph
+	sensitive  sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
+	metrics    *serverMetrics
+	metricsReg *metrics.Registry // handleFunc target for GET /metrics, metrics is the typed counters callers actually use
+}
+
+// serverMetrics is every counter and gauge cmd/api exposes over GET
+// /metrics, named to match what each handler already logs to
+// internal/audit, so a metric and an audit action describe the same
+// event two different ways rather than inventing a second vocabulary.
+// Registration and tool-registration get a "duplicate" result bucket of
+// their own rather than folding it into "error", it's the specific,
+// common, non-error case invariant 7 (see docs/SECURITY_INVARIANTS.md)
+// exists to keep distinct from an actual backend failure; everything
+// else uses a plain success/error split. audit_write_failures and
+// graph_write_failures exist specifically to make the fail-open
+// postures docs/SECURITY_INVARIANTS.md invariants 8 and 9 describe
+// observable, previously nothing surfaced them beyond a log line.
+type serverMetrics struct {
+	registrations      *metrics.Counter // result: created|duplicate|error
+	toolRegistrations  *metrics.Counter // result: created|duplicate|error
+	credentialsIssued  *metrics.Counter // result: success|error
+	credentialsRevoked *metrics.Counter // result: success|error
+	grantsWritten      *metrics.Counter // result: success|killed|error
+	grantsDeleted      *metrics.Counter // result: success|error
+	kills              *metrics.Counter // result: success|error
+	auditWriteFailures *metrics.Counter // no labels
+	graphWriteFailures *metrics.Counter // op: add_node|add_edge
+}
+
+func newServerMetrics(reg *metrics.Registry, s *server) *serverMetrics {
+	m := &serverMetrics{
+		registrations:      reg.NewCounter("nia_agent_registrations_total", "agent registration attempts by result", "result"),
+		toolRegistrations:  reg.NewCounter("nia_tool_registrations_total", "tool registration attempts by result", "result"),
+		credentialsIssued:  reg.NewCounter("nia_credentials_issued_total", "credential issuance attempts by result", "result"),
+		credentialsRevoked: reg.NewCounter("nia_credentials_revoked_total", "credential revocation attempts by result", "result"),
+		grantsWritten:      reg.NewCounter("nia_grants_written_total", "grant write attempts by result", "result"),
+		grantsDeleted:      reg.NewCounter("nia_grants_deleted_total", "grant delete attempts by result", "result"),
+		kills:              reg.NewCounter("nia_kills_total", "kill switch invocations by result", "result"),
+		auditWriteFailures: reg.NewCounter("nia_audit_write_failures_total", "audit trail append failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 8"),
+		graphWriteFailures: reg.NewCounter("nia_graph_write_failures_total", "identity graph write failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 9", "op"),
+	}
+	reg.NewGaugeFunc("nia_agents_registered", "agents currently in the registry", func() float64 {
+		list, err := s.agents.List(context.Background())
+		if err != nil {
+			return 0
+		}
+		return float64(len(list))
+	})
+	reg.NewGaugeFunc("nia_tools_registered", "tools currently in the catalog", func() float64 {
+		list, err := s.toolCat.List(context.Background())
+		if err != nil {
+			return 0
+		}
+		return float64(len(list))
+	})
+	return m
 }
 
 // newServer wires every control-plane dependency. The policy client comes
@@ -72,7 +128,7 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
-	return &server{
+	s := &server{
 		agents:    registry.NewInMemoryAgentRegistry(),
 		toolCat:   tools.NewInMemoryCatalog(),
 		creds:     credentials.NewInMemoryStore(),
@@ -80,7 +136,11 @@ func newServer(ctx context.Context) (*server, error) {
 		auditLog:  auditLog,
 		graph:     graph.NewInMemoryGraph(),
 		sensitive: sensitive,
-	}, nil
+	}
+	reg := metrics.NewRegistry()
+	s.metrics = newServerMetrics(reg, s)
+	s.metricsReg = reg
+	return s, nil
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -125,12 +185,15 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		// caller deserves 500, not a false "you already registered
 		// this," for that. See docs/SECURITY_INVARIANTS.md.
 		if errors.Is(err, registry.ErrAlreadyRegistered) {
+			s.metrics.registrations.Inc("duplicate")
 			niahttp.WriteError(w, http.StatusConflict, err.Error())
 			return
 		}
+		s.metrics.registrations.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.registrations.Inc("created")
 	s.graphAddNode(ctx, agent.Ref, graph.NodeAgent)
 	s.audit(ctx, audit.Event{
 		Action:   "agent.registered",
@@ -150,6 +213,30 @@ func (s *server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, agents)
 }
 
+// handleGetAgent looks up one agent's identity record. Everything else
+// this control plane knows about an agent (grants, credentials, audit
+// history, graph reachability) is already its own sub-resource endpoint;
+// this is the one piece, the identity record itself, that had no direct
+// lookup until niactl agent inspect needed to show it without pulling
+// the entire agent list and filtering client side.
+func (s *server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	agent, err := s.agents.Get(r.Context(), ref)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, agent)
+}
+
 type killRequest struct {
 	AgentRef string `json:"agent_ref"`
 	Incident string `json:"incident"`
@@ -165,9 +252,11 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	result, err := s.pol.Kill(ctx, req.AgentRef, req.Incident, req.Operator)
 	if err != nil {
+		s.metrics.kills.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.kills.Inc("success")
 	// The kill itself already succeeded, that's what actually matters,
 	// so a failure here is logged rather than turned into a failed
 	// response, same fail-open posture as s.audit and the graph
@@ -230,9 +319,11 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 
 	cred, err := s.creds.Issue(ctx, ref, kind, ttl)
 	if err != nil {
+		s.metrics.credentialsIssued.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.credentialsIssued.Inc("success")
 	s.graphAddNode(ctx, cred.ID, graph.NodeCredential)
 	s.graphAddEdge(ctx, cred.ID, ref, graph.EdgeBoundTo)
 	s.audit(ctx, audit.Event{
@@ -291,9 +382,11 @@ func (s *server) handleRevokeCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.creds.Revoke(ctx, id, req.RevokedBy, req.Reason); err != nil {
+		s.metrics.credentialsRevoked.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.credentialsRevoked.Inc("success")
 	s.audit(ctx, audit.Event{
 		Action:   "credential.revoked",
 		AgentRef: cred.AgentRef,
@@ -358,12 +451,15 @@ func (s *server) handleRegisterTool(w http.ResponseWriter, r *http.Request) {
 		// see docs/SECURITY_INVARIANTS.md: only an actual duplicate is a
 		// 409, anything else is a 500.
 		if errors.Is(err, tools.ErrAlreadyRegistered) {
+			s.metrics.toolRegistrations.Inc("duplicate")
 			niahttp.WriteError(w, http.StatusConflict, err.Error())
 			return
 		}
+		s.metrics.toolRegistrations.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.toolRegistrations.Inc("created")
 	s.graphAddNode(ctx, tool.Name, graph.NodeTool)
 	niahttp.WriteJSON(w, http.StatusCreated, tool)
 }
@@ -487,12 +583,15 @@ func (s *server) handleWriteGrants(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.pol.WriteGrants(ctx, ref, grants); err != nil {
 		if errors.Is(err, policy.ErrKilled) {
+			s.metrics.grantsWritten.Inc("killed")
 			niahttp.WriteError(w, http.StatusConflict, "agent is killed, restore before writing grants")
 			return
 		}
+		s.metrics.grantsWritten.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.grantsWritten.Inc("success")
 	s.graphAddGrantEdges(ctx, ref, grants)
 	s.audit(ctx, audit.Event{
 		Action:   "grant.written",
@@ -541,9 +640,11 @@ func (s *server) handleDeleteGrants(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.pol.DeleteGrants(ctx, ref, grants); err != nil {
+		s.metrics.grantsDeleted.Inc("error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.metrics.grantsDeleted.Inc("success")
 	s.audit(ctx, audit.Event{
 		Action:   "grant.deleted",
 		AgentRef: ref,
@@ -859,6 +960,7 @@ func (s *server) handleBlastRadius(w http.ResponseWriter, r *http.Request) {
 // handler can do about it mid-request.
 func (s *server) audit(ctx context.Context, evt audit.Event) {
 	if err := s.auditLog.Append(ctx, evt); err != nil {
+		s.metrics.auditWriteFailures.Inc()
 		log.Printf("nia-api: audit append failed: %v", err)
 	}
 }
@@ -877,12 +979,14 @@ func (s *server) audit(ctx context.Context, evt audit.Event) {
 // fail today, this exists for whatever backs Graph next.
 func (s *server) graphAddNode(ctx context.Context, id string, kind graph.NodeKind) {
 	if err := s.graph.AddNode(ctx, graph.Node{ID: id, Kind: kind}); err != nil {
+		s.metrics.graphWriteFailures.Inc("add_node")
 		log.Printf("nia-api: graph add node failed: %v", err)
 	}
 }
 
 func (s *server) graphAddEdge(ctx context.Context, from, to string, kind graph.EdgeKind) {
 	if err := s.graph.AddEdge(ctx, graph.Edge{From: from, To: to, Kind: kind}); err != nil {
+		s.metrics.graphWriteFailures.Inc("add_edge")
 		log.Printf("nia-api: graph add edge failed: %v", err)
 	}
 }
@@ -967,6 +1071,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
 	mux.HandleFunc("GET /agents", s.handleListAgents)
+	mux.HandleFunc("GET /agents/{ref}", s.handleGetAgent)
 	mux.HandleFunc("POST /policy/kill", s.handleKill)
 	mux.HandleFunc("POST /agents/{ref}/grants", s.handleWriteGrants)
 	mux.HandleFunc("DELETE /agents/{ref}/grants", s.handleDeleteGrants)
@@ -984,6 +1089,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /graph/{id}/neighbors", s.handleGraphNeighbors)
 	mux.HandleFunc("GET /graph/{id}/reachable", s.handleGraphReachable)
 	mux.HandleFunc("GET /graph/{id}/blast-radius", s.handleBlastRadius)
+	mux.Handle("GET /metrics", s.metricsReg)
 	return mux
 }
 

@@ -96,6 +96,24 @@ func (m *Monitor) CumulativeRisk(agentRef string) float64 {
 	return m.cumulative[agentRef]
 }
 
+// Thresholds returns the flag/revoke/kill thresholds this Monitor was
+// built with, so a caller reporting CumulativeRisk (a "niactl risk"
+// command, say) can show what that number is being compared against
+// without the caller having to separately know or re-derive it.
+func (m *Monitor) Thresholds() Threshold {
+	return m.thresholds
+}
+
+// TrackedAgents returns how many agents currently have a nonzero risk
+// history since their last kill, a cheap gauge of "how many agents this
+// process has scored at all recently" for /metrics, not a list of who
+// they are, see CumulativeRisk for that.
+func (m *Monitor) TrackedAgents() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.cumulative)
+}
+
 // accumulate adds value to agentRef's running total and returns the new
 // total, atomically so concurrent calls for the same agent can't lose
 // an update racing each other.

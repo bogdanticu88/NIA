@@ -186,6 +186,37 @@ func TestObserve_RiskAccumulationIsPerAgent(t *testing.T) {
 	}
 }
 
+func TestThresholds_ReturnsWhatMonitorWasBuiltWith(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	want := Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}
+	m := NewMonitor(want, policy.NewInMemoryClient(), nil, nil, sink)
+	if got := m.Thresholds(); got != want {
+		t.Fatalf("Thresholds() = %+v, want %+v", got, want)
+	}
+}
+
+func TestTrackedAgents_CountsDistinctAgentsWithRiskHistory(t *testing.T) {
+	sink := audit.NewInMemorySink(10)
+	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
+	ctx := context.Background()
+
+	if got := m.TrackedAgents(); got != 0 {
+		t.Fatalf("TrackedAgents() on a fresh monitor = %d, want 0", got)
+	}
+	if _, err := m.Observe(ctx, newScore("agent:billing", 1), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if _, err := m.Observe(ctx, newScore("agent:reporting", 1), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if _, err := m.Observe(ctx, newScore("agent:billing", 1), ""); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if got := m.TrackedAgents(); got != 2 {
+		t.Fatalf("TrackedAgents() = %d, want 2 distinct agents, a repeat Observe for one already tracked must not double-count", got)
+	}
+}
+
 func TestObserve_KillResetsCumulativeRisk(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
 	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)

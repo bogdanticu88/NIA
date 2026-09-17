@@ -38,6 +38,8 @@ func usage() {
 Usage:
   niactl register -ref <agent_ref> [-owner <owner>] [-purpose <purpose>]
   niactl list
+  niactl agent inspect -ref <agent_ref> [-audit-limit <n>]
+  niactl risk -ref <agent_ref>
   niactl kill -ref <agent_ref> -incident <incident_id> [-operator <name>]
   niactl audit [-ref <agent_ref>] [-limit <n>]
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
@@ -63,6 +65,21 @@ audit with -ref shows everything recorded for that agent (registration,
 grants, kills, every gateway decision), oldest first, the query an
 incident review starts with. Without -ref it shows the n most recent
 events across every agent (default 100).
+
+agent inspect is the one command that composes several endpoints into a
+single report: identity, credentials, grants, the most recent audit
+events (most recent first, -audit-limit caps how many, default 10),
+blast radius, and a best-effort look at the gateway's own risk view for
+that agent, GET /risk/{ref}. The risk section is best-effort on purpose,
+the gateway is a separate process and monitoring on it is opt-in (see
+NIA_RISK_FLAG_AT and friends), an unreachable gateway or unconfigured
+monitoring there is routine, not a failure of this command.
+
+risk reads GET /risk/{ref} directly and prints the raw response: the
+agent's current cumulative risk, the flag/revoke/kill thresholds it's
+being compared against, and its most recent incidents on that gateway.
+configured:false in the response means that gateway has no monitoring
+set up at all, not that the agent has a clean history.
 
 credential issue only mints metadata, an id, kind, and expiry, NIA does not
 generate the credential material itself, see internal/credentials's package
@@ -137,8 +154,11 @@ never configured on that gateway (NIA_RISK_FLAG_AT and friends unset), not
 that the request failed.
 
 Every command talks to the control-plane API (NIA_API_URL, default http://localhost:8080)
-except gateway call, simulate attack, and incident list/get, which talk to
-the gateway instead (NIA_GATEWAY_URL, default http://localhost:8081).`)
+except gateway call, simulate attack, incident list/get, and risk, which
+talk to the gateway instead (NIA_GATEWAY_URL, default http://localhost:8081).
+agent inspect talks to both: identity, credentials, grants, audit, and
+blast radius come from the control-plane API, the risk section comes
+from the gateway.`)
 }
 
 func main() {
@@ -152,6 +172,10 @@ func main() {
 		cmdRegister(os.Args[2:])
 	case "list":
 		cmdList(os.Args[2:])
+	case "agent":
+		cmdAgent(os.Args[2:])
+	case "risk":
+		cmdRisk(os.Args[2:])
 	case "kill":
 		cmdKill(os.Args[2:])
 	case "audit":

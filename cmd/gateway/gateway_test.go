@@ -12,6 +12,7 @@ import (
 
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/incident"
+	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -74,10 +75,13 @@ func (f fakeToolReader) Get(_ context.Context, name string) (tools.Tool, error) 
 
 func newTestGateway(pol policy.Client) (*gateway, *audit.InMemorySink) {
 	sink := audit.NewInMemorySink(10)
+	reg := metrics.NewRegistry()
 	g := &gateway{
-		resolver: headerResolver{headerName: "X-Agent-Ref"},
-		pol:      pol,
-		auditLog: sink,
+		resolver:   headerResolver{headerName: "X-Agent-Ref"},
+		pol:        pol,
+		auditLog:   sink,
+		metrics:    newGatewayMetrics(reg),
+		metricsReg: reg,
 	}
 	return g, sink
 }
@@ -112,13 +116,16 @@ func newTestGatewayWithMonitoring(pol policy.Client, scorer risk.Scorer, thresho
 	sink := audit.NewInMemorySink(10)
 	incidents := incident.NewInMemoryStore()
 	monitor := monitoring.NewMonitor(thresholds, pol, nil, incidents, sink)
+	reg := metrics.NewRegistry()
 	g := &gateway{
-		resolver:  headerResolver{headerName: "X-Agent-Ref"},
-		pol:       pol,
-		scorer:    scorer,
-		monitor:   monitor,
-		incidents: incidents,
-		auditLog:  sink,
+		resolver:   headerResolver{headerName: "X-Agent-Ref"},
+		pol:        pol,
+		scorer:     scorer,
+		monitor:    monitor,
+		incidents:  incidents,
+		auditLog:   sink,
+		metrics:    newGatewayMetrics(reg),
+		metricsReg: reg,
 	}
 	return g, sink
 }

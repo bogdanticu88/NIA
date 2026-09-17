@@ -10,13 +10,14 @@ import (
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/credentials"
 	"github.com/bogdanticu88/nia/internal/graph"
+	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
 )
 
 func newTestServer() *server {
-	return &server{
+	s := &server{
 		agents:   registry.NewInMemoryAgentRegistry(),
 		toolCat:  tools.NewInMemoryCatalog(),
 		creds:    credentials.NewInMemoryStore(),
@@ -24,6 +25,10 @@ func newTestServer() *server {
 		auditLog: audit.NewInMemorySink(10_000),
 		graph:    graph.NewInMemoryGraph(),
 	}
+	reg := metrics.NewRegistry()
+	s.metrics = newServerMetrics(reg, s)
+	s.metricsReg = reg
+	return s
 }
 
 func decodeEvents(t *testing.T, rec *httptest.ResponseRecorder) []audit.Event {

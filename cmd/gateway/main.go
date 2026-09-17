@@ -80,6 +80,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/identity"
 	"github.com/bogdanticu88/nia/internal/incident"
+	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
@@ -116,6 +117,34 @@ type gateway struct {
 	monitor        *monitoring.Monitor    // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
 	incidents      incident.Store         // nil unless monitor is also configured, see main(); GET /incidents and GET /incidents/{id} read this directly
 	auditLog       audit.Sink
+	metrics        *gatewayMetrics
+	metricsReg     *metrics.Registry // handleFunc target for GET /metrics
+}
+
+// gatewayMetrics is every counter cmd/gateway exposes over GET /metrics.
+// requests is the hot-path counter, one Inc per handleToolCall outcome,
+// named to match the audit actions the same branches already write
+// (see the "gateway." prefixed actions throughout this file) so a
+// metric and an audit event describe the same decision two different
+// ways. monitoringActions counts only an actual containment response
+// (flag, revoke, kill), not every scored call, "how often did
+// monitoring do something" is the useful aggregate, "how often was a
+// call scored" is nia_gateway_requests_total{outcome="allowed"} already,
+// every allowed call gets scored when monitoring is configured.
+// auditWriteFailures mirrors cmd/api's counter of the same name, this
+// process keeps its own audit sink and its own failure count.
+type gatewayMetrics struct {
+	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved
+	monitoringActions  *metrics.Counter // action: flag|revoke|kill
+	auditWriteFailures *metrics.Counter // no labels
+}
+
+func newGatewayMetrics(reg *metrics.Registry) *gatewayMetrics {
+	return &gatewayMetrics{
+		requests:           reg.NewCounter("nia_gateway_requests_total", "tool-call requests by outcome", "outcome"),
+		monitoringActions:  reg.NewCounter("nia_monitoring_actions_total", "monitoring responses to a scored call by action", "action"),
+		auditWriteFailures: reg.NewCounter("nia_audit_write_failures_total", "audit trail append failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 8"),
+	}
 }
 
 // toolCallRequest is the request body handleToolCall decodes.
@@ -141,10 +170,12 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 
 	resolved, err := g.resolver.Resolve(identity.ResolveContext{Headers: headers})
 	if err != nil {
+		g.metrics.requests.Inc("resolve_error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if resolved == nil {
+		g.metrics.requests.Inc("unresolved")
 		niahttp.WriteError(w, http.StatusUnauthorized, "could not resolve caller identity")
 		return
 	}
@@ -161,6 +192,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	if g.toolCat != nil {
 		if _, err := g.toolCat.Get(ctx, tool); err != nil {
 			if errors.Is(err, tools.ErrNotFound) {
+				g.metrics.requests.Inc("unknown_tool")
 				g.audit(ctx, "gateway.unknown_tool", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 				niahttp.WriteError(w, http.StatusNotFound, "tool is not registered")
 				return
@@ -169,6 +201,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			// determine whether this tool is even real, so this is not
 			// a denial, it's "we couldn't ask," worth its own action
 			// for an incident review to tell apart from "we said no."
+			g.metrics.requests.Inc("tool_lookup_error")
 			g.audit(ctx, "gateway.tool_lookup_error", resolved.Ref, fmt.Sprintf("tool=%s err=%v", tool, err))
 			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -181,11 +214,13 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		// A failed check is not a denial, the policy engine couldn't be
 		// reached or errored, worth its own action so an incident
 		// review can tell "we said no" apart from "we couldn't ask."
+		g.metrics.requests.Inc("check_error")
 		g.audit(ctx, "gateway.check_error", resolved.Ref, fmt.Sprintf("tool=%s err=%v", tool, err))
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if !allowed {
+		g.metrics.requests.Inc("denied_tool")
 		g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 		niahttp.WriteError(w, http.StatusForbidden, "agent is not authorized for this tool")
 		return
@@ -214,11 +249,13 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			}
 			dataAllowed, err := g.pol.Check(ctx, resolved.Ref, policy.GrantForData(resource))
 			if err != nil {
+				g.metrics.requests.Inc("check_error")
 				g.audit(ctx, "gateway.check_error", resolved.Ref, fmt.Sprintf("tool=%s resource=%s err=%v", tool, resource, err))
 				niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			if !dataAllowed {
+				g.metrics.requests.Inc("denied_resource")
 				g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s resource=%s level=%s", tool, resource, level))
 				niahttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("agent is not authorized for resource %q", resource))
 				return
@@ -226,6 +263,7 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	g.metrics.requests.Inc("allowed")
 	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s", tool))
 
 	resp := map[string]any{
@@ -286,6 +324,9 @@ func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources 
 		g.audit(ctx, "gateway.monitoring_error", agentRef, fmt.Sprintf("tool=%s incident=%s err=%v", tool, incident, err))
 		log.Printf("nia-gateway: monitoring action failed for %s on %s: %v", agentRef, tool, err)
 	}
+	if action != monitoring.ActionNone {
+		g.metrics.monitoringActions.Inc(string(action))
+	}
 
 	signals := make([]riskSignal, 0, len(score.Signals))
 	for _, s := range score.Signals {
@@ -317,6 +358,7 @@ func (g *gateway) audit(ctx context.Context, action, agentRef, detail string) {
 		Detail:   detail,
 		At:       time.Now(),
 	}); err != nil {
+		g.metrics.auditWriteFailures.Inc()
 		log.Printf("nia-gateway: audit append failed: %v", err)
 	}
 }
@@ -370,6 +412,57 @@ func (g *gateway) handleGetIncident(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, in)
 }
 
+// riskReport is what GET /risk/{ref} returns: the same running total and
+// thresholds internal/monitoring.Monitor is itself comparing on every
+// call, plus a page of that agent's most recent incident records so a
+// caller (niactl risk, an operator paging through an investigation)
+// doesn't have to separately query GET /incidents?ref=... and cross
+// reference the cumulative number by hand. Configured is false when
+// this gateway has no Monitor at all (see monitoring.ThresholdsFromEnv),
+// the honest way to say "there is nothing to report" rather than
+// returning a zero Cumulative that looks identical to an agent that's
+// actually never done anything risky.
+type riskReport struct {
+	AgentRef   string               `json:"agent_ref"`
+	Configured bool                 `json:"configured"`
+	Cumulative float64              `json:"cumulative,omitempty"`
+	Thresholds monitoring.Threshold `json:"thresholds,omitempty"`
+	Incidents  []incident.Incident  `json:"incidents,omitempty"`
+}
+
+// riskReportIncidentLimit bounds how many recent incidents handleRisk
+// returns inline, the same reasoning cmd/api's handleRecentAudit bounds
+// its own default limit: a caller wants a recent picture, not a full
+// table scan through one HTTP response.
+const riskReportIncidentLimit = 20
+
+func (g *gateway) handleRisk(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	if g.monitor == nil {
+		niahttp.WriteJSON(w, http.StatusOK, riskReport{AgentRef: ref, Configured: false})
+		return
+	}
+	report := riskReport{
+		AgentRef:   ref,
+		Configured: true,
+		Cumulative: g.monitor.CumulativeRisk(ref),
+		Thresholds: g.monitor.Thresholds(),
+	}
+	if g.incidents != nil {
+		incidents, err := g.incidents.List(r.Context(), ref, riskReportIncidentLimit)
+		if err != nil {
+			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		report.Incidents = incidents
+	}
+	niahttp.WriteJSON(w, http.StatusOK, report)
+}
+
 func (g *gateway) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -378,6 +471,8 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc("POST /tools/{tool}/call", g.handleToolCall)
 	mux.HandleFunc("GET /incidents", g.handleListIncidents)
 	mux.HandleFunc("GET /incidents/{id}", g.handleGetIncident)
+	mux.HandleFunc("GET /risk/{ref}", g.handleRisk)
+	mux.Handle("GET /metrics", g.metricsReg)
 	return mux
 }
 
@@ -463,6 +558,7 @@ func main() {
 		monitor = monitoring.NewMonitor(thresholds, pol, nil, incidents, auditLog)
 	}
 
+	metricsReg := metrics.NewRegistry()
 	g := &gateway{
 		resolver:       headerResolver{headerName: "X-Agent-Ref"},
 		pol:            pol,
@@ -473,6 +569,8 @@ func main() {
 		monitor:        monitor,
 		incidents:      incidents,
 		auditLog:       auditLog,
+		metrics:        newGatewayMetrics(metricsReg),
+		metricsReg:     metricsReg,
 	}
 
 	srv := &http.Server{
