@@ -10,7 +10,18 @@
 //
 // MCP integration lives here: an MCP tool-call request is just another
 // inbound request that needs an identity resolved and a grant checked
-// before mcpHandler forwards it to the underlying tool.
+// before it's forwarded to the underlying tool. When
+// NIA_GATEWAY_DOWNSTREAM_URL is set, an authorized call actually
+// reaches a real downstream tool/MCP server, gets its response
+// inspected for anything security-relevant, and that response, not a
+// stand-in, is what the agent gets back, see forward.go. Unset, the
+// gateway still makes and audits the exact same decision, it just
+// stops there and returns its own response, the same behavior every
+// gateway before this pass had. Forwarding is strictly the last step:
+// identity, credential state, kill state, tool and resource
+// authorization, and risk scoring all run and can all still reject the
+// call first, there is no second, unguarded route to a downstream
+// tool, handleToolCall is the only place Forward is ever called from.
 //
 // When NIA_TOOLS_API_URL is set, resolve -> check grows a step in
 // front: look the tool up in cmd/api's catalog first, and reject
@@ -122,6 +133,7 @@ type gateway struct {
 	scorer         risk.Scorer            // nil means monitoring is not configured, kept nil together with monitor
 	monitor        *monitoring.Monitor    // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
 	incidents      incident.Store         // nil unless monitor is also configured, see main(); GET /incidents and GET /incidents/{id} read this directly
+	forwarder      Forwarder              // nil means downstream forwarding is not configured, see forward.go and forwarderFromEnv
 	auditLog       audit.Sink
 	metrics        *gatewayMetrics
 	metricsReg     *metrics.Registry // handleFunc target for GET /metrics
@@ -140,7 +152,7 @@ type gateway struct {
 // auditWriteFailures mirrors cmd/api's counter of the same name, this
 // process keeps its own audit sink and its own failure count.
 type gatewayMetrics struct {
-	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved
+	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved|downstream_ok|downstream_client_error|downstream_server_error|downstream_unreachable
 	monitoringActions  *metrics.Counter // action: flag|revoke|kill
 	auditWriteFailures *metrics.Counter // no labels
 }
@@ -283,10 +295,123 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// A real deployment forwards the request to the tool's actual
-	// transport (MCP, HTTP, gRPC) here. Left as the integration point
-	// rather than stubbed with a fake tool response.
-	niahttp.WriteJSON(w, http.StatusOK, resp)
+	// Everything above this point is the decision: identity, credential
+	// state, kill state (both inside g.resolver.Resolve, see authn.go),
+	// tool-level and resource-level authorization, risk scoring. Nothing
+	// below this line can turn a denial into an allow, forwarding only
+	// happens after every one of those gates has already said yes, and
+	// there is no second route into a downstream tool that skips them,
+	// handleToolCall is the only handler that ever calls Forward.
+	//
+	// g.forwarder == nil is the pre-forwarding default: the gateway
+	// proves the decision and stops there, the same stub response this
+	// handler always returned. Set NIA_GATEWAY_DOWNSTREAM_URL to make
+	// this an actual enforcement proxy instead of a decision service,
+	// see forward.go.
+	if g.forwarder == nil {
+		niahttp.WriteJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	result, err := g.forwarder.Forward(ctx, tool, body.Arguments)
+	if err != nil {
+		// The call was authorized, the downstream itself just isn't
+		// reachable, a different failure mode from anything decided
+		// above and worth its own outcome and its own audit action so
+		// an incident review can tell "we said yes and couldn't deliver
+		// it" apart from every "we said no" branch earlier in this
+		// function.
+		g.metrics.requests.Inc("downstream_unreachable")
+		g.audit(ctx, "gateway.downstream_unreachable", resolved.Ref, fmt.Sprintf("tool=%s credential=%s err=%v", tool, resolved.CredentialID, err))
+		niahttp.WriteError(w, http.StatusBadGateway, "downstream tool call failed")
+		return
+	}
+
+	g.inspectAndAuditDownstream(ctx, resolved.Ref, tool, resolved.CredentialID, result)
+
+	resp["downstream_status"] = result.StatusCode
+	resp["downstream_duration_ms"] = result.Duration.Milliseconds()
+	if len(result.Body) > 0 {
+		var decoded any
+		if err := json.Unmarshal(result.Body, &decoded); err == nil {
+			resp["result"] = decoded
+		} else {
+			// Not every real tool answers with JSON, this is a proxy,
+			// not a validator, an opaque body still reaches the agent
+			// rather than being dropped because it didn't parse.
+			resp["result"] = string(result.Body)
+		}
+	}
+
+	// Mirror the downstream's own status when it answered with
+	// something other than success: an agent calling through the
+	// gateway should see the same failure it would see calling the tool
+	// directly, the gateway's job was authorization, not hiding that
+	// the tool itself said no or broke.
+	status := http.StatusOK
+	if result.StatusCode != 0 {
+		status = result.StatusCode
+	}
+	niahttp.WriteJSON(w, status, resp)
+}
+
+// inspectAndAuditDownstream looks at what a downstream tool actually
+// returned for anything worth a security review noticing on its own,
+// separate from whether the call was authorized to happen at all. This
+// is deliberately a small, named set of checks, not a content scanner:
+// a downstream response body is arbitrary tool output, NIA has no
+// general way to know what in it matters, what it can do honestly is
+// flag the shapes that are always worth a second look regardless of
+// which tool produced them.
+func (g *gateway) inspectAndAuditDownstream(ctx context.Context, agentRef, tool, credentialID string, result ForwardResult) {
+	detail := fmt.Sprintf("tool=%s credential=%s status=%d duration_ms=%d bytes=%d", tool, credentialID, result.StatusCode, result.Duration.Milliseconds(), len(result.Body))
+
+	switch {
+	case result.StatusCode >= 500:
+		g.metrics.requests.Inc("downstream_server_error")
+		g.audit(ctx, "gateway.downstream_error", agentRef, detail)
+	case result.StatusCode >= 400:
+		g.metrics.requests.Inc("downstream_client_error")
+		g.audit(ctx, "gateway.downstream_rejected", agentRef, detail)
+	default:
+		g.metrics.requests.Inc("downstream_ok")
+		g.audit(ctx, "gateway.downstream_ok", agentRef, detail)
+	}
+
+	if len(result.Body) >= maxDownstreamResponseBytes {
+		// The response was cut off at the read cap, worth its own audit
+		// line: a caller reading "result" back later has no other way
+		// to know the body they're looking at is partial, and a
+		// downstream suddenly returning far more data than usual is a
+		// signal on its own, a possible sign of a bulk data pull
+		// through a tool that isn't normally used that way.
+		g.audit(ctx, "gateway.downstream_response_truncated", agentRef, detail)
+	}
+
+	if msg, ok := downstreamReportedError(result.Body); ok {
+		g.audit(ctx, "gateway.downstream_reported_error", agentRef, detail+fmt.Sprintf(" error=%q", msg))
+	}
+}
+
+// downstreamReportedError looks for a top-level "error" string field in
+// a JSON response body, the same shape internal/transport/http.WriteError
+// already produces, so a downstream tool built on this codebase's own
+// conventions (or anything else that answers errors the same way)
+// surfaces its own failures into the audit trail even when its HTTP
+// status code was a plain 200. Anything else, a non-JSON body, no such
+// field, an empty one, is not treated as an error, this is a narrow,
+// specific check, not general content inspection.
+func downstreamReportedError(body []byte) (string, bool) {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", false
+	}
+	if parsed.Error == "" {
+		return "", false
+	}
+	return parsed.Error, true
 }
 
 // riskInfo is the risk block handleToolCall attaches to an allowed
@@ -592,6 +717,18 @@ func main() {
 		resolver = headerResolver{headerName: "X-Agent-Ref"}
 	}
 
+	// forwarderFromEnv: NIA_GATEWAY_DOWNSTREAM_URL unset means a nil
+	// Forwarder, handleToolCall stops at the authorization decision and
+	// returns its own response, same as every gateway before this pass.
+	// Set it to a real downstream tool/MCP server's address and an
+	// authorized call actually reaches it, see forward.go.
+	forwarder := forwarderFromEnv()
+	if forwarder != nil {
+		log.Printf("nia-gateway: %s is set, authorized calls are forwarded to a real downstream tool", envDownstreamURL)
+	} else {
+		log.Printf("nia-gateway: %s is not set, this process only decides allow/deny, it does not forward calls to a real tool", envDownstreamURL)
+	}
+
 	metricsReg := metrics.NewRegistry()
 	g := &gateway{
 		resolver:       resolver,
@@ -602,6 +739,7 @@ func main() {
 		scorer:         scorer,
 		monitor:        monitor,
 		incidents:      incidents,
+		forwarder:      forwarder,
 		auditLog:       auditLog,
 		metrics:        newGatewayMetrics(metricsReg),
 		metricsReg:     metricsReg,
