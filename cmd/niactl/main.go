@@ -144,10 +144,13 @@ edges transitively, the full node list, defaulting to every edge kind when
 counts by node kind, which reachable resources are classified sensitive or
 critical (see internal/sensitivity, NIA_SENSITIVITY_RULES_PATH), and a
 HIGH/MEDIUM/LOW severity call, see docs/ARCHITECTURE.md's identity graph
-section for exactly how severity is decided. Known gap: deleting a grant
-does not remove the grants edge it added, the graph can currently only
-grow, treat it as a superset of what's actually still granted, not a
-stale-safe mirror, check niactl grant list for the current truth.
+section for exactly how severity is decided. By design, not by omission:
+the graph is historical and append-only, deleting a grant does not remove
+the grants edge it added, there is no edge-removal operation and there
+isn't going to be one, see internal/graph's own package doc comment.
+Treat graph reachable/blast-radius as a superset of what's actually still
+granted, useful for "what has this identity ever touched," never as a
+live permission list, check niactl grant list for the current truth.
 
 gateway call drives the gateway's own hot path directly, POST /tools/{tool}/call
 with -credential presented as "Authorization: Bearer <id.secret>" (issue one

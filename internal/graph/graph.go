@@ -5,6 +5,36 @@
 // reach, directly or transitively," which is what incident response
 // and blast-radius analysis actually need, and which a live
 // point-in-time authorization check can't give you on its own.
+//
+// What this package is not, stated plainly because it's easy to
+// assume otherwise: it is not a live mirror of current authorization,
+// and it is not meant to become one. There is no edge-removal
+// operation on Graph, on purpose. When a grant is deleted through
+// internal/policy, the corresponding grants edge added when that
+// grant was written stays in the graph. This is a deliberate choice
+// (call it model 2 of the two the graph could have followed: either
+// "current relationships only, with edge removal," or "historical,
+// append-only, a superset of current authorization"), not an
+// oversight waiting to be closed. The graph exists to answer "what
+// has this identity ever been connected to, and what could that
+// chain reach," a question incident response and onboarding review
+// actually want answered even after some of those relationships have
+// since been revoked, an operator reviewing a compromised agent wants
+// to see everything it was ever granted, not just what remains today.
+// internal/policy (OpenFGA/Tessera, via policy.Client) is the only
+// source of truth for what's authorized right now, always. Reachable
+// and Neighbors describe discovered relationships, not current
+// permission, and no caller, in this codebase or outside it, should
+// treat a node showing up in a Reachable result as proof that node is
+// still granted access today, GET /agents/{ref}/grants (ListGrants)
+// or a direct Check is what answers that. See cmd/api/main.go's
+// graphAddGrantEdges and handleDeleteGrants for where this shows up
+// concretely, cmd/api/graph_test.go's
+// TestGraphEdgeSurvivesGrantDeletion_ButPolicyCheckReflectsCurrentTruth
+// for a test that exercises the distinction end to end, and
+// docs/ARCHITECTURE.md's "The identity graph" section and
+// docs/SECURITY_INVARIANTS.md for the same statement made at the
+// documentation layer.
 package graph
 
 import (
@@ -53,7 +83,9 @@ type Edge struct {
 }
 
 // Graph is the identity graph store: add nodes and edges, and traverse
-// for blast-radius queries.
+// for blast-radius queries. Deliberately append-only, see this
+// package's doc comment: there is no RemoveEdge, adding one would
+// change what this store is for.
 type Graph interface {
 	AddNode(ctx context.Context, n Node) error
 	AddEdge(ctx context.Context, e Edge) error

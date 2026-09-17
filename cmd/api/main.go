@@ -494,10 +494,11 @@ func (s *server) handleIssueCredential(w http.ResponseWriter, r *http.Request) {
 // return: the credential record plus the one-time plaintext secret the
 // agent needs to present at the gateway as "Bearer <id>.<secret>", see
 // cmd/gateway/authn.go. This is the only response anywhere in this API
-// that ever carries a plaintext secret; GET /agents/{ref}/credentials
-// and every other read path return bare Credential values, whose
-// SecretHash field is a digest, not the secret, safe to return over an
-// otherwise-authenticated read.
+// that ever carries a plaintext secret. GET /agents/{ref}/credentials
+// and every other read path return bare Credential values too, but
+// credentials.Credential.SecretHash carries a json:"-" tag, so even
+// the digest never goes out over any of these responses, not just the
+// plaintext, see that field's own doc comment for why.
 type issuedCredential struct {
 	credentials.Credential
 	Secret string `json:"secret"`
@@ -1144,7 +1145,12 @@ var allGraphEdgeKinds = []graph.EdgeKind{
 // what else can it reach, directly or transitively, through the given
 // edge kinds. This is the question a live OpenFGA check can't answer on
 // its own, see internal/graph's package doc comment for why the two are
-// kept separate.
+// kept separate. The result is discovered/historical reachability, not
+// a live authorization list, deleting a grant does not remove the edge
+// it added (see graphAddGrantEdges below), a node appearing here is not
+// proof it's still authorized today, internal/policy (GET
+// /agents/{ref}/grants, or a direct Check) is the only current-truth
+// answer to that question.
 func (s *server) handleGraphReachable(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -1220,6 +1226,15 @@ type blastRadius struct {
 // every data resource classifies Public, so CriticalResources and
 // SensitiveResources both always come back empty in that case, not an
 // error, just nothing declared sensitive yet.
+//
+// Same caveat as handleGraphReachable above, worth repeating here since
+// this is the endpoint most likely to get read as "here's what this
+// agent can currently do": the reachable set, and therefore this
+// severity call, can include resources the agent was granted at some
+// point and had that grant later revoked, the graph does not drop the
+// edge. Treat a HIGH here as "here's what this agent's history in the
+// graph could reach," corroborate against internal/policy's live grants
+// before treating it as a statement about current exposure.
 func (s *server) handleBlastRadius(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -1323,13 +1338,20 @@ func (s *server) graphAddEdge(ctx context.Context, from, to string, kind graph.E
 // or resource nobody separately registered still gets a node so the
 // edge has somewhere to point.
 //
-// Known gap, documented rather than silently wrong: handleDeleteGrants
-// does not call the mirror of this, internal/graph.Graph has no edge
-// removal primitive today, so a revoked grant still shows up as a
-// reachable edge in a blast-radius query until something adds one. An
-// operator relying on the graph for an exact, current picture after a
-// revoke should still check internal/policy's own ListGrants, the
-// graph is a superset, not a stale-safe mirror, until this is fixed.
+// handleDeleteGrants deliberately does not call a mirror of this.
+// internal/graph.Graph has no edge removal primitive, and isn't
+// getting one, see that package's doc comment: the graph is
+// historical and append-only by design, a revoked grant still shows
+// up as a reachable edge in a blast-radius query, and that's the
+// intended behavior, not a bug waiting on a fix. internal/policy's
+// ListGrants (or a direct Check) is the only place to ask "what's
+// granted right now," an operator or an automated consumer reading
+// graph reachability as current authorization is misusing this
+// endpoint, not hitting a known limitation of it. See
+// TestGraphEdgeSurvivesGrantDeletion_ButPolicyCheckReflectsCurrentTruth
+// in cmd/api/graph_test.go for the concrete proof of both halves of
+// that statement together, and docs/SECURITY_INVARIANTS.md for this
+// stated as an invariant.
 func (s *server) graphAddGrantEdges(ctx context.Context, ref string, grants []policy.Grant) {
 	for _, g := range grants {
 		switch g.Kind {

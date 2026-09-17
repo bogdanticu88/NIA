@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -44,4 +45,32 @@ func ThresholdsFromEnv() (t Threshold, configured bool, err error) {
 		*dst = v
 	}
 	return t, configured, nil
+}
+
+// envRiskDatabaseURL is the env var that decides whether the running
+// cumulative risk total behind Monitor's thresholds is private to one
+// process or shared. Unset means InMemoryRiskStore, same "runs out of
+// the box, opt into the shared version" posture as
+// credentials.FromEnv and audit.FromEnv. A separate variable from
+// NIA_AUDIT_DATABASE_URL and NIA_CREDENTIALS_DATABASE_URL on purpose, a
+// deployment can point all three at the same Postgres instance
+// (deployments/docker-compose.yml does, see the comment there) or keep
+// them apart, this package doesn't assume which.
+const envRiskDatabaseURL = "NIA_RISK_DATABASE_URL"
+
+// RiskStoreFromEnv builds the RiskStore cmd/gateway actually runs
+// against. Takes a context for the same reason credentials.FromEnv
+// does: standing up a Postgres-backed store means a real connection and
+// a schema check before this can return, better to fail at startup than
+// on the first Accumulate call nobody's watching for.
+func RiskStoreFromEnv(ctx context.Context) (RiskStore, error) {
+	dsn := strings.TrimSpace(os.Getenv(envRiskDatabaseURL))
+	if dsn == "" {
+		return NewInMemoryRiskStore(), nil
+	}
+	store, err := NewPostgresRiskStore(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("monitoring: %w", err)
+	}
+	return store, nil
 }

@@ -240,3 +240,37 @@ func TestHandleRotateCredential_OldSecretStopsWorkingNewOneStarts(t *testing.T) 
 		t.Fatalf("new credential status = %q, want active", byID[next.ID].Status)
 	}
 }
+
+// TestCredentialResponses_NeverCarryTheSecretHash is the API-level
+// half of credentials.TestCredential_JSONNeverCarriesTheSecretHash:
+// that test proves the Credential type itself never serializes the
+// field, this one proves it end to end through the actual handlers a
+// real caller hits, issue, rotate, and list, found by actually running
+// a live nia-api and reading its own response bodies, not just by
+// inspecting the struct tag. See credentials.Credential.SecretHash's
+// own doc comment for the exposure this closes.
+func TestCredentialResponses_NeverCarryTheSecretHash(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents", strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/credentials", strings.NewReader(`{"kind":"api_key"}`)))
+	if strings.Contains(rec.Body.String(), "SecretHash") {
+		t.Fatalf("issue response contains SecretHash: %s", rec.Body.String())
+	}
+	old := decodeCredential(t, rec)
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/credentials/"+old.ID+"/rotate", strings.NewReader(`{"rotated_by":"bogdan"}`)))
+	if strings.Contains(rec.Body.String(), "SecretHash") {
+		t.Fatalf("rotate response contains SecretHash: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/agent:billing/credentials", nil))
+	if strings.Contains(rec.Body.String(), "SecretHash") {
+		t.Fatalf("list response contains SecretHash: %s", rec.Body.String())
+	}
+}

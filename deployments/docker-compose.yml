@@ -103,6 +103,19 @@
 # above, not the audited no-op it used to degrade to when nia-gateway
 # had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
+#
+# NIA_RISK_DATABASE_URL, same postgres and database as the others
+# above, a different table (risk_state, see
+# internal/monitoring/postgres_risk_store.go). Only matters if the risk
+# thresholds above are also set and this compose file is ever scaled to
+# more than one nia-gateway replica: without it, each replica keeps its
+# own private running risk total per agent, in memory, and an agent's
+# real cumulative risk never adds up correctly across replicas, see
+# docs/ARCHITECTURE.md's "Distributed state" section. Verified this
+# pass against two real nia-gateway processes and a real Postgres, not
+# against this exact compose stack scaled up, that specific combination
+# is still open, same caveat NIA_CREDENTIALS_DATABASE_URL's own comment
+# above already states for its own compose-vs-bare-processes gap.
 services:
   nia-api:
     build:

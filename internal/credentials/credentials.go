@@ -91,11 +91,26 @@ const (
 // defend against, the entropy is already in the secret, not derived
 // from anything guessable.
 type Credential struct {
-	ID          string
-	AgentRef    string
-	Kind        Kind
-	Status      Status
-	SecretHash  string
+	ID       string
+	AgentRef string
+	Kind     Kind
+	Status   Status
+	// SecretHash is tagged json:"-": every handler in cmd/api that
+	// returns a Credential (handleIssueCredential, handleListCredentials,
+	// handleRevokeCredential, and the rest) serializes this struct
+	// straight to JSON, and before this field carried a tag it went out
+	// on every one of those responses. A hex SHA-256 digest isn't
+	// reversible to the secret it was computed from, so this was never
+	// the same class of exposure as leaking the secret itself would be,
+	// but it's still exactly the surface the security hardening
+	// directive names directly: "credential hashes/digests must not be
+	// exposed through APIs or logs." Verified live against a real
+	// running nia-api: before this tag, `niactl credential issue`'s own
+	// JSON response body carried a SecretHash field in plain sight.
+	// Nothing inside this package reads SecretHash through JSON, Verify
+	// and every Store implementation compare against the in-memory or
+	// database-column value directly, so this costs nothing internally.
+	SecretHash  string `json:"-"`
 	IssuedAt    time.Time
 	ExpiresAt   *time.Time
 	RevokedAt   *time.Time

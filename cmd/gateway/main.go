@@ -463,10 +463,21 @@ func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources 
 	for _, s := range score.Signals {
 		signals = append(signals, riskSignal{Name: s.Name, Weight: s.Weight})
 	}
+	// A read failure here is display-only, not a decision: Observe
+	// above already decided and acted on the authoritative total it got
+	// straight out of the risk store's own Accumulate call, this is
+	// only fetching that same number again to put in the response.
+	// Fails open to 0 with a log line, same posture as a scoring
+	// failure a few lines up, never treated as "this agent has no risk
+	// history."
+	cumulative, err := g.monitor.CumulativeRisk(ctx, agentRef)
+	if err != nil {
+		log.Printf("nia-gateway: reading cumulative risk failed for %s: %v", agentRef, err)
+	}
 	return riskInfo{
 		Value:      score.Value,
 		Signals:    signals,
-		Cumulative: g.monitor.CumulativeRisk(agentRef),
+		Cumulative: cumulative,
 		Action:     action,
 	}, true
 }
@@ -577,10 +588,21 @@ func (g *gateway) handleRisk(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteJSON(w, http.StatusOK, riskReport{AgentRef: ref, Configured: false})
 		return
 	}
+	// Unlike observe's own fail-open read of the same call, this is a
+	// direct inspection endpoint, an operator asking "what's this
+	// agent's risk right now." Silently answering 0 on a read failure
+	// would look identical to "this agent has never done anything
+	// risky," the wrong answer for something meant to be trusted during
+	// an investigation, so this fails the request instead.
+	cumulative, err := g.monitor.CumulativeRisk(r.Context(), ref)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	report := riskReport{
 		AgentRef:   ref,
 		Configured: true,
-		Cumulative: g.monitor.CumulativeRisk(ref),
+		Cumulative: cumulative,
 		Thresholds: g.monitor.Thresholds(),
 	}
 	if g.incidents != nil {
@@ -688,7 +710,18 @@ func main() {
 	// not-shared-across-replicas limitation as everything else in this
 	// scaffold that keeps state in a map, see internal/incident's own
 	// doc comment for why there's no Postgres-backed option yet, unlike
-	// internal/audit and, as of this pass, internal/credentials.
+	// internal/audit, internal/credentials, and, as of this pass,
+	// internal/monitoring's own risk store. monitoring.RiskStoreFromEnv:
+	// unset NIA_RISK_DATABASE_URL means the running cumulative risk
+	// total this Monitor compares against its thresholds is private to
+	// this process, same in-memory-by-default posture as everything
+	// else FromEnv in this codebase; set it to the same Postgres
+	// instance every gateway replica points at and a risk score
+	// climbing on one replica is the same running total every other
+	// replica observes on its very next Observe call, closing the
+	// specific distributed-state gap this security hardening pass
+	// named directly, see docs/ARCHITECTURE.md's "Distributed state"
+	// section.
 	var scorer risk.Scorer
 	var monitor *monitoring.Monitor
 	var incidents incident.Store
@@ -697,9 +730,13 @@ func main() {
 		log.Fatalf("nia-gateway: %v", err)
 	}
 	if monitoringConfigured {
+		riskStore, err := monitoring.RiskStoreFromEnv(context.Background())
+		if err != nil {
+			log.Fatalf("nia-gateway: %v", err)
+		}
 		scorer = risk.NewHistoryScorer(toolCat, sensitive, risk.DefaultWeights())
 		incidents = incident.NewInMemoryStore()
-		monitor = monitoring.NewMonitor(thresholds, pol, creds, incidents, auditLog)
+		monitor = monitoring.NewMonitorWithRiskStore(thresholds, pol, creds, incidents, auditLog, riskStore)
 	}
 
 	// The default resolver is now credentialResolver: Authorization:

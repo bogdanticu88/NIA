@@ -9,7 +9,6 @@ package monitoring
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
@@ -54,34 +53,54 @@ type Threshold struct {
 // an agent that keeps behaving badly after a revoke should still be
 // closer to a kill, not further from one. This is deliberately simple,
 // no time decay, no windowing, a running sum that resets on kill,
-// documented here rather than left to guesswork; it needs a real
-// backend (see HistoryScorer's own doc comment on its in-process
-// history) before it means anything across a restart or a second
-// gateway replica, same known scaffold limitation as everything else
-// that keeps state in a map today.
+// documented here rather than left to guesswork.
+//
+// Where that running total actually lives is RiskStore's job, not
+// this type's, see risk_store.go. The default, NewMonitor, keeps it in
+// an InMemoryRiskStore, private to whatever process constructs this
+// Monitor, the original behavior and still correct for a single
+// process or a test. cmd/gateway builds a Monitor with
+// NewMonitorWithRiskStore instead, backed by whatever
+// monitoring.RiskStoreFromEnv returns, so the total is shared across
+// every gateway replica pointed at the same store when
+// NIA_RISK_DATABASE_URL is set, see that function's own doc comment
+// and docs/ARCHITECTURE.md's "Distributed state" section for why this
+// matters: a second gateway replica with its own separate view of an
+// agent's cumulative risk is exactly the kind of state fragmentation
+// an attacker spreading calls across replicas could otherwise use to
+// keep any single replica's own view under the kill threshold forever.
 type Monitor struct {
 	thresholds Threshold
 	policy     policy.Client
 	creds      credentials.Store // optional, nil means ActionRevoke is a documented no-op, see revokeCredentials
 	incidents  incident.Store    // optional, nil means no structured incident record is created, only the audit event
 	audit      audit.Sink
-
-	mu         sync.Mutex
-	cumulative map[string]float64 // agentRef -> running risk total since the last kill
+	risk       RiskStore
 }
 
-// NewMonitor builds a Monitor. creds may be nil: a deployment that
-// hasn't wired a credentials.Store into whatever process runs this
-// (cmd/gateway doesn't have one today, see cmd/gateway's own doc
-// comment) still gets flag and kill behavior, ActionRevoke degrades to
-// a no-op that says so in its own audit detail rather than silently
-// pretending to have revoked something. incidents may also be nil: a
-// deployment that hasn't wired an incident.Store in still gets the
-// audit event Observe always writes, it just doesn't get a structured
-// Incident record alongside it, see this file's own package doc comment
-// on why the two are different things.
+// NewMonitor builds a Monitor backed by an InMemoryRiskStore, the
+// original process-local behavior, correct for a single process or a
+// test that isn't specifically exercising the shared, multi-replica
+// case. creds may be nil: a deployment that hasn't wired a
+// credentials.Store into whatever process runs this (cmd/gateway
+// doesn't have one today, see cmd/gateway's own doc comment) still gets
+// flag and kill behavior, ActionRevoke degrades to a no-op that says so
+// in its own audit detail rather than silently pretending to have
+// revoked something. incidents may also be nil: a deployment that
+// hasn't wired an incident.Store in still gets the audit event Observe
+// always writes, it just doesn't get a structured Incident record
+// alongside it, see this file's own package doc comment on why the two
+// are different things.
 func NewMonitor(t Threshold, p policy.Client, creds credentials.Store, incidents incident.Store, a audit.Sink) *Monitor {
-	return &Monitor{thresholds: t, policy: p, creds: creds, incidents: incidents, audit: a, cumulative: make(map[string]float64)}
+	return NewMonitorWithRiskStore(t, p, creds, incidents, a, NewInMemoryRiskStore())
+}
+
+// NewMonitorWithRiskStore is NewMonitor with an explicit RiskStore,
+// what cmd/gateway actually calls, passing whatever
+// monitoring.RiskStoreFromEnv resolved (in-memory by default, Postgres-
+// backed and shared across replicas when NIA_RISK_DATABASE_URL is set).
+func NewMonitorWithRiskStore(t Threshold, p policy.Client, creds credentials.Store, incidents incident.Store, a audit.Sink, risk RiskStore) *Monitor {
+	return &Monitor{thresholds: t, policy: p, creds: creds, incidents: incidents, audit: a, risk: risk}
 }
 
 // CumulativeRisk returns the current running total for an agent, 0 if
@@ -89,11 +108,11 @@ func NewMonitor(t Threshold, p policy.Client, creds credentials.Store, incidents
 // kill. Exported so callers other than the gateway's own request loop,
 // an incident report or a CLI command inspecting an agent's current
 // risk, can read the same number Observe itself is comparing against
-// the thresholds, rather than each keeping their own view of it.
-func (m *Monitor) CumulativeRisk(agentRef string) float64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.cumulative[agentRef]
+// the thresholds, rather than each keeping their own view of it. Takes
+// a context and can fail now that the total may live in Postgres rather
+// than a process-local map, see RiskStore.Get.
+func (m *Monitor) CumulativeRisk(ctx context.Context, agentRef string) (float64, error) {
+	return m.risk.Get(ctx, agentRef)
 }
 
 // Thresholds returns the flag/revoke/kill thresholds this Monitor was
@@ -108,26 +127,8 @@ func (m *Monitor) Thresholds() Threshold {
 // history since their last kill, a cheap gauge of "how many agents this
 // process has scored at all recently" for /metrics, not a list of who
 // they are, see CumulativeRisk for that.
-func (m *Monitor) TrackedAgents() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.cumulative)
-}
-
-// accumulate adds value to agentRef's running total and returns the new
-// total, atomically so concurrent calls for the same agent can't lose
-// an update racing each other.
-func (m *Monitor) accumulate(agentRef string, value float64) float64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cumulative[agentRef] += value
-	return m.cumulative[agentRef]
-}
-
-func (m *Monitor) resetCumulative(agentRef string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.cumulative, agentRef)
+func (m *Monitor) TrackedAgents(ctx context.Context) (int, error) {
+	return m.risk.TrackedAgents(ctx)
 }
 
 // Observe takes a risk score and decides + executes a response. Returns
@@ -138,7 +139,10 @@ func (m *Monitor) resetCumulative(agentRef string) {
 // this Monitor has an incident.Store configured, the structured
 // Incident record Observe creates for any action beyond ActionNone.
 func (m *Monitor) Observe(ctx context.Context, score risk.Score, incidentRef string) (Action, error) {
-	total := m.accumulate(score.AgentRef, score.Value)
+	total, err := m.risk.Accumulate(ctx, score.AgentRef, score.Value)
+	if err != nil {
+		return ActionNone, fmt.Errorf("monitoring: accumulating risk: %w", err)
+	}
 
 	action := ActionNone
 	switch {
@@ -161,8 +165,15 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incidentRef str
 		// A kill is the one action that actually changes the agent's
 		// state, restore plus fresh grants means a fresh start, its
 		// risk history shouldn't carry a pre-kill total forward
-		// forever, see this type's own doc comment.
-		m.resetCumulative(score.AgentRef)
+		// forever, see this type's own doc comment. Same fail-open
+		// posture as the credential revocation just below: the kill
+		// itself already succeeded and is what actually matters, a
+		// failure clearing the risk store afterward is folded into the
+		// audit detail rather than turned into a failed Observe call.
+		var resetNote string
+		if err := m.risk.Reset(ctx, score.AgentRef); err != nil {
+			resetNote = fmt.Sprintf(", but resetting risk history failed: %v", err)
+		}
 		// Convergence: a kill means credential state = REVOKED too, not
 		// just the policy sentinel, see docs/ARCHITECTURE.md's "State
 		// convergence" section. Before this pass, ActionKill only ever
@@ -177,11 +188,11 @@ func (m *Monitor) Observe(ctx context.Context, score risk.Score, incidentRef str
 		revoked, configured, revokeErr := m.revokeCredentials(ctx, score.AgentRef, incidentRef)
 		switch {
 		case revokeErr != nil:
-			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but revoking credentials failed: %v", total, revokeErr)
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but revoking credentials failed: %v%s", total, revokeErr, resetNote)
 		case !configured:
-			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but this process has no credentials.Store configured, credentials were not revoked", total)
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, but this process has no credentials.Store configured, credentials were not revoked%s", total, resetNote)
 		default:
-			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, revoked %d active credential(s)", total, revoked)
+			detail = fmt.Sprintf("cumulative risk %.0f crossed threshold, killed, revoked %d active credential(s)%s", total, revoked, resetNote)
 		}
 	case ActionRevoke:
 		revoked, configured, err := m.revokeCredentials(ctx, score.AgentRef, incidentRef)

@@ -19,6 +19,30 @@ func newScore(agentRef string, value float64) risk.Score {
 	return risk.Score{AgentRef: agentRef, Value: value, ScoredAt: time.Now()}
 }
 
+// cumulativeRisk and trackedAgents are thin wrappers around Monitor's
+// own ctx/error-returning methods, only so every call site below this
+// point doesn't have to repeat the same "fail the test on a read error"
+// boilerplate. Every Monitor in this file is backed by
+// NewMonitor's default InMemoryRiskStore, which never actually returns
+// an error, this is purely about keeping the test bodies readable.
+func cumulativeRisk(t *testing.T, m *Monitor, agentRef string) float64 {
+	t.Helper()
+	v, err := m.CumulativeRisk(context.Background(), agentRef)
+	if err != nil {
+		t.Fatalf("CumulativeRisk(%s): %v", agentRef, err)
+	}
+	return v
+}
+
+func trackedAgents(t *testing.T, m *Monitor) int {
+	t.Helper()
+	n, err := m.TrackedAgents(context.Background())
+	if err != nil {
+		t.Fatalf("TrackedAgents: %v", err)
+	}
+	return n
+}
+
 func TestObserve_BelowFlagThreshold_NoActionNoAudit(t *testing.T) {
 	sink := audit.NewInMemorySink(10)
 	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
@@ -240,7 +264,7 @@ func TestObserve_RiskAccumulatesAcrossCalls_CrossesThresholdOnTheThirdCall(t *te
 			t.Fatalf("Observe #%d: action = %q, want %q", i, action, want)
 		}
 	}
-	if got := m.CumulativeRisk("agent:billing"); got != 6 {
+	if got := cumulativeRisk(t, m, "agent:billing"); got != 6 {
 		t.Fatalf("CumulativeRisk = %v, want 6 (three calls at 2 each)", got)
 	}
 }
@@ -260,10 +284,10 @@ func TestObserve_RiskAccumulationIsPerAgent(t *testing.T) {
 	if action != ActionNone {
 		t.Fatalf("action = %q, want none, agent:reporting's own total is only 4, below the flag threshold of 5", action)
 	}
-	if got := m.CumulativeRisk("agent:billing"); got != 4 {
+	if got := cumulativeRisk(t, m, "agent:billing"); got != 4 {
 		t.Fatalf("CumulativeRisk(agent:billing) = %v, want 4", got)
 	}
-	if got := m.CumulativeRisk("agent:reporting"); got != 4 {
+	if got := cumulativeRisk(t, m, "agent:reporting"); got != 4 {
 		t.Fatalf("CumulativeRisk(agent:reporting) = %v, want 4", got)
 	}
 }
@@ -282,7 +306,7 @@ func TestTrackedAgents_CountsDistinctAgentsWithRiskHistory(t *testing.T) {
 	m := NewMonitor(Threshold{FlagAt: 5, RevokeAt: 10, KillAt: 20}, policy.NewInMemoryClient(), nil, nil, sink)
 	ctx := context.Background()
 
-	if got := m.TrackedAgents(); got != 0 {
+	if got := trackedAgents(t, m); got != 0 {
 		t.Fatalf("TrackedAgents() on a fresh monitor = %d, want 0", got)
 	}
 	if _, err := m.Observe(ctx, newScore("agent:billing", 1), ""); err != nil {
@@ -294,7 +318,7 @@ func TestTrackedAgents_CountsDistinctAgentsWithRiskHistory(t *testing.T) {
 	if _, err := m.Observe(ctx, newScore("agent:billing", 1), ""); err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
-	if got := m.TrackedAgents(); got != 2 {
+	if got := trackedAgents(t, m); got != 2 {
 		t.Fatalf("TrackedAgents() = %d, want 2 distinct agents, a repeat Observe for one already tracked must not double-count", got)
 	}
 }
@@ -307,7 +331,7 @@ func TestObserve_KillResetsCumulativeRisk(t *testing.T) {
 	if _, err := m.Observe(ctx, newScore("agent:billing", 20), "INC-003"); err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
-	if got := m.CumulativeRisk("agent:billing"); got != 0 {
+	if got := cumulativeRisk(t, m, "agent:billing"); got != 0 {
 		t.Fatalf("CumulativeRisk after a kill = %v, want 0", got)
 	}
 }
@@ -320,7 +344,7 @@ func TestObserve_RevokeDoesNotResetCumulativeRisk(t *testing.T) {
 	if _, err := m.Observe(ctx, newScore("agent:billing", 10), ""); err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
-	if got := m.CumulativeRisk("agent:billing"); got != 10 {
+	if got := cumulativeRisk(t, m, "agent:billing"); got != 10 {
 		t.Fatalf("CumulativeRisk after a revoke = %v, want 10, a revoke should not reset the running total, only a kill does", got)
 	}
 }
@@ -343,7 +367,7 @@ func TestObserve_RiskAccumulationIsRaceSafe(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := m.CumulativeRisk("agent:billing"); got != n {
+	if got := cumulativeRisk(t, m, "agent:billing"); got != n {
 		t.Fatalf("CumulativeRisk = %v, want %d, concurrent Observe calls must not lose an update", got, n)
 	}
 }

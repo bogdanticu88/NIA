@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bogdanticu88/nia/internal/graph"
+	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/sensitivity"
 )
 
@@ -435,6 +437,70 @@ func TestHandleBlastRadius_SensitiveResourceMeansMediumSeverity(t *testing.T) {
 	}
 	if len(br.SensitiveResources) != 1 || br.SensitiveResources[0] != "customer.email" {
 		t.Fatalf("SensitiveResources = %v, want [customer.email]", br.SensitiveResources)
+	}
+}
+
+// TestGraphEdgeSurvivesGrantDeletion_ButPolicyCheckReflectsCurrentTruth
+// is item 6's test: it makes the identity graph's chosen lifecycle
+// model (internal/graph's package doc comment, docs/ARCHITECTURE.md's
+// "The identity graph" section) concrete rather than only documented.
+// The graph is historical and append-only, deleting a grant leaves the
+// grants edge it added in place, while internal/policy, the live
+// OpenFGA-backed authorization source, reflects the deletion
+// immediately. Both halves matter together: if this test only checked
+// that Check goes from allowed to denied, it wouldn't prove the graph
+// is actually a superset rather than incidentally correct; if it only
+// checked the edge survives, it wouldn't prove live authorization is
+// still safe to rely on. A consumer who reads graph reachability as
+// "currently granted" would get exactly this scenario wrong.
+func TestGraphEdgeSurvivesGrantDeletion_ButPolicyCheckReflectsCurrentTruth(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+	registerAgentForGrants(t, mux, "agent:billing")
+
+	writeBody := `{"grants":[{"kind":"tool","object":"invoice.read"}]}`
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents/agent:billing/grants", strings.NewReader(writeBody)))
+
+	ctx := context.Background()
+	allowed, err := s.pol.Check(ctx, "agent:billing", policy.GrantForTool("invoice.read"))
+	if err != nil {
+		t.Fatalf("Check before delete: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected the grant to be live-authorized right after it was written")
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/agents/agent:billing/grants", strings.NewReader(`{"grants":[{"kind":"tool","object":"invoice.read"}]}`))
+	deleteRec := httptest.NewRecorder()
+	mux.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("delete grants status = %d, want 200: %s", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	// internal/policy: the live source of truth. Must reflect the
+	// deletion immediately, this is what every real authorization
+	// decision in this codebase actually checks against.
+	allowed, err = s.pol.Check(ctx, "agent:billing", policy.GrantForTool("invoice.read"))
+	if err != nil {
+		t.Fatalf("Check after delete: %v", err)
+	}
+	if allowed {
+		t.Fatal("expected the grant to be denied after deletion, internal/policy must be the live authorization source of truth")
+	}
+
+	// internal/graph: historical, append-only. The edge this grant
+	// wrote when it was created must still be there, that's the
+	// deliberately chosen model, not a bug.
+	neighRec := httptest.NewRecorder()
+	mux.ServeHTTP(neighRec, httptest.NewRequest(http.MethodGet, "/graph/agent:billing/neighbors?kind=grants", nil))
+	found := false
+	for _, n := range decodeNodes(t, neighRec) {
+		if n.ID == "invoice.read" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected the grants edge to survive the grant's deletion, the graph is historical and append-only by design, this is the intended model, not a stale-safe mirror of current authorization")
 	}
 }
 
