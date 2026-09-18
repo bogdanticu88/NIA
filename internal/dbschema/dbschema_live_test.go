@@ -145,6 +145,14 @@ func TestApply_RepeatBootstrap_Live(t *testing.T) {
 // be invisible in the tests above: a lock that is taken and never
 // released still lets one caller through, so everything looks fine
 // until the second process starts and hangs for lockTimeout.
+//
+// It proves the release by taking the lock again from a separate
+// connection under a short lock_timeout, rather than by counting rows
+// in pg_locks. Counting would be the obvious check and would be flaky:
+// every store's bootstrap shares this lock now, so a live test in
+// another package running at the same time can legitimately be holding
+// it for the millisecond this one looks. Re-acquiring tolerates that,
+// it just waits, and only fails if the lock is genuinely stuck.
 func TestApply_ReleasesTheLock_Live(t *testing.T) {
 	dsn := os.Getenv("NIA_DBSCHEMA_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -167,14 +175,21 @@ func TestApply_ReleasesTheLock_Live(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	var held int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = $1 AND objid = $2`,
-		schemaLockClass, schemaLockID,
-	).Scan(&held); err != nil {
-		t.Fatalf("reading pg_locks: %v", err)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquiring a connection: %v", err)
 	}
-	if held != 0 {
-		t.Errorf("%d advisory schema locks still held after Apply returned, want 0", held)
+	defer conn.Close()
+	// Generous against a bootstrap that takes milliseconds, short enough
+	// that a lock Apply forgot to release fails the test rather than
+	// stalling it for the real lockTimeout.
+	if _, err := conn.ExecContext(ctx, `SET lock_timeout = 2000`); err != nil {
+		t.Fatalf("setting lock_timeout: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1, $2)`, schemaLockClass, schemaLockID); err != nil {
+		t.Fatalf("the schema lock was still held after Apply returned: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1, $2)`, schemaLockClass, schemaLockID); err != nil {
+		t.Fatalf("releasing the lock this test took: %v", err)
 	}
 }

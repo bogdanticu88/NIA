@@ -11,8 +11,8 @@ jobs:
     runs-on: ubuntu-latest
 
     # The Postgres-backed tests in this repo (internal/audit,
-    # internal/credentials, internal/monitoring) all skip unless their
-    # own DSN env var is set, so before this service existed a green CI
+    # internal/credentials, internal/monitoring, internal/dbschema) all
+    # skip unless their own DSN env var is set, so before this service existed a green CI
     # run proved gofmt, build, vet, and the in-memory implementations
     # only. Every Postgres implementation, including the audit hash
     # chain's SELECT ... FOR UPDATE serialization, went unexercised.
@@ -41,6 +41,7 @@ jobs:
       NIA_REGISTRY_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_INCIDENT_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_POLICY_LOCK_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+      NIA_DBSCHEMA_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       # Not a real deployment key, only the value the live checkpoint
       # tests sign with. A real one is generated per deployment and kept
       # out of the audit database, see internal/audit/checkpoint.go.
@@ -72,8 +73,8 @@ jobs:
       # overall pass.
       - name: Confirm the Postgres-backed tests actually ran
         run: |
-          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ ./internal/registry/ ./internal/incident/ ./internal/policy/ -run 'Live' -v 2>&1 | tee live.log
-          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live TestPostgresLocker_Live TestPostgresCheckpointStore_Live TestPostgresStore_Live_CertificateBinding; do
+          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ ./internal/registry/ ./internal/incident/ ./internal/policy/ ./internal/dbschema/ -run 'Live' -v 2>&1 | tee live.log
+          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live TestPostgresLocker_Live TestPostgresCheckpointStore_Live TestPostgresStore_Live_CertificateBinding TestApply_ConcurrentBootstrap_Live TestApply_RepeatBootstrap_Live TestApply_ReleasesTheLock_Live; do
             if grep -q -- "--- SKIP: $name" live.log; then
               echo "$name was skipped, its DSN env var is not reaching the test"
               exit 1
