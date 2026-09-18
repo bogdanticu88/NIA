@@ -76,21 +76,79 @@ The decision completes before anything is forwarded, so a refused call is never 
 
 ## Quickstart
 
-Needs Go 1.25. No Postgres, Tessera or OpenFGA required for this.
+Needs Go 1.25 and nothing else. Every command below was run against a clean clone of this repository before being written down.
 
 ```bash
-# 1. build and check
+git clone https://github.com/bogdanticu88/NIA.git && cd NIA
 go build ./... && go test ./...
 
-# 2. start the control plane and the gateway, in two terminals
-go run ./cmd/api
-go run ./cmd/gateway
+# The control plane refuses to start open, so say so explicitly.
+# Listens on :8080.
+NIA_ALLOW_UNAUTHENTICATED=1 go run ./cmd/api
 
-# 3. drive the whole loop: registration, grants, and a scripted attack sequence
+# In another terminal, drive it.
+go run ./cmd/niactl register -ref agent:billing-reconciler -owner bogdan -purpose "reconciles invoices nightly"
+go run ./cmd/niactl tool register -name invoice.read -transport http -risk read_only -owner bogdan
+go run ./cmd/niactl grant write -ref agent:billing-reconciler -kind tool -object invoice.read
+go run ./cmd/niactl credential issue -ref agent:billing-reconciler -kind api_key -ttl 24h
+
+# What could this agent reach if it were compromised right now
+go run ./cmd/niactl graph blast-radius -id agent:billing-reconciler
+
+# Everything that just happened to it
+go run ./cmd/niactl audit -ref agent:billing-reconciler
+```
+
+That is the control plane on its own, and it needs no infrastructure because every store falls back to an in-memory implementation when its environment variable is unset.
+
+What it cannot do is the transcript above. The gateway is a separate process, and with the in-memory defaults each process keeps its own private state, so a credential issued through `cmd/api` is invisible to `cmd/gateway` and every call it makes comes back 401. That is not a bug to work around, it is the two processes genuinely having nothing shared to check against. Running the gateway for real means giving them a shared backend, which is what the Docker stack below is for.
+
+## Running the full stack
+
+Needs Docker and [Tessera](https://github.com/bogdanticu88/Tessera) checked out as a sibling directory, since compose builds it from `../../tessera`.
+
+```bash
+cd deployments
+
+# 1. The two files a fresh clone does not ship, because both hold secrets.
+cp operator-tokens.example.json operator-tokens.json   # then replace every token in it
+cat > .env <<'ENV'
+NIA_TESSERA_JWT_SIGNING_KEY=<openssl rand -base64 32>
+TESSERA_OPENFGA_STORE_ID=placeholder
+NIA_TOOLS_API_TOKEN=<the viewer token from operator-tokens.json>
+ENV
+
+# 2. OpenFGA has no store until it is running, so bootstrap it first.
+#    TESSERA_OPENFGA_STORE_ID needs a placeholder value before this:
+#    compose interpolates every service's variables even when you name
+#    only two, so a missing one fails the command outright.
+docker compose up -d postgres openfga
+./bootstrap-openfga.sh          # prints the real store id
+
+# 3. Put that id in .env, replacing the placeholder, then bring up the rest.
+docker compose up -d --build
+```
+
+Five containers, all healthy: `nia-api`, `nia-gateway`, `tessera`, `openfga`, `postgres`. Both NIA services share one Postgres for credentials, audit, registry, incidents and risk state, and one Tessera for policy, which is what makes the gateway usable.
+
+Risk monitoring is off by default, deliberately, since a kill threshold in a shared dev stack is the kind of thing that should be opted into rather than sprung on someone. Three lines in `.env` turn it on:
+
+```bash
+NIA_RISK_FLAG_AT=4
+NIA_RISK_REVOKE_AT=100
+NIA_RISK_KILL_AT=12
+```
+
+Then `docker compose up -d nia-gateway` and:
+
+```bash
+export NIA_OPERATOR_TOKEN=<the admin token from operator-tokens.json>
 go run ./cmd/niactl simulate attack -scenario agent-hijack
 ```
 
-To reproduce the transcript above with real containment firing, the gateway needs risk thresholds and both processes need a shared policy backend, since each one otherwise keeps its own private in-memory state and every gateway call is denied for a genuinely empty reason. [`docs/RUNNING.md`](docs/RUNNING.md) has the exact environment variables, the full `niactl` command tour, and the Docker Compose stack with its OpenFGA bootstrap step.
+Worth knowing before you read the output: revoke and kill both genuinely revoke the agent's credential now, so once containment fires, every later call in the sequence returns 401 rather than continuing. The thresholds above are chosen to reach the kill; set `NIA_RISK_REVOKE_AT` low instead and the run ends earlier, at the revoke. Either way the agent is cut off partway through its own attack, which is the thing being demonstrated.
+
+[`docs/RUNNING.md`](docs/RUNNING.md) has the full `niactl` command tour and the rest of the environment variables.
 
 ## Layout
 

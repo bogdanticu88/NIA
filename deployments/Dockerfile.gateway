@@ -1,7 +1,7 @@
 # Builds cmd/gateway. Same shape as Dockerfile.api, see that file's
-# comment, this one has the same "go build/vet/test verified, docker
-# build not" caveat.
-FROM golang:1.24-alpine AS build
+# comment, including the note about keeping this base image in step
+# with go.mod.
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY . .

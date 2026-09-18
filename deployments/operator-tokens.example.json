@@ -13,5 +13,10 @@
     "token": "and-this-one",
     "name": "on-call",
     "roles": ["viewer"]
+  },
+  {
+    "token": "and-one-more-for-the-gateway",
+    "name": "nia-gateway",
+    "roles": ["viewer"]
   }
 ]

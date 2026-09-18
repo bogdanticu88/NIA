@@ -164,8 +164,17 @@
 # spring on someone who didn't opt into it. crossing a revoke or kill
 # threshold now genuinely revokes credentials through the shared store
 # above, not the audited no-op it used to degrade to when nia-gateway
-# had no credentials.Store wired in at all. Add the three variables to
-# nia-gateway's environment block below to try it locally.
+# had no credentials.Store wired in at all. They are wired through to
+# nia-gateway below as optional pass-throughs that default to empty,
+# and an empty value reads as unset (see internal/monitoring/from_env.go),
+# so the default stays off and trying it locally is three lines in .env
+# rather than an edit to this file:
+#
+#   NIA_RISK_FLAG_AT=4
+#   NIA_RISK_REVOKE_AT=8
+#   NIA_RISK_KILL_AT=15
+#
+# Those are the values README.md's transcript was captured with.
 #
 # NIA_POLICY_LOCK_DATABASE_URL serializes grant writes across replicas.
 # WriteGrants and DeleteGrants are a read, merge, then full onboard,
@@ -334,6 +343,17 @@ services:
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_TOOLS_API_URL: "http://nia-api:8080"
+      # The gateway reads nia-api's tool catalog over HTTP, and nia-api
+      # authenticates its own surface, so this lookup needs a token like
+      # any other read. Viewer is enough, the gateway never writes to the
+      # catalog. Without it every lookup is a 401 and every tool call
+      # fails as a lookup error rather than a decision, which is exactly
+      # how this was found, by running the stack rather than reading it.
+      NIA_TOOLS_API_TOKEN: "${NIA_TOOLS_API_TOKEN:?set this to a viewer token from operator-tokens.json, see the comment at the top of this file}"
+      # Optional, empty means off, see the comment at the top of this file.
+      NIA_RISK_FLAG_AT: "${NIA_RISK_FLAG_AT:-}"
+      NIA_RISK_REVOKE_AT: "${NIA_RISK_REVOKE_AT:-}"
+      NIA_RISK_KILL_AT: "${NIA_RISK_KILL_AT:-}"
       NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
       NIA_OPENFGA_API_URL: "http://openfga:8080"
       NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"

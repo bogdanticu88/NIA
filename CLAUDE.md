@@ -75,6 +75,7 @@ real versus still stubbed, and the distributed-state table.
 has the full local setup.
 
 CI runs on every push to `master` (`.github/workflows/ci.yml`): gofmt
-check, build, vet, `go test ./... -race`. The Postgres-backed audit store
-(`internal/audit/postgres_sink.go`) needs `go mod tidy` after a fresh
-clone to pull in `lib/pq`, it isn't vendored.
+check, build, vet, `go test ./... -race`, against a real Postgres
+service, asserting the Postgres-backed live tests actually ran rather
+than skipped. A fresh clone builds with no extra steps, `go.sum` is
+committed.

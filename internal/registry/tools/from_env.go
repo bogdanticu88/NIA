@@ -15,6 +15,18 @@ import (
 // store.
 const envAPIURL = "NIA_TOOLS_API_URL"
 
+// envAPIToken is the operator token the gateway presents for that
+// lookup. cmd/api authenticates its own surface, and GET /tools/{name}
+// needs the viewer permission, so without this every lookup comes back
+// 401 and every tool call fails as a lookup error rather than a
+// decision. Viewer is all it needs: the gateway reads the catalog, it
+// never writes to it.
+//
+// Unset is still valid, and is correct for a cmd/api running with
+// NIA_ALLOW_UNAUTHENTICATED=1. It is not correct for anything else, so
+// this is a variable rather than a default.
+const envAPIToken = "NIA_TOOLS_API_TOKEN"
+
 // FromEnvReader builds the Reader cmd/gateway checks a tool against
 // before forwarding a call. A nil Reader (both return values valid,
 // error is nil) means "not configured", callers must treat that as
@@ -24,5 +36,5 @@ func FromEnvReader() (Reader, error) {
 	if base == "" {
 		return nil, nil
 	}
-	return NewHTTPReader(base), nil
+	return NewHTTPReader(base, os.Getenv(envAPIToken)), nil
 }

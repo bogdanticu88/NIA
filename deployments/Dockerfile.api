@@ -1,11 +1,13 @@
 # Builds cmd/api. Multi-stage so the shipped image is the static binary
 # plus a minimal base, not the Go toolchain, not go.mod's module cache.
 #
-# Not verified with a real docker build in this repo's own sandbox, it
-# has no Docker daemon, go build/go vet/go test have all run clean
-# against the code this Dockerfile packages, but "docker build" itself
-# has not. Run it once locally before trusting it in CI.
-FROM golang:1.24-alpine AS build
+# Verified with a real docker build now, in the full compose stack, and
+# it is worth saying why that mattered: this pinned golang:1.24-alpine
+# while go.mod had moved to 1.25, so every docker build failed with
+# "go.mod requires go >= 1.25.0". Nothing caught it, because go build,
+# go vet and go test all run against the host toolchain and never touch
+# this file. Keep this base image in step with go.mod.
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 COPY . .
