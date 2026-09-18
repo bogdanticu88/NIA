@@ -10,6 +10,20 @@ AI assistant wrote the change. If a tool's default behavior wants to add
 attribution lines, that default is overridden here, this instruction takes
 precedence.
 
+Commit messages follow the shape the log already has, and the easiest way
+to get it right is to read the last few before writing one. Subject in the
+imperative, sentence case, no `feat:`/`fix:`-style prefixes, a second
+clause after a comma when one thing genuinely needs saying alongside the
+other. Body in prose paragraphs, not bullets: what was wrong, what changed,
+why it was done that way, and at the end what was actually run to verify
+it. Wrap around 72 to 80 columns.
+
+When a piece of work is one of the numbered phases the README tracks, put
+`phase N` at the end of the subject (`..., phase 9`), never at the front,
+and use the same number the README entry uses. Do not invent a separate
+numbering for a plan or a working session, there is one sequence and it
+lives in the README.
+
 ## Writing style
 
 No em dashes anywhere, in code comments or docs, use commas instead. Code
@@ -18,6 +32,17 @@ plain, specific, no filler, no marketing tone. Explain the actual reasoning
 behind a decision, not just what the code does. When something is a known
 gap or hasn't been verified yet, say so plainly rather than implying it
 works.
+
+The README's Status section has conventions of its own, and they matter
+because that list is the honest record of what has actually been done.
+One entry per phase, numbered sequentially, and never two entries sharing
+a number: if a pass produced three separable pieces of work, those are
+three phases, not one phase with three bullets. The reverse is fine, a
+single commit can cover several phases (see `9591ad2`, whose four items
+are phases 13 to 16). Verification belongs at the end of the entry it
+verifies, not collected into a separate bullet of its own. What a phase
+deliberately did not do, and what it left open, goes inside that phase's
+entry too. No bold, the file does not use it anywhere else.
 
 ## Verification standard
 
