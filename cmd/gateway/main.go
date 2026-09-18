@@ -96,6 +96,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/monitoring"
 	"github.com/bogdanticu88/nia/internal/opauth"
 	"github.com/bogdanticu88/nia/internal/policy"
+	"github.com/bogdanticu88/nia/internal/ratelimit"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
 	"github.com/bogdanticu88/nia/internal/risk"
 	"github.com/bogdanticu88/nia/internal/sensitivity"
@@ -141,10 +142,20 @@ type gateway struct {
 	// own credential to POST /tools/{tool}/call and never an operator
 	// token, see authn.go. nil only when NIA_ALLOW_UNAUTHENTICATED=1
 	// was set deliberately, see opauth.FromEnvEnforced.
-	opStore    opauth.Store
-	auditLog   audit.Sink
-	metrics    *gatewayMetrics
-	metricsReg *metrics.Registry // handleFunc target for GET /metrics
+	opStore opauth.Store
+	// clientLimiter bounds requests per client address, in front of
+	// everything including credential verification. agentLimiter bounds
+	// what one authenticated agent can do, applied inside
+	// handleToolCall once identity is known, because that is the first
+	// moment the agent's ref exists. The two are not redundant: one
+	// agent can call from many addresses, and one address can present
+	// many agents' credentials.
+	clientLimiter  *ratelimit.Limiter
+	agentLimiter   *ratelimit.Limiter
+	trustForwarded bool
+	auditLog       audit.Sink
+	metrics        *gatewayMetrics
+	metricsReg     *metrics.Registry // handleFunc target for GET /metrics
 }
 
 // gatewayMetrics is every counter cmd/gateway exposes over GET /metrics.
@@ -163,6 +174,7 @@ type gatewayMetrics struct {
 	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved|downstream_ok|downstream_client_error|downstream_server_error|downstream_unreachable
 	monitoringActions  *metrics.Counter // action: flag|revoke|kill
 	auditWriteFailures *metrics.Counter // no labels
+	rateLimited        *metrics.Counter // scope: client|agent
 }
 
 func newGatewayMetrics(reg *metrics.Registry) *gatewayMetrics {
@@ -170,6 +182,7 @@ func newGatewayMetrics(reg *metrics.Registry) *gatewayMetrics {
 		requests:           reg.NewCounter("nia_gateway_requests_total", "tool-call requests by outcome", "outcome"),
 		monitoringActions:  reg.NewCounter("nia_monitoring_actions_total", "monitoring responses to a scored call by action", "action"),
 		auditWriteFailures: reg.NewCounter("nia_audit_write_failures_total", "audit trail append failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 8"),
+		rateLimited:        reg.NewCounter("nia_rate_limited_total", "requests refused with 429 by a rate limiter, by which limiter refused them", "scope"),
 	}
 }
 
@@ -208,6 +221,21 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 
 	tool := r.PathValue("tool")
 	ctx := r.Context()
+
+	// The per-agent limit goes here, after identity resolution and
+	// before anything expensive: this is the first point the agent's
+	// ref exists, and every step below it (catalog lookup, policy
+	// check, argument inspection, scoring, forwarding) costs real work
+	// on behalf of a caller that may be flooding. internal/risk's
+	// call_rate signal observes the same burst and feeds containment,
+	// this is the half that actually refuses it.
+	if !g.agentLimiter.Allow(resolved.Ref) {
+		g.metrics.rateLimited.Inc("agent")
+		g.audit(ctx, "gateway.rate_limited", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
+		w.Header().Set("Retry-After", "1")
+		niahttp.WriteError(w, http.StatusTooManyRequests, "rate limit exceeded for this agent, slow down")
+		return
+	}
 
 	var body toolCallRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
@@ -624,7 +652,7 @@ func (g *gateway) handleRisk(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, report)
 }
 
-func (g *gateway) routes() *http.ServeMux {
+func (g *gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		niahttp.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -641,7 +669,15 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.Handle("GET /incidents/{id}", g.operatorOnly(http.HandlerFunc(g.handleGetIncident)))
 	mux.Handle("GET /risk/{ref}", g.operatorOnly(http.HandlerFunc(g.handleRisk)))
 	mux.Handle("GET /metrics", g.metricsReg)
-	return mux
+
+	// Same order as cmd/api: rate limit, then body cap, then the mux.
+	// The per-agent limiter is not here, it needs a resolved identity
+	// and so lives inside handleToolCall.
+	var h http.Handler = niahttp.MaxBytes(mux, niahttp.DefaultMaxRequestBytes)
+	h = ratelimit.Middleware(g.clientLimiter, g.trustForwarded, func(string) {
+		g.metrics.rateLimited.Inc("client")
+	}, h, "/healthz")
+	return h
 }
 
 // operatorOnly wraps an operator-facing handler in operator-token
@@ -852,6 +888,12 @@ func main() {
 		log.Printf("nia-gateway: operator authentication is on, GET /incidents, GET /incidents/{id} and GET /risk/{ref} require Authorization: Bearer <operator token>")
 	}
 
+	rateCfg, err := ratelimit.FromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+	log.Printf("nia-gateway: rate limits, %.0f/s per client address (burst %d) and %.0f/s per authenticated agent (burst %d), 0 means disabled", rateCfg.PerClientRPS, rateCfg.PerClientBurst, rateCfg.PerAgentRPS, rateCfg.PerAgentBurst)
+
 	metricsReg := metrics.NewRegistry()
 	g := &gateway{
 		resolver:       resolver,
@@ -864,15 +906,27 @@ func main() {
 		incidents:      incidents,
 		forwarder:      forwarder,
 		opStore:        opStore,
+		clientLimiter:  rateCfg.PerClient(),
+		agentLimiter:   rateCfg.PerAgent(),
+		trustForwarded: rateCfg.TrustForwardedFor,
 		auditLog:       auditLog,
 		metrics:        newGatewayMetrics(metricsReg),
 		metricsReg:     metricsReg,
 	}
 
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           g.routes(),
+		Addr:    addr,
+		Handler: g.routes(),
+		// Same reasoning as cmd/api's, with one difference that matters:
+		// WriteTimeout has to exceed the downstream forwarder's own
+		// 30 second client timeout (see forward.go), or this server
+		// would cut off a response the gateway is still legitimately
+		// waiting on and turn a slow downstream into a broken one.
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	log.Printf("nia-gateway listening on %s", addr)

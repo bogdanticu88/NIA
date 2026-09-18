@@ -140,6 +140,21 @@
 # had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
 #
+# Rate limiting is on by default in both services and needs no
+# configuration here, which is why no NIA_RATE_LIMIT_* variable appears
+# below. 50 requests per second per client address (burst 100) and, in
+# nia-gateway, 20 per second per authenticated agent (burst 40), both
+# per replica. Override with NIA_RATE_LIMIT_PER_CLIENT_RPS /
+# _BURST and NIA_GATEWAY_RATE_LIMIT_PER_AGENT_RPS / _BURST; an explicit
+# 0 disables one. See internal/ratelimit.
+#
+# NIA_RATE_LIMIT_TRUST_FORWARDED_FOR is deliberately not set. Turning it
+# on makes the per-client key come from X-Forwarded-For, which is right
+# behind a proxy that overwrites the header and wrong everywhere else:
+# on a directly reachable process anyone can mint unlimited buckets by
+# varying one header. Both services in this stack publish ports
+# directly, so leaving it unset is correct here.
+#
 # NIA_RISK_HISTORY_DATABASE_URL, same postgres and database as the
 # others, its own four tables (agent_tool_history,
 # agent_transition_history, agent_last_tool, agent_calls, see

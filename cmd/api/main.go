@@ -24,6 +24,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/opauth"
 	"github.com/bogdanticu88/nia/internal/policy"
+	"github.com/bogdanticu88/nia/internal/ratelimit"
 	"github.com/bogdanticu88/nia/internal/registry"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
 	"github.com/bogdanticu88/nia/internal/sensitivity"
@@ -36,16 +37,23 @@ import (
 // one) satisfies it. Swapping the policy client for a real Tessera HTTP
 // adapter, once it exists, touches only this constructor.
 type server struct {
-	agents     registry.AgentRegistry
-	toolCat    tools.Catalog
-	creds      credentials.Store
-	pol        policy.Client
-	auditLog   audit.Store
-	graph      graph.Graph
-	sensitive  sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
-	opStore    opauth.Store           // optional, nil means operator authentication is off, see opauth.go and opauth.FromEnv's own doc comment
-	metrics    *serverMetrics
-	metricsReg *metrics.Registry // handleFunc target for GET /metrics, metrics is the typed counters callers actually use
+	agents    registry.AgentRegistry
+	toolCat   tools.Catalog
+	creds     credentials.Store
+	pol       policy.Client
+	auditLog  audit.Store
+	graph     graph.Graph
+	sensitive sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
+	opStore   opauth.Store           // optional, nil means operator authentication is off, see opauth.go and opauth.FromEnv's own doc comment
+	// limiter bounds requests per client address, applied in front of
+	// everything including authentication, see routes(). A flood of
+	// unauthenticated requests is the case it exists for: each one costs
+	// a token-store lookup and none of them is audited, there is no
+	// resolved operator to attribute an event to.
+	limiter        *ratelimit.Limiter
+	trustForwarded bool
+	metrics        *serverMetrics
+	metricsReg     *metrics.Registry // handleFunc target for GET /metrics, metrics is the typed counters callers actually use
 }
 
 // serverMetrics is every counter and gauge cmd/api exposes over GET
@@ -70,6 +78,7 @@ type serverMetrics struct {
 	kills              *metrics.Counter // result: success|error
 	auditWriteFailures *metrics.Counter // no labels
 	graphWriteFailures *metrics.Counter // op: add_node|add_edge
+	rateLimited        *metrics.Counter // no labels, one per request refused with 429
 }
 
 func newServerMetrics(reg *metrics.Registry, s *server) *serverMetrics {
@@ -83,7 +92,11 @@ func newServerMetrics(reg *metrics.Registry, s *server) *serverMetrics {
 		kills:              reg.NewCounter("nia_kills_total", "kill switch invocations by result", "result"),
 		auditWriteFailures: reg.NewCounter("nia_audit_write_failures_total", "audit trail append failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 8"),
 		graphWriteFailures: reg.NewCounter("nia_graph_write_failures_total", "identity graph write failures, fail-open by design, see docs/SECURITY_INVARIANTS.md invariant 9", "op"),
+		rateLimited:        reg.NewCounter("nia_rate_limited_total", "requests refused with 429 by the per-client rate limiter"),
 	}
+	reg.NewGaugeFunc("nia_rate_limit_tracked_clients", "client addresses currently holding a rate-limit bucket", func() float64 {
+		return float64(s.limiter.Tracked())
+	})
 	reg.NewGaugeFunc("nia_agents_registered", "agents currently in the registry", func() float64 {
 		list, err := s.agents.List(context.Background())
 		if err != nil {
@@ -156,15 +169,21 @@ func newServer(ctx context.Context) (*server, error) {
 	if openOnPurpose {
 		log.Printf("nia-api: %s=1, this process accepts every request unauthenticated and trusts operator/*_by fields at face value, this must never be set on anything reachable by an untrusted caller", opauth.EnvAllowUnauthenticated)
 	}
+	rateCfg, err := ratelimit.FromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
 	s := &server{
-		agents:    registry.NewInMemoryAgentRegistry(),
-		toolCat:   tools.NewInMemoryCatalog(),
-		creds:     creds,
-		pol:       pol,
-		auditLog:  auditLog,
-		graph:     graph.NewInMemoryGraph(),
-		sensitive: sensitive,
-		opStore:   opStore,
+		limiter:        rateCfg.PerClient(),
+		trustForwarded: rateCfg.TrustForwardedFor,
+		agents:         registry.NewInMemoryAgentRegistry(),
+		toolCat:        tools.NewInMemoryCatalog(),
+		creds:          creds,
+		pol:            pol,
+		auditLog:       auditLog,
+		graph:          graph.NewInMemoryGraph(),
+		sensitive:      sensitive,
+		opStore:        opStore,
 	}
 	reg := metrics.NewRegistry()
 	s.metrics = newServerMetrics(reg, s)
@@ -1478,10 +1497,21 @@ func (s *server) routes() http.Handler {
 	// the bare mux, identical to before opauth existed. Every caller
 	// (main, and every test in this package) only ever calls
 	// ServeHTTP on the result, which http.Handler still provides.
+	var h http.Handler = mux
 	if s.opStore != nil {
-		return operatorAuthMiddleware(s.opStore, mux)
+		h = operatorAuthMiddleware(s.opStore, h)
 	}
-	return mux
+	// Order matters, outermost first: rate limit, then body cap, then
+	// authentication, then the handler. Limiting in front of
+	// authentication is the point, an attacker who never presents a
+	// valid token still costs this process work. Capping the body in
+	// front of it too means an oversized request is refused before any
+	// handler reads a byte of it.
+	h = niahttp.MaxBytes(h, niahttp.DefaultMaxRequestBytes)
+	h = ratelimit.Middleware(s.limiter, s.trustForwarded, func(string) {
+		s.metrics.rateLimited.Inc()
+	}, h, "/healthz")
+	return h
 }
 
 func main() {
@@ -1498,9 +1528,23 @@ func main() {
 		log.Printf("nia-api: operator authentication is on, every request except GET /healthz and GET /metrics requires Authorization: Bearer <operator token>")
 	}
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           s.routes(),
+		Addr:    addr,
+		Handler: s.routes(),
+		// Only ReadHeaderTimeout was set before, which bounds the
+		// headers and nothing else: a client could open a connection,
+		// send valid headers, and then trickle a body or simply hold
+		// the connection open indefinitely, and enough of those exhaust
+		// the process without sending a single complete request.
+		// ReadTimeout bounds the whole request, WriteTimeout the whole
+		// response, IdleTimeout an otherwise-silent keep-alive
+		// connection, and MaxHeaderBytes the headers themselves, which
+		// are read before any of this code runs and so are not covered
+		// by the body cap in routes().
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	log.Printf("nia-api listening on %s", addr)
