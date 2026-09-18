@@ -386,3 +386,58 @@ func TestPostgresSink_ChainLive_DetectsClearedHashColumn(t *testing.T) {
 		t.Fatalf("Breaks = %+v, want one naming the blanked row (seq %d)", result.Breaks, seqs[1])
 	}
 }
+
+// TestPostgresSink_ChainLive_VerifyDuringConcurrentAppendsIsNeverAFalseBreak
+// guards the tip check against the failure mode it could plausibly
+// introduce. The events and the tip are in two different tables, so a
+// Chain that read them under two separate snapshots would see a tip
+// newer than its newest event whenever an append landed in between, and
+// report a truncation on a perfectly healthy trail. cmd/api serves
+// GET /audit/verify while cmd/gateway is still appending, so that is
+// the ordinary case, not a rare one, and a verifier that cries tamper
+// under load is worse than no verifier.
+func TestPostgresSink_ChainLive_VerifyDuringConcurrentAppendsIsNeverAFalseBreak(t *testing.T) {
+	sink, ctx := liveChainSink(t)
+	agentRef := liveChainAgentRef(t)
+	appendLiveChain(t, ctx, sink, agentRef, 2)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			evt := Event{
+				Action:   "gateway.allowed",
+				AgentRef: agentRef,
+				Operator: agentRef,
+				Detail:   fmt.Sprintf("concurrent seq=%d", i),
+				At:       time.Now(),
+			}
+			if err := sink.Append(context.Background(), evt); err != nil {
+				t.Errorf("concurrent Append #%d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 25; i++ {
+		result, err := Verify(ctx, sink)
+		if err != nil {
+			close(stop)
+			<-done
+			t.Fatalf("Verify #%d: %v", i, err)
+		}
+		if !result.OK {
+			close(stop)
+			<-done
+			t.Fatalf("Verify #%d reported breaks on a healthy chain while appends were in flight: %+v", i, result.Breaks)
+		}
+	}
+	close(stop)
+	<-done
+}

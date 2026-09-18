@@ -228,7 +228,23 @@ func (s *PostgresSink) ForAgent(ctx context.Context, agentRef string) ([]Event, 
 // or operator explicitly deleted, which is exactly what Verify's
 // prev_hash check is there to catch.
 func (s *PostgresSink) Chain(ctx context.Context) (Chain, error) {
-	rows, err := s.db.QueryContext(ctx,
+	// Both reads run in one REPEATABLE READ transaction, and that is not
+	// incidental tidiness. The events and the tip live in two different
+	// tables, and Append writes both in one transaction of its own, so
+	// reading them under two separate snapshots means a concurrent
+	// Append landing between the two reads makes the tip newer than the
+	// newest event this saw. Verify would then report a chain
+	// truncation that never happened, on a perfectly healthy trail,
+	// which is worse than not having the check at all: cmd/api serves
+	// GET /audit/verify while cmd/gateway is still appending, so this
+	// is the ordinary case, not a rare one.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return Chain{}, fmt.Errorf("audit: chain: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx,
 		`SELECT id, action, agent_ref, operator, incident, detail, at, hash, prev_hash FROM audit_events ORDER BY id ASC`,
 	)
 	if err != nil {
@@ -255,8 +271,11 @@ func (s *PostgresSink) Chain(ctx context.Context) (Chain, error) {
 	// empty and Verify skips the check rather than reporting a false
 	// break.
 	var tip string
-	if err := s.db.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = TRUE`).Scan(&tip); err != nil && err != sql.ErrNoRows {
+	if err := tx.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = TRUE`).Scan(&tip); err != nil && err != sql.ErrNoRows {
 		return Chain{}, fmt.Errorf("audit: chain: reading chain tip: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Chain{}, fmt.Errorf("audit: chain: commit: %w", err)
 	}
 	return Chain{Events: out, StartsAtGenesis: true, Tip: tip}, nil
 }
