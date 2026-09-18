@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"time"
 )
 
 // Operator is an authenticated caller of cmd/api. Name is whatever the
@@ -38,6 +39,18 @@ type Operator struct {
 	// that failed to load: a handler asks Can(perm) and gets false
 	// rather than a permissive default.
 	Roles []Role
+	// ExpiresAt, when set, is when this token stops authenticating.
+	// Checked at Verify time against the clock rather than swept in the
+	// background, the same choice internal/credentials.Credential.
+	// Effective makes and for the same reason: nothing has to be
+	// running for an expired token to stop working.
+	ExpiresAt *time.Time
+}
+
+// Expired reports whether this operator's token is past its expiry at
+// now. An operator with no expiry never expires.
+func (o Operator) Expired(now time.Time) bool {
+	return o.ExpiresAt != nil && !now.Before(*o.ExpiresAt)
 }
 
 // ErrInvalidToken covers every reason a presented token fails: unknown,
@@ -55,10 +68,12 @@ var ErrInvalidToken = errors.New("opauth: invalid token")
 // provider, not OAuth. NIA doesn't have enough distinct human callers
 // yet to justify more, and a static list that's actually checked beats
 // a more sophisticated design that never gets built. What this
-// deliberately doesn't have: rotation or expiry (a leaked token has to
-// be removed from the source file and the process restarted, there's no
-// live revoke the way internal/credentials has). That is a real, open
-// gap, named here rather than implied solved.
+// deliberately doesn't have: issuance. There is no endpoint that mints
+// an operator token, they are written into the file by whoever
+// administers the deployment. Expiry and revocation it does have, see
+// Operator.ExpiresAt and ReloadingStore: a token can carry an
+// expires_at, and removing a line from the file retires that token on
+// every process reading it within a couple of seconds, no restart.
 //
 // Per-operator scoping used to be on that list and is not any more, see
 // roles.go: a token declares roles, a handler demands a permission, and

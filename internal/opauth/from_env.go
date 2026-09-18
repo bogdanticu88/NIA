@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // envTokensPath names a JSON file of operator tokens. Unset means
@@ -56,6 +57,11 @@ type tokenFile struct {
 	Token string   `json:"token"`
 	Name  string   `json:"name"`
 	Roles []string `json:"roles"`
+	// ExpiresAt is optional, RFC3339. A token past it stops
+	// authenticating without anyone having to remember to remove it,
+	// which is the point: the tokens that actually leak are the ones
+	// issued for a migration eighteen months ago that nobody revisited.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // FromEnv builds a Store from the tokens file named by
@@ -72,41 +78,65 @@ func FromEnv() (Store, error) {
 	if path == "" {
 		return nil, nil
 	}
+	// ReloadingStore rather than a bare StaticStore: removing a line
+	// from the token file takes effect on every process reading it
+	// within a couple of seconds, which is the closest thing this
+	// package has to revocation, see reloading.go.
+	return NewReloadingStore(path)
+}
+
+// loadTokenFile parses the token file at path and returns a store plus
+// the modification time and size it was read at, which ReloadingStore
+// uses to notice a later change without re-parsing on every request.
+func loadTokenFile(path string) (*StaticStore, time.Time, int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, time.Time{}, 0, fmt.Errorf("opauth: reading %s (%s): %w", envTokensPath, path, err)
+	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("opauth: reading %s (%s): %w", envTokensPath, path, err)
+		return nil, time.Time{}, 0, fmt.Errorf("opauth: reading %s (%s): %w", envTokensPath, path, err)
 	}
 	var files []tokenFile
 	if err := json.Unmarshal(raw, &files); err != nil {
-		return nil, fmt.Errorf("opauth: parsing %s: %w", path, err)
+		return nil, time.Time{}, 0, fmt.Errorf("opauth: parsing %s: %w", path, err)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("opauth: %s is set but %s contains no tokens, a deployment would lock every operator out, remove the env var instead if that's genuinely intended", envTokensPath, path)
+		return nil, time.Time{}, 0, fmt.Errorf("opauth: %s is set but %s contains no tokens, a deployment would lock every operator out, remove the env var instead if that's genuinely intended", envTokensPath, path)
 	}
 
 	operators := make(map[string]Operator, len(files))
 	for i, f := range files {
 		if f.Token == "" {
-			return nil, fmt.Errorf("opauth: entry %d in %s has an empty token", i, path)
+			return nil, time.Time{}, 0, fmt.Errorf("opauth: entry %d in %s has an empty token", i, path)
 		}
 		if f.Name == "" {
-			return nil, fmt.Errorf("opauth: entry %d in %s (token present) has an empty name", i, path)
+			return nil, time.Time{}, 0, fmt.Errorf("opauth: entry %d in %s (token present) has an empty name", i, path)
 		}
 		if len(f.Roles) == 0 {
-			return nil, fmt.Errorf("opauth: entry %d (%s) in %s declares no roles, add at least one of: %s", i, f.Name, path, strings.Join(KnownRoles(), ", "))
+			return nil, time.Time{}, 0, fmt.Errorf("opauth: entry %d (%s) in %s declares no roles, add at least one of: %s", i, f.Name, path, strings.Join(KnownRoles(), ", "))
 		}
 		roles := make([]Role, 0, len(f.Roles))
-		for _, raw := range f.Roles {
-			role, err := ParseRole(raw)
+		for _, rawRole := range f.Roles {
+			role, err := ParseRole(rawRole)
 			if err != nil {
-				return nil, fmt.Errorf("opauth: entry %d (%s) in %s: %w", i, f.Name, path, err)
+				return nil, time.Time{}, 0, fmt.Errorf("opauth: entry %d (%s) in %s: %w", i, f.Name, path, err)
 			}
 			roles = append(roles, role)
 		}
-		operators[f.Token] = Operator{Name: f.Name, Roles: roles}
+
+		op := Operator{Name: f.Name, Roles: roles}
+		if f.ExpiresAt != "" {
+			exp, err := time.Parse(time.RFC3339, f.ExpiresAt)
+			if err != nil {
+				return nil, time.Time{}, 0, fmt.Errorf("opauth: entry %d (%s) in %s has an expires_at that is not RFC3339 (want e.g. 2026-12-31T23:59:59Z): %w", i, f.Name, path, err)
+			}
+			op.ExpiresAt = &exp
+		}
+		operators[f.Token] = op
 	}
-	return NewStaticStoreWithOperators(operators), nil
+	return NewStaticStoreWithOperators(operators), info.ModTime(), info.Size(), nil
 }
 
 // FromEnvEnforced is FromEnv with the deployment posture inverted:

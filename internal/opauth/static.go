@@ -1,6 +1,9 @@
 package opauth
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // StaticStore is the reference (and, for now, only) Store
 // implementation: a fixed map of token digest to Operator built once
@@ -51,6 +54,13 @@ func (s *StaticStore) Verify(_ context.Context, token string) (Operator, error) 
 	// digests doesn't have that shape or that risk.
 	op, ok := s.byDigest[hashToken(token)]
 	if !ok {
+		return Operator{}, ErrInvalidToken
+	}
+	if op.Expired(time.Now()) {
+		// Collapsed into the same error as an unknown token, same
+		// reasoning ErrInvalidToken's own doc comment gives: a caller
+		// probing which specific reason a token failed gets no signal
+		// to work with.
 		return Operator{}, ErrInvalidToken
 	}
 	return op, nil
