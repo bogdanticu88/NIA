@@ -37,12 +37,13 @@ import (
 // catches it without trusting anything the application that originally
 // wrote the events claims, it only trusts the stored data and
 // recomputes from there. Closing the "privileged rewrite" gap needs an
-// external anchor the database itself can't rewrite: a periodic signed
-// checkpoint published somewhere else, or WORM storage for the table.
-// Neither exists yet. Chained (below) is deliberately the narrow
-// interface a future checkpoint mechanism would need (read the current
-// chain state), so adding one later doesn't mean redesigning this API,
-// only adding a second consumer of it.
+// external anchor the database itself can't rewrite, and that is
+// checkpoint.go: a signed statement that at some moment the tip was a
+// particular hash at a particular sequence number, with the signing key
+// deliberately kept out of the audit database, so rewriting history
+// also requires forging a signature the rewriter cannot produce.
+// Chained (below) is the interface that mechanism reads through, which
+// is why it was worth keeping narrow.
 
 // GenesisHash is the defined prev_hash for the first event in a chain,
 // a fixed, documented value rather than an empty string or a nil

@@ -44,6 +44,8 @@ Usage:
   niactl restore -ref <agent_ref> [-operator <name>]
   niactl audit [-ref <agent_ref>] [-limit <n>]
   niactl audit verify
+  niactl audit checkpoint
+  niactl audit checkpoints
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
   niactl credential list -ref <agent_ref>
   niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
@@ -78,6 +80,15 @@ or reordered. This proves the trail wasn't tampered with after the
 fact, it does not by itself stop someone with direct database access
 from rewriting both the events and the chain together, see that
 package's own doc comment for the full reasoning.
+
+audit checkpoint signs the chain's current tip and stores the
+signature; audit checkpoints lists what has been anchored so far. A
+hash chain catches an attacker who rewrites part of it, a checkpoint
+catches one who rewrites all of it consistently, because a rewritten
+chain is still a valid chain over the wrong events and only a signature
+made with a key that isn't in the database can tell the difference.
+Archive the output of audit checkpoints somewhere the audit database
+cannot reach, that's what makes the anchor worth having.
 
 agent inspect is the one command that composes several endpoints into a
 single report: identity, credentials, grants, the most recent audit
@@ -431,6 +442,21 @@ func cmdKill(args []string) {
 func cmdAudit(args []string) {
 	if len(args) > 0 && args[0] == "verify" {
 		get("/audit/verify")
+		return
+	}
+	// audit checkpoint signs the chain's current tip and stores the
+	// signature, which is what turns a tamper-evident trail into an
+	// anchored one: a rewrite that recomputes every hash consistently
+	// verifies clean against itself and cannot produce a matching
+	// signature without the key. audit checkpoints lists what has been
+	// anchored, so an operator can archive them somewhere the audit
+	// database cannot reach, see internal/audit/checkpoint.go.
+	if len(args) > 0 && args[0] == "checkpoint" {
+		post("/audit/checkpoint", nil)
+		return
+	}
+	if len(args) > 0 && args[0] == "checkpoints" {
+		get("/audit/checkpoint")
 		return
 	}
 

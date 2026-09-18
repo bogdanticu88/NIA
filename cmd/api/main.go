@@ -46,6 +46,12 @@ type server struct {
 	graph     graph.Graph
 	sensitive sensitivity.Classifier // optional, nil means blast-radius severity never sees anything above public, see handleBlastRadius
 	opStore   opauth.Store           // optional, nil means operator authentication is off, see opauth.go and opauth.FromEnv's own doc comment
+	// checkpointer is nil when NIA_AUDIT_CHECKPOINT_KEY is unset, which
+	// means the audit trail is tamper evident but unanchored: a rewrite
+	// that recomputes every hash consistently verifies clean. See
+	// internal/audit/checkpoint.go.
+	checkpointer    *audit.Checkpointer
+	checkpointStore audit.CheckpointStore
 	// limiter bounds requests per client address, applied in front of
 	// everything including authentication, see routes(). A flood of
 	// unauthenticated requests is the case it exists for: each one costs
@@ -188,6 +194,24 @@ func newServer(ctx context.Context) (*server, error) {
 	// depends on it (handleGetAgent reads kill state live from the
 	// policy client), but an inventory that disagrees with itself is
 	// not a property a control plane gets to have.
+	// audit.CheckpointerFromEnv: unset key means a nil Checkpointer, and
+	// every method on it answers ErrNoCheckpointKey, so the handlers can
+	// hold it unconditionally rather than guarding each call.
+	checkpointer, err := audit.CheckpointerFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	checkpointStore, durableCheckpoints, err := audit.CheckpointStoreFromEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	switch {
+	case !checkpointer.Configured():
+		log.Printf("nia-api: NIA_AUDIT_CHECKPOINT_KEY is not set, the audit trail is tamper evident but unanchored, a rewrite that recomputes every hash consistently would verify clean")
+	case !durableCheckpoints:
+		log.Printf("nia-api: audit checkpoints are signed but kept in memory and will not survive a restart, set NIA_AUDIT_DATABASE_URL to keep them")
+	}
+
 	agents, sharedRegistry, err := registry.FromEnv(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
@@ -196,16 +220,18 @@ func newServer(ctx context.Context) (*server, error) {
 		log.Printf("nia-api: the agent inventory is process-local, set NIA_REGISTRY_DATABASE_URL to share it across replicas")
 	}
 	s := &server{
-		limiter:        rateCfg.PerClient(),
-		trustForwarded: rateCfg.TrustForwardedFor,
-		agents:         agents,
-		toolCat:        tools.NewInMemoryCatalog(),
-		creds:          creds,
-		pol:            pol,
-		auditLog:       auditLog,
-		graph:          graph.NewInMemoryGraph(),
-		sensitive:      sensitive,
-		opStore:        opStore,
+		limiter:         rateCfg.PerClient(),
+		trustForwarded:  rateCfg.TrustForwardedFor,
+		agents:          agents,
+		toolCat:         tools.NewInMemoryCatalog(),
+		creds:           creds,
+		pol:             pol,
+		auditLog:        auditLog,
+		graph:           graph.NewInMemoryGraph(),
+		sensitive:       sensitive,
+		opStore:         opStore,
+		checkpointer:    checkpointer,
+		checkpointStore: checkpointStore,
 	}
 	reg := metrics.NewRegistry()
 	s.metrics = newServerMetrics(reg, s)
@@ -1551,12 +1577,94 @@ func (s *server) handleVerifyAudit(w http.ResponseWriter, r *http.Request) {
 		niahttp.WriteError(w, http.StatusNotImplemented, "this audit backend does not support chain verification")
 		return
 	}
-	result, err := audit.Verify(r.Context(), chained)
+	ctx := r.Context()
+
+	// When checkpointing is configured and something has been anchored,
+	// verify against it too. That is the only check that can catch a
+	// consistent rewrite: the chain walk below would report clean either
+	// way, because a rewritten chain is a valid chain over the wrong
+	// events.
+	if s.checkpointer.Configured() {
+		cp, err := s.checkpointStore.Latest(ctx)
+		switch {
+		case err == nil:
+			out, err := s.checkpointer.VerifyAgainst(ctx, chained, cp)
+			if err != nil {
+				niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			niahttp.WriteJSON(w, http.StatusOK, out)
+			return
+		case errors.Is(err, audit.ErrNoCheckpoints):
+			// Configured but nothing anchored yet. Fall through to the
+			// plain chain check: a deployment that has never taken a
+			// checkpoint is not broken.
+		default:
+			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	result, err := audit.Verify(ctx, chained)
 	if err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	niahttp.WriteJSON(w, http.StatusOK, result)
+}
+
+// handleCreateCheckpoint signs the audit chain's current tip and stores
+// the result. A write rather than a read: it changes what the deployment
+// can later prove, and an operator with only read access should not be
+// able to plant anchors.
+func (s *server) handleCreateCheckpoint(w http.ResponseWriter, r *http.Request) {
+	chained, ok := s.auditLog.(audit.Chained)
+	if !ok {
+		niahttp.WriteError(w, http.StatusNotImplemented, "this audit backend does not support chain verification")
+		return
+	}
+	if !s.checkpointer.Configured() {
+		niahttp.WriteError(w, http.StatusNotImplemented, "no audit checkpoint signing key is configured, set NIA_AUDIT_CHECKPOINT_KEY")
+		return
+	}
+
+	ctx := r.Context()
+	cp, result, err := s.checkpointer.Create(ctx, chained)
+	if err != nil {
+		// A chain that does not verify is a 409 rather than a 500: the
+		// request was well formed and the refusal is a finding about the
+		// data, not a failure of this process. Signing a broken chain
+		// would later read as proof the damage was legitimate history.
+		if !result.OK {
+			niahttp.WriteJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "verify": result})
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.checkpointStore.Save(ctx, cp); err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(ctx, audit.Event{
+		Action:   "audit.checkpoint_created",
+		Operator: resolveOperator(ctx, ""),
+		Detail:   fmt.Sprintf("seq=%d hash=%s", cp.Seq, cp.Hash),
+		At:       time.Now(),
+	})
+	niahttp.WriteJSON(w, http.StatusCreated, cp)
+}
+
+// handleListCheckpoints returns recent checkpoints so an operator can
+// archive them somewhere the audit database cannot reach, which is the
+// only way the anchor survives an attacker who owns that database.
+func (s *server) handleListCheckpoints(w http.ResponseWriter, r *http.Request) {
+	list, err := s.checkpointStore.List(r.Context(), 50)
+	if err != nil {
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	niahttp.WriteJSON(w, http.StatusOK, list)
 }
 
 func (s *server) routes() http.Handler {
@@ -1598,6 +1706,8 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /audit", read(s.handleRecentAudit))
 	mux.Handle("GET /agents/{ref}/audit", read(s.handleAgentAudit))
 	mux.Handle("GET /audit/verify", read(s.handleVerifyAudit))
+	mux.Handle("POST /audit/checkpoint", write(s.handleCreateCheckpoint))
+	mux.Handle("GET /audit/checkpoint", read(s.handleListCheckpoints))
 	mux.Handle("POST /graph/nodes", write(s.handleAddGraphNode))
 	mux.Handle("POST /graph/edges", write(s.handleAddGraphEdge))
 	mux.Handle("GET /graph/{id}/neighbors", read(s.handleGraphNeighbors))

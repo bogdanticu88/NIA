@@ -66,6 +66,26 @@
 # actually share the table rather than each keeping its own history.
 # See README.md's Status section for the full sequence.
 #
+# NIA_AUDIT_CHECKPOINT_KEY anchors the audit trail. Hash chaining
+# catches an attacker who rewrites part of it; it cannot catch one who
+# rewrites all of it consistently, because a rewritten chain is a valid
+# chain over the wrong events and verifies clean. A checkpoint is a
+# signed statement that at some moment the tip was a particular hash, so
+# rewriting history also requires forging a signature.
+#
+# Deliberately not set here, and this is the one variable in this file
+# where the default being off is the honest choice rather than a
+# convenience: the whole mechanism depends on the key living somewhere
+# the audit database does not, and a key committed into the compose file
+# next to the database credentials would be theatre. Generate one
+# (`openssl rand -base64 32`), put it in the same `.env` as the JWT
+# signing key, and add it to nia-api's environment below.
+#
+# Checkpoints themselves are stored in the audit database, so an
+# attacker with write access there can delete them but cannot forge one.
+# Export them with `niactl audit checkpoints` and keep them somewhere
+# else if that matters for your threat model.
+#
 # NIA_TOOLS_API_URL points nia-gateway at nia-api's own catalog
 # endpoint (GET /tools/{name}) so the gateway rejects a call to a tool
 # nobody registered before it ever reaches the policy check, see

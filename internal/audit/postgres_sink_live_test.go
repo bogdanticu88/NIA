@@ -441,3 +441,124 @@ func TestPostgresSink_ChainLive_VerifyDuringConcurrentAppendsIsNeverAFalseBreak(
 	close(stop)
 	<-done
 }
+
+// TestPostgresCheckpointStore_Live covers the durable half of the
+// anchor: a checkpoint that dies with the process anchors nothing.
+func TestPostgresCheckpointStore_Live(t *testing.T) {
+	dsn := os.Getenv("NIA_AUDIT_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("NIA_AUDIT_TEST_DATABASE_URL not set, skipping live Postgres test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store, err := NewPostgresCheckpointStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPostgresCheckpointStore: %v", err)
+	}
+	defer store.Close()
+
+	cp := Checkpoint{Seq: time.Now().UnixNano(), Hash: "abc123", CreatedAt: time.Now(), Signature: "sig"}
+	t.Cleanup(func() {
+		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM audit_checkpoints WHERE seq = $1`, cp.Seq)
+	})
+	if err := store.Save(ctx, cp); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Read back through a second handle, standing in for a restart or a
+	// different replica.
+	second, err := NewPostgresCheckpointStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("second store: %v", err)
+	}
+	defer second.Close()
+
+	latest, err := second.Latest(ctx)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if latest.Seq != cp.Seq || latest.Hash != cp.Hash || latest.Signature != cp.Signature {
+		t.Fatalf("Latest = %+v, want the checkpoint the first handle saved", latest)
+	}
+}
+
+// TestPostgresSink_ChainLive_CheckpointCatchesAConsistentRewrite is the
+// strongest form of the claim, done with real SQL against a real table.
+// The rewrite below is exactly the attack the hash chain cannot catch on
+// its own: every event replaced, every hash recomputed correctly, chain
+// state updated to match. Verify reports it intact, because it is
+// intact. Only the signed checkpoint knows it is a different history.
+func TestPostgresSink_ChainLive_CheckpointCatchesAConsistentRewrite(t *testing.T) {
+	sink, ctx := liveChainSink(t)
+	agentRef := liveChainAgentRef(t)
+	seqs := appendLiveChain(t, ctx, sink, agentRef, 3)
+
+	cpr, err := NewCheckpointer([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("NewCheckpointer: %v", err)
+	}
+	cp, result, err := cpr.Create(ctx, sink)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("the chain did not verify before checkpointing: %+v", result)
+	}
+
+	// Rewrite the middle event and recompute the rest of the chain the
+	// way an attacker with write access would, so nothing is internally
+	// inconsistent afterwards.
+	var prevHash string
+	if err := sink.db.QueryRowContext(ctx, `SELECT prev_hash FROM audit_events WHERE id = $1`, seqs[1]).Scan(&prevHash); err != nil {
+		t.Fatalf("reading prev_hash: %v", err)
+	}
+	var at time.Time
+	if err := sink.db.QueryRowContext(ctx, `SELECT at FROM audit_events WHERE id = $1`, seqs[1]).Scan(&at); err != nil {
+		t.Fatalf("reading at: %v", err)
+	}
+
+	forged := Event{Action: "gateway.allowed", AgentRef: agentRef, Operator: agentRef, Detail: "forged, this call never happened", At: at}
+	forgedHash := chainHash(forged, prevHash)
+	if _, err := sink.db.ExecContext(ctx,
+		`UPDATE audit_events SET detail = $1, hash = $2 WHERE id = $3`, forged.Detail, forgedHash, seqs[1],
+	); err != nil {
+		t.Fatalf("rewriting the event: %v", err)
+	}
+
+	// Relink the event after it, and the chain state, so everything is
+	// consistent again.
+	var third ChainedEvent
+	if err := sink.db.QueryRowContext(ctx,
+		`SELECT action, agent_ref, operator, incident, detail, at FROM audit_events WHERE id = $1`, seqs[2],
+	).Scan(&third.Action, &third.AgentRef, &third.Operator, &third.Incident, &third.Detail, &third.At); err != nil {
+		t.Fatalf("reading the third event: %v", err)
+	}
+	thirdHash := chainHash(third.Event, forgedHash)
+	if _, err := sink.db.ExecContext(ctx,
+		`UPDATE audit_events SET prev_hash = $1, hash = $2 WHERE id = $3`, forgedHash, thirdHash, seqs[2],
+	); err != nil {
+		t.Fatalf("relinking the third event: %v", err)
+	}
+	if _, err := sink.db.ExecContext(ctx, `UPDATE audit_chain_state SET last_hash = $1 WHERE id = TRUE`, thirdHash); err != nil {
+		t.Fatalf("updating the chain state: %v", err)
+	}
+
+	// The chain now verifies perfectly. That is the problem.
+	plain, err := Verify(ctx, sink)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !plain.OK {
+		t.Fatalf("the rewritten chain reported breaks, this test needs a consistent rewrite: %+v", plain.Breaks)
+	}
+
+	out, err := cpr.VerifyAgainst(ctx, sink, cp)
+	if err != nil {
+		t.Fatalf("VerifyAgainst: %v", err)
+	}
+	if out.MatchesCheckpoint {
+		t.Fatal("the rewritten history matched the signed checkpoint, the anchor is not anchoring anything")
+	}
+	t.Logf("chain verified clean (OK=%v) while the checkpoint caught it: %s", plain.OK, out.CheckpointMismatch)
+}
