@@ -81,6 +81,15 @@ import (
 //     implementations should not treat "ListGrants looks empty right
 //     after a kill" as something to rely on for TesseraHTTPClient.
 //
+//     As of the gap-closing pass this is fixable from outside this
+//     client rather than only documented: wrap it in OpenFGAChecker
+//     (openfga_client.go) and Check reads live tuples from OpenFGA
+//     instead of the declared list this client can see, which is the
+//     only honest answer to "is this authorized right now." The
+//     divergence described above was reproduced against a real Tessera
+//     and a real OpenFGA before that was written, see
+//     openfga_live_test.go, it is not a theoretical concern.
+//
 //  5. agentRef and Tessera's client_ref are not the same string. NIA's
 //     own convention is a type-prefixed ref, "agent:billing-reconciler"
 //     (see identity.AgentRef.Ref), Tessera's CanonicalForm.ClientRef
@@ -120,8 +129,24 @@ const (
 	defaultTokenTTL  = 30 * time.Second
 	maxResponseBytes = 1 << 20 // 1 MiB, these are small client records, a response this large means something is wrong
 	minSigningKeyLen = 32      // matches Hs256JwtValidator's own minimum on the Tessera side
-	toolGrantPrefix  = "tool:"
-	dataGrantPrefix  = "data:"
+	// The prefixes NIA's two extra grant kinds ride into Tessera's
+	// api_group field on, see grantsToWire. The separator is '/' and
+	// cannot be ':', which is what it was until a run against a real
+	// OpenFGA caught it: Tessera's GrantTupleMapper turns an api_group
+	// value into the OpenFGA object "api_group:{value}", and OpenFGA
+	// rejects an object whose id half contains a colon, "Invalid tuple
+	// ... Reason: invalid 'object' field format". With ':' here, every
+	// onboard carrying a NIA tool or data grant failed outright against
+	// a real OpenFGA-backed Tessera, a 500 from onboard, no grant
+	// written. Nothing caught it earlier because this package's own
+	// tests run against a fake HTTP server that accepts any string, and
+	// the earlier live stack run only ever onboarded plain api_group
+	// grants.
+	//
+	// Changing this is not a data migration concern: no tuple in this
+	// shape was ever successfully stored, OpenFGA refused all of them.
+	toolGrantPrefix = "tool/"
+	dataGrantPrefix = "data/"
 )
 
 // NewTesseraHTTPClient builds a Client backed by a real Tessera.Service

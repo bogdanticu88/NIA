@@ -20,6 +20,23 @@ const (
 	envIssuer        = "NIA_TESSERA_JWT_ISSUER"
 	envAudience      = "NIA_TESSERA_JWT_AUDIENCE"
 	envSystemSubject = "NIA_TESSERA_SYSTEM_SUBJECT"
+
+	// The OpenFGA direct-check variables. Unprefixed by NIA_TESSERA_
+	// because they do not configure NIA's client of Tessera, they point
+	// NIA at the authorization store underneath it, which is a
+	// different service NIA now reads from directly, see
+	// OpenFGAChecker's own doc comment for why a hot-path Check cannot
+	// honestly be answered from Tessera's declared grant list.
+	//
+	// NIA_OPENFGA_STORE_ID is the same store id Tessera is configured
+	// with (OPENFGA_STORE_ID there), and
+	// deployments/bootstrap-openfga.sh prints it. Pointing the two at
+	// different stores is a silent misconfiguration, every Check would
+	// come back "not allowed" against an empty store and read as an
+	// ordinary denial.
+	envOpenFGAURL     = "NIA_OPENFGA_API_URL"
+	envOpenFGAStoreID = "NIA_OPENFGA_STORE_ID"
+	envOpenFGAModelID = "NIA_OPENFGA_AUTHORIZATION_MODEL_ID"
 )
 
 // defaultIssuer and defaultAudience match Tessera.Service's own Program.cs
@@ -77,7 +94,24 @@ func FromEnv() (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("policy: building the tessera client: %w", err)
 	}
-	return client, nil
+
+	// Both OpenFGA variables set means Check reads live tuples instead
+	// of Tessera's declared grant list, see OpenFGAChecker. Neither set
+	// is the previous behavior, unchanged. One set without the other is
+	// an error rather than a silent fallback: a deployment that meant
+	// to turn this on and typo'd one variable would otherwise keep the
+	// fail-open this exists to close, and never know.
+	openfgaURL := strings.TrimSpace(os.Getenv(envOpenFGAURL))
+	openfgaStore := strings.TrimSpace(os.Getenv(envOpenFGAStoreID))
+	switch {
+	case openfgaURL == "" && openfgaStore == "":
+		return client, nil
+	case openfgaURL == "":
+		return nil, fmt.Errorf("policy: %s is set but %s is not, both are required to check authorization against OpenFGA directly", envOpenFGAStoreID, envOpenFGAURL)
+	case openfgaStore == "":
+		return nil, fmt.Errorf("policy: %s is set but %s is not, both are required to check authorization against OpenFGA directly", envOpenFGAURL, envOpenFGAStoreID)
+	}
+	return NewOpenFGAChecker(client, openfgaURL, openfgaStore, strings.TrimSpace(os.Getenv(envOpenFGAModelID))), nil
 }
 
 func envOrDefault(name, def string) string {

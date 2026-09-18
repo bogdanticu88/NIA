@@ -111,6 +111,24 @@
 # services mount the same file: an operator token is one credential for
 # the control plane, not one per process.
 #
+# NIA_OPENFGA_API_URL / NIA_OPENFGA_STORE_ID make a hot-path
+# authorization check read live OpenFGA tuples instead of Tessera's
+# declared grant list, see internal/policy.OpenFGAChecker. They matter
+# because the two genuinely diverge: Tessera's kill deletes a client's
+# tuples but leaves its declared grants in place, and restore clears the
+# kill sentinel without rewriting them, so between a restore and the next
+# grant write, reading the declared list says "allowed" for something
+# OpenFGA has no tuple for. That is a fail-open, and it was confirmed
+# against this exact pair of services, not argued from source, see
+# internal/policy/openfga_live_test.go.
+#
+# The store id is the same one Tessera is configured with, which
+# bootstrap-openfga.sh already prints for TESSERA_OPENFGA_STORE_ID.
+# Pointing NIA at a different store would make every check come back
+# "not allowed" against an empty store, indistinguishable from an
+# ordinary denial, which is why FromEnv errors when only one of the two
+# variables is set rather than quietly falling back.
+#
 # NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT turn on
 # risk-based monitoring in nia-gateway, see internal/monitoring and
 # internal/risk.HistoryScorer. Deliberately not set here: turning on a
@@ -148,6 +166,8 @@ services:
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
+      NIA_OPENFGA_API_URL: "http://openfga:8080"
+      NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
@@ -155,6 +175,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      openfga:
+        condition: service_started
 
   nia-gateway:
     build:
@@ -170,6 +192,8 @@ services:
       NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_TOOLS_API_URL: "http://nia-api:8080"
       NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
+      NIA_OPENFGA_API_URL: "http://openfga:8080"
+      NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
@@ -177,6 +201,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      openfga:
+        condition: service_started
       nia-api:
         condition: service_started
 

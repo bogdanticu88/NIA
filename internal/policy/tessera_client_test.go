@@ -399,9 +399,9 @@ func TestWriteGrants_ApiGroupCollidingWithToolPrefix_IsRejected(t *testing.T) {
 		writeJSON(w, http.StatusOK, onboardResultWire{Success: true})
 	})
 
-	err := c.WriteGrants(context.Background(), "agent-1", []Grant{GrantForAPIGroup("tool:reports")})
+	err := c.WriteGrants(context.Background(), "agent-1", []Grant{GrantForAPIGroup("tool/reports")})
 	if err == nil {
-		t.Fatal("expected an error, an api_group named tool:reports would come back misread as a tool grant")
+		t.Fatal("expected an error, an api_group named tool/reports would come back misread as a tool grant")
 	}
 	if postCalled {
 		t.Fatal("onboard must never be called with a grant that would round trip as the wrong kind")
@@ -679,7 +679,7 @@ func TestGrantWireEncoding_ToolGrantUsesPrefixedApiGroupOnTheWire(t *testing.T) 
 	if err != nil {
 		t.Fatalf("grantsToWireGrants: %v", err)
 	}
-	if wire[0].ApiGroup != "tool:mcp-search" {
+	if wire[0].ApiGroup != "tool/mcp-search" {
 		t.Fatalf("expected the tool grant to be sent as a prefixed api_group so Tessera's wire format doesn't need to change, got %+v", wire[0])
 	}
 }
