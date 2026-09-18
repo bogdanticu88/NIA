@@ -9,6 +9,8 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"github.com/bogdanticu88/nia/internal/dbschema"
+
 	"github.com/bogdanticu88/nia/internal/identity"
 )
 
@@ -67,9 +69,9 @@ func NewPostgresAgentRegistry(ctx context.Context, dsn string) (*PostgresAgentRe
 		db.Close()
 		return nil, fmt.Errorf("registry: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, agentSchemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "registry", agentSchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("registry: creating agents schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)

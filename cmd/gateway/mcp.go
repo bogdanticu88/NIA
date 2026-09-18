@@ -183,14 +183,15 @@ func (g *gateway) mcpHandler() http.Handler {
 		}
 
 		// One audit line per authenticated MCP request, written here
-		// rather than in the protocol middleware because the SDK
-		// negotiates initialize internally and never surfaces it to a
-		// receiving middleware, see mcpSecurityMiddleware. Without this,
-		// an agent opening a session would leave no trace at all until
-		// it called something, and "when did this agent connect" is a
-		// question an incident review actually asks. It does mean a
-		// tools/call produces this line as well as its own decision
-		// line, which is the correlation being paid for.
+		// rather than only in the protocol middleware because a request
+		// can be refused before it ever becomes a method call: a bad
+		// Mcp-Method header, a body the SDK will not decode, a method
+		// the server does not implement. Those never reach
+		// mcpSecurityMiddleware, and "an authenticated agent sent
+		// something this endpoint rejected" is a question an incident
+		// review actually asks. It does mean a tools/call produces this
+		// line as well as its own decision line, which is the
+		// correlation being paid for.
 		ctx := r.Context()
 		g.audit(ctx, "gateway.mcp_request", resolved.Ref, fmt.Sprintf("credential=%s", resolved.CredentialID))
 
@@ -247,24 +248,32 @@ func (g *gateway) mcpSecurityMiddleware(next mcp.MethodHandler) mcp.MethodHandle
 		case "initialize":
 			// Version and capability negotiation are the SDK's, and
 			// correctly so: they are protocol mechanics, not security
-			// decisions.
+			// decisions. What is audited here is the security-relevant
+			// half, that an authenticated agent opened a session.
 			//
-			// Worth knowing rather than assuming: with this SDK the
-			// initialize handshake is handled inside the server before
-			// receiving middleware runs, so this case does not currently
-			// fire. It is kept because the security-relevant fact, that
-			// an authenticated agent opened a session, is audited at the
-			// transport layer in mcpHandler instead, and because a
-			// future SDK version routing initialize through middleware
-			// should audit here rather than silently do nothing.
+			// This case fires for clients speaking 2025-11-25 or older.
+			// From 2026-07-28 initialize is deprecated and the handshake
+			// is server/discover, which lands in the default branch
+			// below and is audited there by name. Verified against a
+			// running gateway both ways rather than inferred: a
+			// 2025-06-18 initialize produced gateway.mcp_initialize, a
+			// 2026-07-28 server/discover produced gateway.mcp_method
+			// with method=server/discover.
 			g.audit(ctx, "gateway.mcp_initialize", resolved.Ref, fmt.Sprintf("credential=%s", resolved.CredentialID))
 			return next(ctx, method, req)
 		default:
-			// Notifications and everything else the SDK handles. Audited
-			// at a lower level of detail because they carry no side
-			// effect on the downstream: this endpoint only ever forwards
-			// tools/list and tools/call, so an unrecognised method
-			// cannot become a downstream action by passing through here.
+			// server/discover, notifications, and everything else the
+			// SDK handles. Audited at a lower level of detail because
+			// none of it reaches the downstream: this endpoint only ever
+			// forwards tools/list and tools/call, so a method arriving
+			// here cannot become a downstream action by passing through.
+			//
+			// It can still be answered locally by the SDK, which is a
+			// smaller thing but not nothing: resources/list and
+			// prompts/list return empty, and subscriptions/listen holds
+			// an SSE stream open for as long as the client keeps it.
+			// See docs/MCP.md for what that means and why the surface is
+			// not narrowed here.
 			g.audit(ctx, "gateway.mcp_method", resolved.Ref, fmt.Sprintf("method=%s credential=%s", method, resolved.CredentialID))
 			return next(ctx, method, req)
 		}

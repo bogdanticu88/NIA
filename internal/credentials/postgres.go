@@ -8,6 +8,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // schemaSQL creates the one table PostgresStore needs, same
@@ -84,9 +86,9 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("credentials: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "credentials", schemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("credentials: creating credentials schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)

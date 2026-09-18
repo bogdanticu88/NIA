@@ -7,6 +7,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // schemaSQL creates the one table PostgresSink needs if it isn't there
@@ -117,13 +119,9 @@ func NewPostgresSink(ctx context.Context, dsn string) (*PostgresSink, error) {
 		db.Close()
 		return nil, fmt.Errorf("audit: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "audit", schemaSQL, chainSchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("audit: creating audit_events schema: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, chainSchemaSQL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("audit: creating audit chain schema: %w", err)
+		return nil, err
 	}
 	// Seed the singleton chain-state row with GenesisHash if this is
 	// the very first time this feature has run against this database,

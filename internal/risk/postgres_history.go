@@ -8,6 +8,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // historySchemaSQL creates the four tables PostgresCallHistory needs,
@@ -99,9 +101,9 @@ func NewPostgresCallHistory(ctx context.Context, dsn string) (*PostgresCallHisto
 		db.Close()
 		return nil, fmt.Errorf("risk: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, historySchemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "risk", historySchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("risk: creating call history schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)

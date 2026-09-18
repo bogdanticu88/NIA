@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // CheckpointStore is where signed checkpoints are kept so a later
@@ -96,9 +98,9 @@ func NewPostgresCheckpointStore(ctx context.Context, dsn string) (*PostgresCheck
 		db.Close()
 		return nil, fmt.Errorf("audit: postgres unreachable for checkpoints: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, checkpointSchemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "audit", checkpointSchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("audit: creating audit_checkpoints schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)

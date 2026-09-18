@@ -11,6 +11,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // incidentSchemaSQL creates the one table PostgresStore needs, same
@@ -66,9 +68,9 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("incident: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, incidentSchemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "incident", incidentSchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("incident: creating incidents schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)

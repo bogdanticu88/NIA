@@ -7,6 +7,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"github.com/bogdanticu88/nia/internal/dbschema"
 )
 
 // riskSchemaSQL creates the one table PostgresRiskStore needs, same
@@ -77,9 +79,9 @@ func NewPostgresRiskStore(ctx context.Context, dsn string) (*PostgresRiskStore, 
 		db.Close()
 		return nil, fmt.Errorf("monitoring: postgres unreachable: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, riskSchemaSQL); err != nil {
+	if err := dbschema.Apply(ctx, db, "monitoring", riskSchemaSQL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("monitoring: creating risk_state schema: %w", err)
+		return nil, err
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)
