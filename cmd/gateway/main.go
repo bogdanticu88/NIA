@@ -793,6 +793,7 @@ func main() {
 	var scorer risk.Scorer
 	var monitor *monitoring.Monitor
 	var incidents incident.Store
+	var sharedIncidents bool
 	thresholds, monitoringConfigured, err := monitoring.ThresholdsFromEnv()
 	if err != nil {
 		log.Fatalf("nia-gateway: %v", err)
@@ -840,8 +841,19 @@ func main() {
 		} else {
 			log.Printf("nia-gateway: rate detection is off, set NIA_RISK_RATE_WINDOW and NIA_RISK_RATE_THRESHOLD to enable the call_rate signal")
 		}
+		// incident.FromEnv: NIA_INCIDENT_DATABASE_URL unset means these
+		// records live in a map that dies with the process, which is a
+		// strange place to keep the evidence an incident review starts
+		// from. Set it and a kill's risk value, signals and cumulative
+		// total survive a restart and are visible from every replica.
+		incidents, sharedIncidents, err = incident.FromEnv(context.Background())
+		if err != nil {
+			log.Fatalf("nia-gateway: %v", err)
+		}
+		if !sharedIncidents {
+			log.Printf("nia-gateway: incident records are process-local and lost on restart, set NIA_INCIDENT_DATABASE_URL to keep them")
+		}
 		scorer = risk.NewHistoryScorerWithHistory(toolCat, sensitive, risk.DefaultWeights(), callHistory, rateWindow, rateThreshold)
-		incidents = incident.NewInMemoryStore()
 		monitor = monitoring.NewMonitorWithRiskStore(thresholds, pol, creds, incidents, auditLog, riskStore)
 	}
 

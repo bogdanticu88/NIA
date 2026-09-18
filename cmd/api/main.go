@@ -173,10 +173,23 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
+	// registry.FromEnv: NIA_REGISTRY_DATABASE_URL unset means the agent
+	// inventory is this process's own map, so a second replica returns
+	// 404 for an agent this one registered. No authorization decision
+	// depends on it (handleGetAgent reads kill state live from the
+	// policy client), but an inventory that disagrees with itself is
+	// not a property a control plane gets to have.
+	agents, sharedRegistry, err := registry.FromEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	if !sharedRegistry {
+		log.Printf("nia-api: the agent inventory is process-local, set NIA_REGISTRY_DATABASE_URL to share it across replicas")
+	}
 	s := &server{
 		limiter:        rateCfg.PerClient(),
 		trustForwarded: rateCfg.TrustForwardedFor,
-		agents:         registry.NewInMemoryAgentRegistry(),
+		agents:         agents,
 		toolCat:        tools.NewInMemoryCatalog(),
 		creds:          creds,
 		pol:            pol,

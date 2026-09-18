@@ -140,6 +140,27 @@
 # had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
 #
+# NIA_REGISTRY_DATABASE_URL and NIA_INCIDENT_DATABASE_URL, same
+# postgres and database as the others, their own tables (agents, and
+# incidents, see internal/registry/postgres.go and
+# internal/incident/postgres.go). These were the last two stores still
+# keeping state in a process-local map.
+#
+# The registry one is an inventory problem rather than an enforcement
+# one: no authorization decision reads it, GET /agents/{ref} checks kill
+# state live against the policy client. But without it a second nia-api
+# replica answers 404 for an agent the first registered, and `niactl
+# list` shows a different inventory depending on which replica answers.
+#
+# The incident one matters more than its size suggests. An incident
+# record is the evidence for why NIA killed or revoked an agent, the
+# risk value, the signals and the cumulative total that triggered it,
+# and in a map it died with the process, leaving only the audit line
+# saying containment happened. nia-gateway is the process that writes
+# them, nia-api does not need this variable, but both are set below so
+# the two do not drift apart if a future endpoint reads incidents from
+# the control plane side.
+#
 # Rate limiting is on by default in both services and needs no
 # configuration here, which is why no NIA_RATE_LIMIT_* variable appears
 # below. 50 requests per second per client address (burst 100) and, in
@@ -203,6 +224,8 @@ services:
       NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
       NIA_OPENFGA_API_URL: "http://openfga:8080"
       NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
+      NIA_REGISTRY_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_INCIDENT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
@@ -229,6 +252,8 @@ services:
       NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
       NIA_OPENFGA_API_URL: "http://openfga:8080"
       NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
+      NIA_REGISTRY_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_INCIDENT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
