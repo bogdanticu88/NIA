@@ -166,5 +166,5 @@ var (
 // aspirational, both processes read and write the same table instead
 // of each keeping its own in-memory history. Wiring that in is
 // deployment configuration, not code, see docker-compose.yml and
-// README.md's Status section for what's actually been run against a
+// CHANGELOG.md for what's actually been run against a
 // real instance.

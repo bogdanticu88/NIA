@@ -33,8 +33,10 @@ behind a decision, not just what the code does. When something is a known
 gap or hasn't been verified yet, say so plainly rather than implying it
 works.
 
-The README's Status section has conventions of its own, and they matter
-because that list is the honest record of what has actually been done.
+`CHANGELOG.md` has conventions of its own, and they matter because that
+log is the honest record of what has actually been done. It used to live
+in the README's Status section and moved out when that page got too long
+to scan; the conventions came with it unchanged.
 One entry per phase, numbered sequentially, and never two entries sharing
 a number: if a pass produced three separable pieces of work, those are
 three phases, not one phase with three bullets. The reverse is fine, a
@@ -63,11 +65,14 @@ expected to be checked out as a sibling directory (`../tessera` relative
 to this repo, see `deployments/docker-compose.yml`'s build context for
 `tessera`).
 
-Read `README.md`'s Status section first, it's kept honest and current,
-listing exactly what's been verified and how, not just what's been
-written. `docs/ARCHITECTURE.md` has the full design and the seventeen-item
-MVP-to-module map with a table of what's real versus still stubbed.
-`docs/DATA_MODEL.md` has the identity graph schema.
+Read `CHANGELOG.md` first, it's kept honest and current, listing exactly
+what's been verified and how, not just what's been written. `README.md`
+is the landing page: the hook, a real transcript, and a quickstart, with
+the detail linked rather than inlined. `docs/ARCHITECTURE.md` has the
+full design, the seventeen-item MVP-to-module map with a table of what's
+real versus still stubbed, and the distributed-state table.
+`docs/DATA_MODEL.md` has the identity graph schema. `docs/RUNNING.md`
+has the full local setup.
 
 CI runs on every push to `master` (`.github/workflows/ci.yml`): gofmt
 check, build, vet, `go test ./... -race`. The Postgres-backed audit store

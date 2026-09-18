@@ -15,7 +15,7 @@ import (
 // checked-out repo, this one expects an already-running pair: a real
 // Tessera.Service and the real OpenFGA instance it is configured
 // against. Both are easiest to get from containers, see the README's
-// Status section for the exact commands this was run with.
+// CHANGELOG.md for the exact commands this was run with.
 //
 // Four variables, all required, all skipped-not-failed when absent, the
 // same posture every other live test in this repo takes:

@@ -64,7 +64,7 @@
 # it, killed it, then read nia-api's own audit endpoint back and saw
 # all three events together, in order, proof the two processes
 # actually share the table rather than each keeping its own history.
-# See README.md's Status section for the full sequence.
+# See CHANGELOG.md for the full sequence.
 #
 # NIA_AUDIT_CHECKPOINT_KEY anchors the audit trail. Hash chaining
 # catches an attacker who rewrites part of it; it cannot catch one who

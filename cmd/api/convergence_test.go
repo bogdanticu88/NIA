@@ -33,7 +33,7 @@ func TestHandleGetAgent_ReportsKilledFromTheLiveSentinelEvenWhenTheRegistryCache
 	// runs inside cmd/gateway, a different process, and has no path to
 	// call handleKill or update this process's own AgentRegistry.State.
 	// This is the exact scenario the phase 8 demo surfaced as a real
-	// gap, see README.md's Status section.
+	// gap, see CHANGELOG.md.
 	if _, err := s.pol.Kill(context.Background(), "agent:billing", "INC-AUTO", "monitoring"); err != nil {
 		t.Fatalf("pol.Kill: %v", err)
 	}
