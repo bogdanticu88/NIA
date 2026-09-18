@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bogdanticu88/nia/internal/audit"
@@ -273,13 +274,67 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusCreated, agent)
 }
 
+// listKillCheckConcurrency bounds how many live kill-sentinel checks run
+// at once. Each one is an HTTP round trip to Tessera when a real policy
+// client is configured, so an unbounded fan-out over a large inventory
+// would be a self-inflicted load spike against the policy engine, and a
+// serial loop would make the endpoint unusably slow for the same
+// inventory. Eight is enough to keep the wall time close to a single
+// round trip for a realistic agent population without being a burst
+// anything would notice.
+const listKillCheckConcurrency = 8
+
 func (s *server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	agents, err := s.agents.List(r.Context())
+	ctx := r.Context()
+	agents, err := s.agents.List(ctx)
 	if err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	niahttp.WriteJSON(w, http.StatusOK, agents)
+
+	// The registry's State field is a cache, updated by handleKill,
+	// handleRestore and handleRegisterAgent. It goes stale for exactly
+	// the case that matters most: cmd/gateway's automatic, risk-triggered
+	// kills go through internal/policy directly and never touch this
+	// process's registry, so an agent that monitoring killed an hour ago
+	// still listed here as active.
+	//
+	// handleGetAgent has always read the live sentinel for one agent.
+	// This endpoint did not, so the same control plane gave two
+	// different answers about the same agent depending on which way you
+	// asked, and the wrong one was the one an operator scanning a list
+	// during an incident would see. Both report the same shape now.
+	reports := make([]agentReport, len(agents))
+	sem := make(chan struct{}, listKillCheckConcurrency)
+	var wg sync.WaitGroup
+	for i, agent := range agents {
+		reports[i] = agentReport{AgentRef: agent, EffectiveState: agent.State}
+		wg.Add(1)
+		go func(i int, ref string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			killed, err := s.pol.IsKilled(ctx, ref)
+			if err != nil {
+				// Same posture as handleGetAgent: a failed check leaves
+				// KillSentinelChecked false and the cached state showing,
+				// rather than guessing in either direction. A caller can
+				// tell "this is confirmed live" from "this is what the
+				// registry last recorded" by reading that field, which is
+				// the whole reason it is on the wire.
+				log.Printf("nia-api: live kill-sentinel check failed for %s during list: %v", ref, err)
+				return
+			}
+			reports[i].KillSentinelChecked = true
+			if killed {
+				reports[i].EffectiveState = identity.StateKilled
+			}
+		}(i, agent.Ref)
+	}
+	wg.Wait()
+
+	niahttp.WriteJSON(w, http.StatusOK, reports)
 }
 
 // handleGetAgent looks up one agent's identity record. Everything else

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/bogdanticu88/nia/internal/credentials"
 	"github.com/bogdanticu88/nia/internal/identity"
+	"github.com/bogdanticu88/nia/internal/policy"
 )
 
 // This file exercises the two convergence fixes the security hardening
@@ -157,3 +159,106 @@ func TestHandleRestore_RequiresAgentRef(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for a missing agent_ref: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestHandleListAgents_ReportsKilledFromTheLiveSentinelEvenWhenTheRegistryCacheLags
+// is the same property for the list endpoint, which did not have it. The
+// control plane used to give two different answers about the same agent
+// depending on which way you asked, and the wrong one was the one an
+// operator scanning a list during an incident would see.
+func TestHandleListAgents_ReportsKilledFromTheLiveSentinelEvenWhenTheRegistryCacheLags(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+
+	for _, ref := range []string{"agent:billing", "agent:payroll"} {
+		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents",
+			strings.NewReader(`{"ref":"`+ref+`","owner":"bogdan"}`)))
+	}
+
+	// Killed through s.pol directly, the shape an automatic kill from
+	// cmd/gateway's monitoring takes: a different process, no path to
+	// this one's registry cache.
+	if _, err := s.pol.Kill(context.Background(), "agent:billing", "INC-AUTO", "monitoring"); err != nil {
+		t.Fatalf("pol.Kill: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var reports []agentReport
+	if err := json.NewDecoder(rec.Body).Decode(&reports); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if len(reports) != 2 {
+		t.Fatalf("got %d agents, want 2", len(reports))
+	}
+
+	byRef := map[string]agentReport{}
+	for _, r := range reports {
+		byRef[r.Ref] = r
+	}
+
+	killed, ok := byRef["agent:billing"]
+	if !ok {
+		t.Fatalf("agent:billing missing from the list: %+v", reports)
+	}
+	if killed.State != identity.StateActive {
+		t.Fatalf("registry State = %q, want this test to prove the cache genuinely never saw the kill", killed.State)
+	}
+	if !killed.KillSentinelChecked {
+		t.Fatal("KillSentinelChecked = false for the killed agent, want true")
+	}
+	if killed.EffectiveState != identity.StateKilled {
+		t.Fatalf("EffectiveState = %q for the killed agent, want killed", killed.EffectiveState)
+	}
+
+	alive, ok := byRef["agent:payroll"]
+	if !ok {
+		t.Fatalf("agent:payroll missing from the list: %+v", reports)
+	}
+	if alive.EffectiveState != identity.StateActive {
+		t.Fatalf("EffectiveState = %q for the untouched agent, want active: the kill must not smear across the list", alive.EffectiveState)
+	}
+}
+
+// TestHandleListAgents_ReportsUncheckedWhenTheLiveCheckFails keeps the
+// honest half: a failed check leaves the cached state showing and says
+// so, rather than guessing in either direction.
+func TestHandleListAgents_ReportsUncheckedWhenTheLiveCheckFails(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents",
+		strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	s.pol = failingKillCheckClient{Client: s.pol}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 even when the live check fails: %s", rec.Code, rec.Body.String())
+	}
+	var reports []agentReport
+	if err := json.NewDecoder(rec.Body).Decode(&reports); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d agents, want 1", len(reports))
+	}
+	if reports[0].KillSentinelChecked {
+		t.Fatal("KillSentinelChecked = true after the check failed")
+	}
+	if reports[0].EffectiveState != identity.StateActive {
+		t.Fatalf("EffectiveState = %q, want the cached state when the live check could not answer", reports[0].EffectiveState)
+	}
+}
+
+type failingKillCheckClient struct {
+	policy.Client
+}
+
+func (failingKillCheckClient) IsKilled(context.Context, string) (bool, error) {
+	return false, errKillCheckDown
+}
+
+var errKillCheckDown = errors.New("policy engine unreachable")
