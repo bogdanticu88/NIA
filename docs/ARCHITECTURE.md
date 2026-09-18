@@ -242,6 +242,20 @@ Verified two ways. `cmd/gateway/distributed_test.go` builds two independent `*ga
 
 * * *
 
+### Runtime detection: volume and ordering
+
+Every risk signal before the gap-closing pass judged one call on its own. `novel_tool` asked whether the agent had ever called this tool, `risk_class` asked how destructive the tool is, `sensitive_resource` asked what the arguments touched. None of them could see a pattern across calls, which meant the whole category docs/THREAT_MODEL.md's threat 10 describes, an agent going fast or going in a strange order, was invisible: a compromised agent working through tools it was already allowed to call, at whatever speed it liked, scored zero.
+
+Two signals close that, both fed by `risk.CallHistory` rather than by anything the scorer keeps itself.
+
+`call_rate` fires when an agent's call count inside a window crosses a threshold. Flat weight per call over the line, not something that scales with how far over: the score feeds a cumulative total that can kill an agent, and a scaling term compounds into a kill nobody can explain afterwards. Both `NIA_RISK_RATE_WINDOW` and `NIA_RISK_RATE_THRESHOLD` have to be set or neither, and there is no default, because a threshold nobody chose for their own traffic either never fires or fires on everything.
+
+`novel_transition` fires when an agent goes from one tool straight to another in an order it has never used. This is the one that catches what rate alone misses: familiar tools, ordinary speed, unfamiliar sequence. It is deliberately one step deep, the immediately preceding tool, not a model of the agent's whole call graph, and a repeat of the same tool does not count, because calling one tool twice in a row is the most ordinary thing an agent does and counting it would fire on essentially every agent's second call. An agent hammering one tool is a volume signal, and `call_rate` is what covers it.
+
+Where that history lives is a deployment choice with a real consequence. `InMemoryCallHistory` is the default, per process and lost on restart. `PostgresCallHistory` (`NIA_RISK_HISTORY_DATABASE_URL`) is shared, and it is the other half of the work `internal/monitoring.PostgresRiskStore` started: that one made the cumulative total shared, this one makes the signals the total is built from shared. With several replicas and only the first, the same tool scores `novel_tool` once per replica and every restart makes the whole catalog novel again, so a correctly shared total is fed by inputs that are neither shared nor stable. Verified against a real Postgres with two independent store handles standing in for two replicas, see invariant 22.
+
+What this is not: a rate limiter. Nothing here refuses a request because it arrived too fast. A burst is detected, scored, and accumulated toward containment, which is a different guarantee, and worth not conflating with prevention. It is also not baselining: the window is a flat count, "more than N," not "unusual for this agent specifically," which is the harder thing CENTIPEDE's own detection logic is meant to bring when it becomes a `Scorer` here.
+
 ### Structured incident evidence
 
 `internal/audit` answers "what happened": a chronological line per decision, `gateway.denied`, `monitoring.kill`, tied together only by an operator-supplied free-text `Incident` string if one was even passed. `internal/incident` answers a narrower, more specific question: for one containment decision, what triggered it, exactly. Every time `internal/monitoring.Monitor.Observe` flags, revokes, or kills, and an `incident.Store` is configured, it also creates one `Incident` record: the agent, the correlator string (the same one that ends up in the audit event's `Incident` field), the action taken, the risk value of the call that tipped it over, the cumulative total at that moment, the exact signals that made up the score, and the reason string. One record per decision, not a description reconstructed later by grepping the audit trail for lines that happen to share an incident string.

@@ -158,15 +158,15 @@ An attacker with database access to the audit store, or a bug, deletes or alters
 
 A compromised agent calls tools rapidly, far outside its normal request volume, either to exfiltrate data fast before it's caught or simply to run up cost and load.
 
-**Prevent:** None. No rate limiting exists anywhere in `cmd/gateway`.
+**Prevent:** Still none in the hard sense. There is no rate limiter in `cmd/gateway`, nothing refuses a request because it arrived too fast, and a burst is not blocked at the moment it happens. What exists now is detection that feeds containment, which is a different guarantee and worth not conflating with a limiter.
 
-**Detect:** None currently. `internal/risk.Signal`'s own doc comment names `volume_deviation` as an intended future signal, but `HistoryScorer` doesn't implement it, there's no request-rate tracking in this codebase to detect a burst against.
+**Detect:** Real as of the gap-closing pass, where it used to be nothing. `internal/risk.HistoryScorer` has two signals for this shape. `call_rate` fires when an agent's call count inside a configured window crosses a configured threshold (`NIA_RISK_RATE_WINDOW`, `NIA_RISK_RATE_THRESHOLD`, both or neither, `cmd/gateway` refuses to start with one of the two). `novel_transition` fires when an agent moves from one tool to another in an order it has never used before, which catches the case the volume signal misses: a hijacked agent working through tools it is legitimately allowed to call, at ordinary speed, in an order it has never worked in. Both are off by default, deliberately, an unchosen threshold either never fires or fires on every busy agent, and what it feeds is a cumulative total that can kill an agent outright.
 
-**Contain:** Indirect only, if the burst happens to also trip `novel_tool` or a sensitive-resource check, normal containment applies, but a burst of calls to tools the agent already uses normally would sail through today.
+**Contain:** Through the same path every other signal uses, `internal/monitoring` accumulates the score and flags, revokes, or kills at the configured thresholds. A burst of calls to tools the agent already uses normally no longer sails through: it accumulates `call_rate` on every call over the threshold, so a sustained burst climbs toward containment rather than being invisible.
 
-**Investigate:** `internal/audit` has a timestamped record of every call, so a burst is visible after the fact to anyone who thinks to look at call frequency, nothing surfaces it proactively.
+**Investigate:** `internal/audit` still has the timestamped record of every call, and now `GET /risk/{ref}` on the gateway (operator-authenticated, see invariant 19) reports the cumulative total and the incident records naming which signals fired, so a burst surfaces as a specific `call_rate` signal in an incident rather than as something someone has to notice by eyeballing frequencies.
 
-**Not covered:** This entire threat category. Named directly rather than folded into a vaguer "risk scoring covers behavioral anomalies" claim, it doesn't, not this one, yet.
+**Not covered:** Prevention, still. Detection needs the two rate variables set, and the numbers are a deployment's own to choose, there is no default that would be honest. The window is a flat count, not a baseline: this notices "more than N in the window," not "unusual for this agent specifically," which is the harder thing CENTIPEDE's own baselining is meant to bring. Sequence detection is one step deep, the immediately preceding tool, not a model of an agent's whole call graph. And a repeat of the same tool is deliberately not a novel transition, so a tight loop on one tool is caught by `call_rate` or not at all.
 
 * * *
 

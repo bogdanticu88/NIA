@@ -140,6 +140,26 @@
 # had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
 #
+# NIA_RISK_HISTORY_DATABASE_URL, same postgres and database as the
+# others, its own four tables (agent_tool_history,
+# agent_transition_history, agent_last_tool, agent_calls, see
+# internal/risk/postgres_history.go). This is the other half of
+# NIA_RISK_DATABASE_URL below: that one shares the cumulative risk
+# total, this one shares the signals the total is built from. Without
+# it, each replica has its own idea of which tools an agent has ever
+# called, so the same tool scores novel_tool once per replica and every
+# restart makes the whole catalog novel again, a correctly shared total
+# fed by inputs that are neither shared nor stable.
+#
+# NIA_RISK_RATE_WINDOW / NIA_RISK_RATE_THRESHOLD turn on the call_rate
+# signal: more than THRESHOLD calls by one agent inside WINDOW adds to
+# that agent's risk. Both or neither, nia-gateway refuses to start with
+# one of the two. Deliberately unset here for the same reason the three
+# risk thresholds are: the right numbers depend on what an agent's
+# normal traffic actually looks like, and a guessed threshold either
+# never fires or fires on everything, feeding a total that can kill an
+# agent outright.
+#
 # NIA_RISK_DATABASE_URL, same postgres and database as the others
 # above, a different table (risk_state, see
 # internal/monitoring/postgres_risk_store.go). Only matters if the risk

@@ -766,7 +766,35 @@ func main() {
 		if err != nil {
 			log.Fatalf("nia-gateway: %v", err)
 		}
-		scorer = risk.NewHistoryScorer(toolCat, sensitive, risk.DefaultWeights())
+		// risk.CallHistoryFromEnv: NIA_RISK_HISTORY_DATABASE_URL unset
+		// means this process keeps its own behavioural baseline, so a
+		// tool counts as novel once per replica and again after every
+		// restart. Set it to the same database every replica points at
+		// and the inputs to the risk total are shared the same way
+		// RiskStoreFromEnv already shares the total itself, see
+		// risk.PostgresCallHistory. risk.RateConfigFromEnv: both of
+		// NIA_RISK_RATE_WINDOW and NIA_RISK_RATE_THRESHOLD, or neither,
+		// the call_rate signal stays off until an operator picks
+		// numbers for their own traffic.
+		callHistory, sharedHistory, err := risk.CallHistoryFromEnv(context.Background())
+		if err != nil {
+			log.Fatalf("nia-gateway: %v", err)
+		}
+		rateWindow, rateThreshold, err := risk.RateConfigFromEnv()
+		if err != nil {
+			log.Fatalf("nia-gateway: %v", err)
+		}
+		if sharedHistory {
+			log.Printf("nia-gateway: behavioural history is shared through %s, novel_tool and novel_transition are consistent across replicas", "NIA_RISK_HISTORY_DATABASE_URL")
+		} else {
+			log.Printf("nia-gateway: behavioural history is process-local, a restart or a second replica sees every tool as novel again")
+		}
+		if rateThreshold > 0 {
+			log.Printf("nia-gateway: call_rate fires above %d calls per %s per agent", rateThreshold, rateWindow)
+		} else {
+			log.Printf("nia-gateway: rate detection is off, set NIA_RISK_RATE_WINDOW and NIA_RISK_RATE_THRESHOLD to enable the call_rate signal")
+		}
+		scorer = risk.NewHistoryScorerWithHistory(toolCat, sensitive, risk.DefaultWeights(), callHistory, rateWindow, rateThreshold)
 		incidents = incident.NewInMemoryStore()
 		monitor = monitoring.NewMonitorWithRiskStore(thresholds, pol, creds, incidents, auditLog, riskStore)
 	}

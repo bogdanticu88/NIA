@@ -37,6 +37,7 @@ jobs:
       NIA_AUDIT_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_CREDENTIALS_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_MONITORING_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+      NIA_RISK_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
 
     steps:
       - uses: actions/checkout@v4
@@ -64,8 +65,8 @@ jobs:
       # overall pass.
       - name: Confirm the Postgres-backed tests actually ran
         run: |
-          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ -run 'Live' -v 2>&1 | tee live.log
-          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live; do
+          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ -run 'Live' -v 2>&1 | tee live.log
+          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live; do
             if grep -q -- "--- SKIP: $name" live.log; then
               echo "$name was skipped, its DSN env var is not reaching the test"
               exit 1
@@ -76,7 +77,12 @@ jobs:
             fi
           done
 
-    # Not covered here: internal/policy's live cross-service test, which
-    # spawns a real Tessera.Service and needs the dotnet SDK plus that
-    # repo checked out (NIA_TESSERA_REPO_PATH). It stays a local opt in,
-    # see tessera_client_live_test.go's own comment.
+    # Not covered here: internal/policy's two live cross-service tests.
+    # tessera_client_live_test.go spawns a real Tessera.Service and needs
+    # the dotnet SDK plus that repo checked out (NIA_TESSERA_REPO_PATH).
+    # openfga_live_test.go needs a running Tessera and the OpenFGA
+    # instance it is configured against, four variables, see that file's
+    # own comment. Both stay local opt ins. They are the two that catch
+    # wire-format mismatches against another service, so they are worth
+    # running by hand before anything that touches the policy client
+    # ships.
