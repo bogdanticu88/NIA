@@ -40,6 +40,7 @@ jobs:
       NIA_RISK_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_REGISTRY_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
       NIA_INCIDENT_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+      NIA_POLICY_LOCK_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
 
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +68,8 @@ jobs:
       # overall pass.
       - name: Confirm the Postgres-backed tests actually ran
         run: |
-          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ ./internal/registry/ ./internal/incident/ -run 'Live' -v 2>&1 | tee live.log
-          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live; do
+          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ ./internal/registry/ ./internal/incident/ ./internal/policy/ -run 'Live' -v 2>&1 | tee live.log
+          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live TestPostgresLocker_Live; do
             if grep -q -- "--- SKIP: $name" live.log; then
               echo "$name was skipped, its DSN env var is not reaching the test"
               exit 1

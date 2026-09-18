@@ -147,6 +147,21 @@
 # had no credentials.Store wired in at all. Add the three variables to
 # nia-gateway's environment block below to try it locally.
 #
+# NIA_POLICY_LOCK_DATABASE_URL serializes grant writes across replicas.
+# WriteGrants and DeleteGrants are a read, merge, then full onboard,
+# because Tessera has no incremental grant endpoint, and the client's
+# per-agent mutex only covers one process: two nia-api replicas adding a
+# different grant to the same agent at the same time can leave only one
+# of the two written, with no error on either side. Set here because
+# this stack shares a postgres anyway, and because the cost when there
+# is only one replica is one advisory lock per grant write, which is an
+# operator-paced operation rather than hot path.
+#
+# Its own variable rather than reusing one of the store DSNs, even
+# though they point at the same database here: "which database holds the
+# audit trail" and "where do replicas coordinate" are different
+# questions and a deployment that splits them should be able to.
+#
 # NIA_REGISTRY_DATABASE_URL and NIA_INCIDENT_DATABASE_URL, same
 # postgres and database as the others, their own tables (agents, and
 # incidents, see internal/registry/postgres.go and
@@ -232,6 +247,7 @@ services:
       NIA_OPENFGA_API_URL: "http://openfga:8080"
       NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
       NIA_REGISTRY_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_POLICY_LOCK_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_INCIDENT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
@@ -260,6 +276,7 @@ services:
       NIA_OPENFGA_API_URL: "http://openfga:8080"
       NIA_OPENFGA_STORE_ID: "${TESSERA_OPENFGA_STORE_ID:?create a store against openfga first and set this, see the comment at the top of this file}"
       NIA_REGISTRY_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_POLICY_LOCK_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_INCIDENT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
     volumes:
       - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro

@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -112,6 +113,36 @@ func FromEnv() (Client, error) {
 		return nil, fmt.Errorf("policy: %s is set but %s is not, both are required to check authorization against OpenFGA directly", envOpenFGAURL, envOpenFGAStoreID)
 	}
 	return NewOpenFGAChecker(client, openfgaURL, openfgaStore, strings.TrimSpace(os.Getenv(envOpenFGAModelID))), nil
+}
+
+// FromEnvWithLocker is FromEnv plus the cross-process grant lock, which
+// only a real TesseraHTTPClient needs: InMemoryClient is a single
+// process by definition, and OpenFGAChecker delegates its writes to the
+// client it wraps. Returns whether the shared lock is actually
+// configured so the caller can log it.
+//
+// Separate from FromEnv rather than folded into it because acquiring a
+// database handle is a side effect a plain constructor should not have,
+// and because every existing caller and test of FromEnv should keep
+// working unchanged.
+func FromEnvWithLocker(ctx context.Context) (Client, bool, error) {
+	client, err := FromEnv()
+	if err != nil {
+		return nil, false, err
+	}
+	locker, shared, err := LockerFromEnv(ctx, os.Getenv)
+	if err != nil {
+		return nil, false, err
+	}
+	switch c := client.(type) {
+	case *TesseraHTTPClient:
+		c.SetLocker(locker)
+	case *OpenFGAChecker:
+		if base, ok := c.base.(*TesseraHTTPClient); ok {
+			base.SetLocker(locker)
+		}
+	}
+	return client, shared, nil
 }
 
 func envOrDefault(name, def string) string {

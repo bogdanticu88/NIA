@@ -32,11 +32,12 @@ import (
 //     the read and the write. A per-agentRef in-process mutex here
 //     serializes calls made through this one client instance, which is
 //     the same scope InProcessClientLock covers on Tessera's own side, a
-//     single replica. It does not, and cannot, protect against a second
-//     NIA replica doing the same thing at the same time. That needs a
-//     shared lock (the database advisory lock Tessera's own roadmap
-//     already lists for its registry) and isn't implemented here. Calling
-//     it out rather than letting it pass for solved.
+//     single replica. That is not enough across replicas, and the shared
+//     lock this comment used to say was missing now exists: see Locker
+//     and PostgresLocker, wired through SetLocker and enabled by
+//     NIA_POLICY_LOCK_DATABASE_URL. Unset, the behaviour is unchanged and
+//     correct for a single replica, so this is a deployment choice now
+//     rather than an absence.
 //
 //  2. Authorization requires an HS256 JWT whose subject Tessera trusts
 //     as the operator for its audit trail, and that subject can only
@@ -123,6 +124,37 @@ type TesseraHTTPClient struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
+
+	// shared serializes the read-modify-write in WriteGrants and
+	// DeleteGrants across replicas, which the mutex above cannot do,
+	// see Locker. NoopLocker by default, which is the correct choice
+	// for a single replica and the behaviour every deployment had
+	// before this field existed.
+	shared Locker
+}
+
+// SetLocker installs the cross-process lock used by WriteGrants and
+// DeleteGrants. Separate from the constructor rather than another
+// parameter on it: every existing caller and test builds this client
+// without one, the default is safe, and a deployment that wants shared
+// locking is making a deliberate choice at wiring time, see
+// LockerFromEnv.
+func (c *TesseraHTTPClient) SetLocker(l Locker) {
+	if l == nil {
+		l = NoopLocker{}
+	}
+	c.shared = l
+}
+
+// lockShared takes the cross-process lock for agentRef, if one is
+// configured. Always called while already holding the in-process mutex
+// for the same agentRef, so the ordering is fixed and the two can never
+// be taken in the opposite order by different goroutines.
+func (c *TesseraHTTPClient) lockShared(ctx context.Context, agentRef string) (func(), error) {
+	if c.shared == nil {
+		return func() {}, nil
+	}
+	return c.shared.Lock(ctx, agentRef)
 }
 
 const (
@@ -247,6 +279,18 @@ func (c *TesseraHTTPClient) WriteGrants(ctx context.Context, agentRef string, gr
 	lock.Lock()
 	defer lock.Unlock()
 
+	// The read below and the onboard at the end of this function are a
+	// read-modify-write, so everything between them has to be serialized
+	// against other writers for the same agent, including writers in
+	// other processes. A failure to take the shared lock is a real
+	// error: proceeding without it would silently be the unserialized
+	// behaviour this exists to prevent.
+	release, err := c.lockShared(ctx, agentRef)
+	if err != nil {
+		return fmt.Errorf("policy: WriteGrants(%s): %w", agentRef, err)
+	}
+	defer release()
+
 	current, found, err := c.getClientState(ctx, agentRef)
 	if err != nil {
 		return fmt.Errorf("policy: WriteGrants(%s): reading current state: %w", agentRef, err)
@@ -308,6 +352,15 @@ func (c *TesseraHTTPClient) DeleteGrants(ctx context.Context, agentRef string, g
 	lock := c.lockFor(agentRef)
 	lock.Lock()
 	defer lock.Unlock()
+
+	// Same read-modify-write shape as WriteGrants, same reason for the
+	// shared lock: a concurrent write from another replica computed
+	// against the pre-delete state would put the deleted grant back.
+	release, err := c.lockShared(ctx, agentRef)
+	if err != nil {
+		return fmt.Errorf("policy: DeleteGrants(%s): %w", agentRef, err)
+	}
+	defer release()
 
 	current, found, err := c.getClientState(ctx, agentRef)
 	if err != nil {

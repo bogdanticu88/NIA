@@ -127,9 +127,17 @@ func newServerMetrics(reg *metrics.Registry, s *server) *serverMetrics {
 // both share one real audit trail instead of two separate in-memory
 // ones, see internal/audit/from_env.go.
 func newServer(ctx context.Context) (*server, error) {
-	pol, err := policy.FromEnv()
+	// policy.FromEnvWithLocker rather than FromEnv: cmd/api is where
+	// grant writes happen, and those are a read-modify-write against
+	// Tessera that the client's own per-agent mutex can only serialize
+	// within one process. NIA_POLICY_LOCK_DATABASE_URL unset keeps the
+	// previous behaviour, which is correct for a single replica.
+	pol, sharedGrantLock, err := policy.FromEnvWithLocker(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	if !sharedGrantLock {
+		log.Printf("nia-api: grant writes are serialized within this process only, set NIA_POLICY_LOCK_DATABASE_URL to serialize them across replicas")
 	}
 	auditLog, err := audit.FromEnv(ctx)
 	if err != nil {
