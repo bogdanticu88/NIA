@@ -388,23 +388,33 @@ func TestWriteGrants_UnknownGrantKind_FailsBeforeAnyHTTPCall(t *testing.T) {
 	}
 }
 
-func TestWriteGrants_ApiGroupCollidingWithToolPrefix_IsRejected(t *testing.T) {
-	postCalled := false
+func TestWriteGrants_ApiGroupNamedLikeAToolNoLongerCollides(t *testing.T) {
+	// This used to be an error. Tool and data grants rode into Tessera's
+	// api_group field as prefixed strings, so an api_group literally
+	// named "tool/reports" came back misread as a tool grant and the
+	// only safe answer was to reject it. They have their own OpenFGA
+	// types and their own wire fields now, so this is just an api_group.
+	var onboardBody onboardRequestBody
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
+		switch {
+		case r.Method == http.MethodGet:
 			writeJSON(w, http.StatusNotFound, getClientResultWire{Outcome: "not_found"})
-			return
+		default:
+			if err := json.NewDecoder(r.Body).Decode(&onboardBody); err != nil {
+				t.Fatalf("decoding onboard body: %v", err)
+			}
+			writeJSON(w, http.StatusOK, onboardResultWire{Success: true})
 		}
-		postCalled = true
-		writeJSON(w, http.StatusOK, onboardResultWire{Success: true})
 	})
 
-	err := c.WriteGrants(context.Background(), "agent-1", []Grant{GrantForAPIGroup("tool/reports")})
-	if err == nil {
-		t.Fatal("expected an error, an api_group named tool/reports would come back misread as a tool grant")
+	if err := c.WriteGrants(context.Background(), "agent-1", []Grant{GrantForAPIGroup("tool/reports")}); err != nil {
+		t.Fatalf("WriteGrants: %v", err)
 	}
-	if postCalled {
-		t.Fatal("onboard must never be called with a grant that would round trip as the wrong kind")
+	if len(onboardBody.Grants) != 1 || onboardBody.Grants[0].ApiGroup != "tool/reports" {
+		t.Fatalf("onboarded %+v, want the api_group unchanged", onboardBody.Grants)
+	}
+	if onboardBody.Grants[0].ObjectType != "" {
+		t.Fatalf("the api_group was sent as a typed object: %+v", onboardBody.Grants[0])
 	}
 }
 
@@ -695,13 +705,44 @@ func TestGrantWireEncoding_ToolAndDataRoundTrip(t *testing.T) {
 	}
 }
 
-func TestGrantWireEncoding_ToolGrantUsesPrefixedApiGroupOnTheWire(t *testing.T) {
-	wire, err := grantsToWireGrants([]Grant{GrantForTool("mcp-search")})
+func TestGrantWireEncoding_ToolAndDataGrantsUseTypedObjects(t *testing.T) {
+	wire, err := grantsToWireGrants([]Grant{
+		GrantForTool("mcp-search"),
+		GrantForData("customers.ssn"),
+		GrantForAPIGroup("orders"),
+	})
 	if err != nil {
 		t.Fatalf("grantsToWireGrants: %v", err)
 	}
-	if wire[0].ApiGroup != "tool/mcp-search" {
-		t.Fatalf("expected the tool grant to be sent as a prefixed api_group so Tessera's wire format doesn't need to change, got %+v", wire[0])
+	if len(wire) != 3 {
+		t.Fatalf("got %d wire grants, want 3", len(wire))
+	}
+	if wire[0].ObjectType != "tool" || wire[0].ObjectID != "mcp-search" || wire[0].Relation != "granted" {
+		t.Fatalf("tool grant on the wire = %+v, want the typed-object shape", wire[0])
+	}
+	if wire[1].ObjectType != "data" || wire[1].ObjectID != "customers.ssn" || wire[1].Relation != "granted" {
+		t.Fatalf("data grant on the wire = %+v, want the typed-object shape", wire[1])
+	}
+	if wire[2].ApiGroup != "orders" || wire[2].ObjectType != "" {
+		t.Fatalf("api_group grant on the wire = %+v, want it unchanged", wire[2])
+	}
+
+	// And they decode back to what they were.
+	back, err := wireGrantsToGrants(wire)
+	if err != nil {
+		t.Fatalf("wireGrantsToGrants: %v", err)
+	}
+	if len(back) != 3 || back[0].Kind != "tool" || back[0].Object != "mcp-search" || back[1].Kind != "data" || back[1].Object != "customers.ssn" || back[2].Kind != "api_group" {
+		t.Fatalf("round trip produced %+v", back)
+	}
+}
+
+func TestWireGrantsToGrants_UnknownTypedObjectIsAnError(t *testing.T) {
+	// Tessera's typed-object grant is generic, so another caller's types
+	// can legitimately appear on a client NIA also talks to. Reporting
+	// one as an api_group would be a lie.
+	if _, err := wireGrantsToGrants([]wireGrant{{ObjectType: "warehouse", ObjectID: "eu-west", Relation: "reads"}}); err == nil {
+		t.Fatal("a typed object of an unmodelled type was accepted")
 	}
 }
 

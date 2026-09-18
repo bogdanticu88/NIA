@@ -49,7 +49,7 @@ func newRecordingClient() *recordingClient {
 	return &recordingClient{InMemoryClient: NewInMemoryClient()}
 }
 
-func TestOpenFGAChecker_ToolGrant_AsksAboutTheTupleTesseraWouldHaveWritten(t *testing.T) {
+func TestOpenFGAChecker_ToolGrant_AsksAboutTheTypedObjectTesseraWrites(t *testing.T) {
 	var got capturedCheck
 	srv := fakeOpenFGA(t, true, &got)
 	defer srv.Close()
@@ -77,18 +77,18 @@ func TestOpenFGAChecker_ToolGrant_AsksAboutTheTupleTesseraWouldHaveWritten(t *te
 	if strings.Contains(got.body.TupleKey.User, ":") != true || strings.Contains(got.body.TupleKey.User, "billing") != true {
 		t.Fatalf("user = %q, expected a lowercased client ref", got.body.TupleKey.User)
 	}
-	if got.body.TupleKey.Relation != "member" {
-		t.Fatalf("relation = %q, want member", got.body.TupleKey.Relation)
+	if got.body.TupleKey.Relation != "granted" {
+		t.Fatalf("relation = %q, want granted", got.body.TupleKey.Relation)
 	}
-	if got.body.TupleKey.Object != "api_group:tool/invoice.read" {
-		t.Fatalf("object = %q, want api_group:tool/invoice.read", got.body.TupleKey.Object)
+	if got.body.TupleKey.Object != "tool:invoice.read" {
+		t.Fatalf("object = %q, want tool:invoice.read, its own OpenFGA type rather than an api_group with a prefixed name", got.body.TupleKey.Object)
 	}
 	if got.body.AuthorizationModelID != "model-abc" {
 		t.Fatalf("authorization_model_id = %q, want model-abc", got.body.AuthorizationModelID)
 	}
 }
 
-func TestOpenFGAChecker_DataGrant_UsesTheDataPrefix(t *testing.T) {
+func TestOpenFGAChecker_DataGrant_UsesItsOwnType(t *testing.T) {
 	var got capturedCheck
 	srv := fakeOpenFGA(t, true, &got)
 	defer srv.Close()
@@ -97,8 +97,8 @@ func TestOpenFGAChecker_DataGrant_UsesTheDataPrefix(t *testing.T) {
 	if _, err := c.Check(context.Background(), "agent:billing", GrantForData("customers.ssn")); err != nil {
 		t.Fatalf("Check: %v", err)
 	}
-	if got.body.TupleKey.Object != "api_group:data/customers.ssn" {
-		t.Fatalf("object = %q, want api_group:data/customers.ssn", got.body.TupleKey.Object)
+	if got.body.TupleKey.Object != "data:customers.ssn" {
+		t.Fatalf("object = %q, want data:customers.ssn", got.body.TupleKey.Object)
 	}
 	if got.body.AuthorizationModelID != "" {
 		t.Fatalf("authorization_model_id = %q, want empty when no model is configured", got.body.AuthorizationModelID)

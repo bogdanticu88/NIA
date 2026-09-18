@@ -210,12 +210,12 @@ func grantToTuple(grant Grant) (relation, object string, err error) {
 		if grant.Object == "" {
 			return "", "", fmt.Errorf("tool grant has an empty object")
 		}
-		return "member", "api_group:" + lower(toolGrantPrefix+grant.Object), nil
+		return grantedRelation, toolObjectType + ":" + lower(grant.Object), nil
 	case "data":
 		if grant.Object == "" {
 			return "", "", fmt.Errorf("data grant has an empty object")
 		}
-		return "member", "api_group:" + lower(dataGrantPrefix+grant.Object), nil
+		return grantedRelation, dataObjectType + ":" + lower(grant.Object), nil
 	case "endpoint":
 		return "", "", fmt.Errorf("endpoint grants cannot be checked directly against OpenFGA from NIA: Tessera canonicalizes the path against its endpoint catalog, which this process has no copy of")
 	default:

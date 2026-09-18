@@ -9,12 +9,18 @@
     {
       "type": "api_group",
       "relations": {
-        "member": { "this": {} }
+        "member": {
+          "this": {}
+        }
       },
       "metadata": {
         "relations": {
           "member": {
-            "directly_related_user_types": [ { "type": "client" } ]
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
           }
         }
       }
@@ -22,23 +28,117 @@
     {
       "type": "api_endpoint",
       "relations": {
-        "get": { "this": {} },
-        "post": { "this": {} },
-        "put": { "this": {} },
-        "delete": { "this": {} },
-        "patch": { "this": {} },
-        "head": { "this": {} },
-        "options": { "this": {} }
+        "get": {
+          "this": {}
+        },
+        "post": {
+          "this": {}
+        },
+        "put": {
+          "this": {}
+        },
+        "delete": {
+          "this": {}
+        },
+        "patch": {
+          "this": {}
+        },
+        "head": {
+          "this": {}
+        },
+        "options": {
+          "this": {}
+        }
       },
       "metadata": {
         "relations": {
-          "get": { "directly_related_user_types": [ { "type": "client" } ] },
-          "post": { "directly_related_user_types": [ { "type": "client" } ] },
-          "put": { "directly_related_user_types": [ { "type": "client" } ] },
-          "delete": { "directly_related_user_types": [ { "type": "client" } ] },
-          "patch": { "directly_related_user_types": [ { "type": "client" } ] },
-          "head": { "directly_related_user_types": [ { "type": "client" } ] },
-          "options": { "directly_related_user_types": [ { "type": "client" } ] }
+          "get": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "post": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "put": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "delete": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "patch": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "head": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          },
+          "options": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "tool",
+      "relations": {
+        "granted": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "granted": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "data",
+      "relations": {
+        "granted": {
+          "this": {}
+        }
+      },
+      "metadata": {
+        "relations": {
+          "granted": {
+            "directly_related_user_types": [
+              {
+                "type": "client"
+              }
+            ]
+          }
         }
       }
     }

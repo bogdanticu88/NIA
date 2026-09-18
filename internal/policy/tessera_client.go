@@ -53,6 +53,18 @@ import (
 //     authenticate as the system subject, because none of them is an
 //     incident-response action and none has an operator to carry.
 //
+//     3a. Tool and data grants are their own OpenFGA types now, tool:{name}
+//     and data:{name} with a "granted" relation, declared in
+//     deployments/openfga-model.json and carried on Tessera's
+//     typed-object grant fields (object_type, object_id, relation).
+//     They used to ride into the api_group field as a prefixed string,
+//     which is what produced "api_group:tool:invoice.read" and was
+//     rejected by OpenFGA outright. Getting them their own types also
+//     turned up a second bug on Tessera's side, its tuple read
+//     enumerated a hardcoded list of object types, so a kill silently
+//     deleted no tool tuples and reported success, see that repo's own
+//     history.
+//
 //  3. business_unit is settable through Client.SetBusinessUnit, which
 //     this type implements as the same read, merge, write shape
 //     WriteGrants has, passing the existing grants straight back
@@ -158,24 +170,28 @@ const (
 	defaultTokenTTL  = 30 * time.Second
 	maxResponseBytes = 1 << 20 // 1 MiB, these are small client records, a response this large means something is wrong
 	minSigningKeyLen = 32      // matches Hs256JwtValidator's own minimum on the Tessera side
-	// The prefixes NIA's two extra grant kinds ride into Tessera's
-	// api_group field on, see grantsToWire. The separator is '/' and
-	// cannot be ':', which is what it was until a run against a real
-	// OpenFGA caught it: Tessera's GrantTupleMapper turns an api_group
-	// value into the OpenFGA object "api_group:{value}", and OpenFGA
-	// rejects an object whose id half contains a colon, "Invalid tuple
-	// ... Reason: invalid 'object' field format". With ':' here, every
-	// onboard carrying a NIA tool or data grant failed outright against
-	// a real OpenFGA-backed Tessera, a 500 from onboard, no grant
-	// written. Nothing caught it earlier because this package's own
-	// tests run against a fake HTTP server that accepts any string, and
-	// the earlier live stack run only ever onboarded plain api_group
-	// grants.
+	// The OpenFGA types NIA's two extra grant kinds map to, and the
+	// relation both use. These are real types in
+	// deployments/openfga-model.json now, not a prefix smuggled through
+	// Tessera's api_group field.
 	//
-	// Changing this is not a data migration concern: no tuple in this
-	// shape was ever successfully stored, OpenFGA refused all of them.
-	toolGrantPrefix = "tool/"
-	dataGrantPrefix = "data/"
+	// The prefix encoding they replace is worth remembering rather than
+	// deleting quietly. It produced the OpenFGA object
+	// "api_group:tool:invoice.read", and OpenFGA rejects an object whose
+	// id half contains a colon, so every onboard carrying a NIA tool or
+	// data grant failed outright against a real OpenFGA-backed Tessera,
+	// a 500 from onboard with nothing stored. Nothing caught it for a
+	// long time because this package's tests ran against a fake HTTP
+	// server that accepted any string. Switching the separator to '/'
+	// made it work; giving the objects their own types is what makes
+	// the model able to say anything about them.
+	//
+	// Not a migration concern either way: no tuple in either older shape
+	// is worth preserving, the colon form was never stored at all and
+	// the '/' form existed for one phase.
+	toolObjectType  = "tool"
+	dataObjectType  = "data"
+	grantedRelation = "granted"
 )
 
 // NewTesseraHTTPClient builds a Client backed by a real Tessera.Service
@@ -224,6 +240,14 @@ type wireGrant struct {
 	ApiGroup string `json:"api_group,omitempty"`
 	Method   string `json:"method,omitempty"`
 	Path     string `json:"path,omitempty"`
+
+	// The typed-object shape Tessera grew for callers whose objects are
+	// not HTTP API groups or endpoints. NIA's tool and data grants use
+	// it, so a tool grant is tool:invoice.read#granted rather than
+	// being smuggled through api_group as a prefixed string.
+	ObjectType string `json:"object_type,omitempty"`
+	ObjectID   string `json:"object_id,omitempty"`
+	Relation   string `json:"relation,omitempty"`
 }
 
 type onboardRequestBody struct {
@@ -696,16 +720,10 @@ func grantsToWireGrants(grants []Grant) ([]wireGrant, error) {
 			if g.Group == "" {
 				return nil, fmt.Errorf("api_group grant has an empty group")
 			}
-			// An api_group named literally "tool:x" or "data:x" would
-			// come back from wireGrantsToGrants misread as a tool or
-			// data grant, that function has no way to tell "a real
-			// api_group that happens to start with the same prefix"
-			// apart from "a tool grant encoded that way", it always
-			// prefers the more specific case. Reject it here instead of
-			// silently reclassifying the grant on the way back.
-			if strings.HasPrefix(g.Group, toolGrantPrefix) || strings.HasPrefix(g.Group, dataGrantPrefix) {
-				return nil, fmt.Errorf("api_group %q collides with this client's tool/data grant encoding (the %q and %q prefixes), rename the group", g.Group, toolGrantPrefix, dataGrantPrefix)
-			}
+			// No prefix collision to guard against any more. Tool and
+			// data grants have their own OpenFGA types and travel in
+			// their own wire fields, so an api_group named literally
+			// "tool/x" is just an api_group and round trips as one.
 			out = append(out, wireGrant{ApiGroup: g.Group})
 		case "endpoint":
 			if g.Method == "" || g.Path == "" {
@@ -713,22 +731,22 @@ func grantsToWireGrants(grants []Grant) ([]wireGrant, error) {
 			}
 			out = append(out, wireGrant{Method: g.Method, Path: g.Path})
 		case "tool":
-			// Tessera's wire format has no field for "this is a tool, not
-			// an api_group", ApiGroup is just an opaque string as far as
-			// Tessera and OpenFGA are concerned, api_group:{group} is the
-			// object id and Tessera never inspects the value beyond that.
-			// Prefixing it is NIA's own convention for reusing that one
-			// field for the two extra grant kinds NIA has and Tessera
-			// doesn't, not a change to Tessera's protocol.
+			// Tessera's typed-object grant: object_type, object_id and
+			// relation, which become the OpenFGA tuple
+			// tool:{object}#granted@client:{ref}. Before that shape
+			// existed these had to ride into the api_group field as a
+			// prefixed string, which is how they ended up as
+			// api_group:tool:invoice.read and were rejected by OpenFGA
+			// outright.
 			if g.Object == "" {
 				return nil, fmt.Errorf("tool grant has an empty object")
 			}
-			out = append(out, wireGrant{ApiGroup: toolGrantPrefix + g.Object})
+			out = append(out, wireGrant{ObjectType: toolObjectType, ObjectID: g.Object, Relation: grantedRelation})
 		case "data":
 			if g.Object == "" {
 				return nil, fmt.Errorf("data grant has an empty object")
 			}
-			out = append(out, wireGrant{ApiGroup: dataGrantPrefix + g.Object})
+			out = append(out, wireGrant{ObjectType: dataObjectType, ObjectID: g.Object, Relation: grantedRelation})
 		default:
 			return nil, fmt.Errorf("unknown grant kind %q", g.Kind)
 		}
@@ -742,14 +760,21 @@ func wireGrantsToGrants(wire []wireGrant) ([]Grant, error) {
 		switch {
 		case w.Method != "" && w.Path != "":
 			out = append(out, GrantForEndpoint(w.Method, w.Path))
-		case strings.HasPrefix(w.ApiGroup, toolGrantPrefix):
-			out = append(out, GrantForTool(strings.TrimPrefix(w.ApiGroup, toolGrantPrefix)))
-		case strings.HasPrefix(w.ApiGroup, dataGrantPrefix):
-			out = append(out, GrantForData(strings.TrimPrefix(w.ApiGroup, dataGrantPrefix)))
+		case w.ObjectType == toolObjectType && w.ObjectID != "":
+			out = append(out, GrantForTool(w.ObjectID))
+		case w.ObjectType == dataObjectType && w.ObjectID != "":
+			out = append(out, GrantForData(w.ObjectID))
+		case w.ObjectType != "" && w.ObjectID != "":
+			// A typed object of a type NIA does not model. Tessera's
+			// grant shape is generic on purpose, so another caller's
+			// types can legitimately appear on a client NIA also talks
+			// to. Reporting it as an api_group would be a lie, so this
+			// is an error rather than a guess.
+			return nil, fmt.Errorf("tessera returned a %q typed-object grant, which this client does not model", w.ObjectType)
 		case w.ApiGroup != "":
 			out = append(out, GrantForAPIGroup(w.ApiGroup))
 		default:
-			return nil, fmt.Errorf("tessera returned a grant with neither api_group nor method and path set")
+			return nil, fmt.Errorf("tessera returned a grant with none of api_group, method and path, or a typed object set")
 		}
 	}
 	return out, nil
