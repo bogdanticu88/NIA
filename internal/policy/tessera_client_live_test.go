@@ -150,7 +150,7 @@ func TestLive_TesseraHTTPClient_AgainstRealTesseraService(t *testing.T) {
 	// ListGrants right after restore reports the previously declared
 	// grants, "orders" included, even though the live OpenFGA tuple for
 	// it is still gone, kill deleted that and restore doesn't rewrite it.
-	if err := client.Restore(ctx, agentRef); err != nil {
+	if err := client.Restore(ctx, agentRef, "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if killed, err := client.IsKilled(ctx, agentRef); err != nil || killed {

@@ -227,7 +227,7 @@ func TestOpenFGAChecker_EverythingButCheckGoesToTheBaseClient(t *testing.T) {
 	if !killed {
 		t.Fatal("IsKilled = false after Kill, the sentinel lives on the base client and must be read from there")
 	}
-	if err := c.Restore(ctx, "agent:billing"); err != nil {
+	if err := c.Restore(ctx, "agent:billing", "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if err := c.DeleteGrants(ctx, "agent:billing", []Grant{GrantForTool("invoice.read")}); err != nil && !errors.Is(err, ErrKilled) {

@@ -141,7 +141,7 @@ func TestLive_OpenFGAChecker_RestoreDoesNotResurrectAuthorization(t *testing.T) 
 	if _, err := checker.Kill(ctx, ref, "INC-live", "bogdan"); err != nil {
 		t.Fatalf("Kill: %v", err)
 	}
-	if err := checker.Restore(ctx, ref); err != nil {
+	if err := checker.Restore(ctx, ref, "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -188,5 +188,46 @@ func TestLive_OpenFGAChecker_KillDeniesImmediately(t *testing.T) {
 	}
 	if allowed {
 		t.Fatal("Check = true after a kill deleted the agent's tuples")
+	}
+}
+
+// TestLive_SetBusinessUnit_AgainstRealTessera proves the attribute
+// actually reaches Tessera and survives a later grant write, which is
+// the property that matters: Tessera's onboard is a full state
+// reconcile, so an implementation that forgot to pass the existing
+// grants back would silently delete them, and one that forgot the
+// business unit on a later WriteGrants would silently clear it.
+func TestLive_SetBusinessUnit_AgainstRealTessera(t *testing.T) {
+	checker, tessera, ctx := liveOpenFGASetup(t)
+	ref := liveAgentRef(t)
+
+	if err := checker.WriteGrants(ctx, ref, []Grant{GrantForTool("invoice.read")}); err != nil {
+		t.Fatalf("WriteGrants: %v", err)
+	}
+	if err := tessera.SetBusinessUnit(ctx, ref, "finance"); err != nil {
+		t.Fatalf("SetBusinessUnit: %v", err)
+	}
+
+	state, found, err := tessera.getClientState(ctx, ref)
+	if err != nil || !found {
+		t.Fatalf("getClientState = %v, found=%v", err, found)
+	}
+	if state.BusinessUnit != "finance" {
+		t.Fatalf("business_unit = %q on the Tessera record, want finance", state.BusinessUnit)
+	}
+	if len(state.Grants) != 1 {
+		t.Fatalf("the agent has %d grants after setting its business unit, want the 1 it had: a full-state reconcile that drops them deletes them", len(state.Grants))
+	}
+
+	// A later grant write must not clear it.
+	if err := checker.WriteGrants(ctx, ref, []Grant{GrantForTool("invoice.write")}); err != nil {
+		t.Fatalf("second WriteGrants: %v", err)
+	}
+	state, _, err = tessera.getClientState(ctx, ref)
+	if err != nil {
+		t.Fatalf("getClientState: %v", err)
+	}
+	if state.BusinessUnit != "finance" {
+		t.Fatalf("business_unit = %q after a later grant write, want it preserved", state.BusinessUnit)
 	}
 }

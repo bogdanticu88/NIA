@@ -82,8 +82,12 @@ func (c *OpenFGAChecker) Kill(ctx context.Context, agentRef, incident, operator 
 	return c.base.Kill(ctx, agentRef, incident, operator)
 }
 
-func (c *OpenFGAChecker) Restore(ctx context.Context, agentRef string) error {
-	return c.base.Restore(ctx, agentRef)
+func (c *OpenFGAChecker) Restore(ctx context.Context, agentRef, operator string) error {
+	return c.base.Restore(ctx, agentRef, operator)
+}
+
+func (c *OpenFGAChecker) SetBusinessUnit(ctx context.Context, agentRef, businessUnit string) error {
+	return c.base.SetBusinessUnit(ctx, agentRef, businessUnit)
 }
 
 func (c *OpenFGAChecker) IsKilled(ctx context.Context, agentRef string) (bool, error) {

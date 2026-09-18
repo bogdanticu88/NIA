@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -84,7 +85,28 @@ type Client interface {
 	// Restore clears the kill sentinel and re-declares grants from
 	// intent. It does not resurrect grants on its own; the caller
 	// must call WriteGrants afterward with the intended state.
-	Restore(ctx context.Context, agentRef string) error
+	//
+	// operator is who is doing it, and it is required for the same
+	// reason Kill's is: restoring an agent from a kill is exactly the
+	// kind of action an incident record wants attributed to a person
+	// rather than a service account, and TesseraHTTPClient can only
+	// attribute it if the caller passes it, because Tessera takes the
+	// operator from the token subject and never from the request body.
+	// Before this parameter existed, every restore in Tessera's own
+	// audit trail was attributed to NIA's system identity.
+	Restore(ctx context.Context, agentRef, operator string) error
+
+	// SetBusinessUnit declares the agent's owning business unit.
+	//
+	// Separate from WriteGrants because it is not a grant, and its own
+	// method rather than a field on some onboarding call because this
+	// interface has no onboarding call: an agent becomes known to the
+	// policy engine the first time grants are written for it. Before
+	// this existed, Client carried no business_unit anywhere, so an
+	// agent onboarded through NIA always had an empty one on the
+	// Tessera side no matter what cmd/api's own registry recorded, and
+	// there was no path through this interface to set it.
+	SetBusinessUnit(ctx context.Context, agentRef, businessUnit string) error
 
 	// IsKilled reports whether agentRef currently has a kill sentinel
 	// set.
@@ -98,9 +120,11 @@ type Client interface {
 // exclusion via the mutex) so code written against this can be pointed
 // at the real Tessera HTTP client later without surprises.
 type InMemoryClient struct {
-	mu     sync.Mutex
-	grants map[string][]Grant
-	killed map[string]killRecord
+	mu              sync.Mutex
+	grants          map[string][]Grant
+	killed          map[string]killRecord
+	businessUnits   map[string]string
+	restoreOperator map[string]string // who last restored each agent, so a test can assert attribution
 }
 
 type killRecord struct {
@@ -111,8 +135,10 @@ type killRecord struct {
 
 func NewInMemoryClient() *InMemoryClient {
 	return &InMemoryClient{
-		grants: make(map[string][]Grant),
-		killed: make(map[string]killRecord),
+		grants:          make(map[string][]Grant),
+		killed:          make(map[string]killRecord),
+		businessUnits:   make(map[string]string),
+		restoreOperator: make(map[string]string),
 	}
 }
 
@@ -172,11 +198,49 @@ func (c *InMemoryClient) Kill(_ context.Context, agentRef, incident, operator st
 	return KillResult{AgentRef: agentRef, TuplesDeleted: deleted}, nil
 }
 
-func (c *InMemoryClient) Restore(_ context.Context, agentRef string) error {
+func (c *InMemoryClient) Restore(_ context.Context, agentRef, operator string) error {
+	if strings.TrimSpace(operator) == "" {
+		// Same requirement Kill has, and TesseraHTTPClient enforces it
+		// too: an unattributed restore is exactly the record an incident
+		// review cannot use.
+		return fmt.Errorf("policy: Restore(%s): operator is required", agentRef)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.killed, agentRef)
+	c.restoreOperator[agentRef] = operator
 	return nil
+}
+
+// RestoredBy reports who last restored agentRef through this client,
+// empty if it has never been restored. Exists so a test can assert the
+// attribution actually arrives, which is the whole point of Restore
+// taking an operator.
+func (c *InMemoryClient) RestoredBy(agentRef string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.restoreOperator[agentRef]
+}
+
+func (c *InMemoryClient) SetBusinessUnit(_ context.Context, agentRef, businessUnit string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, dead := c.killed[agentRef]; dead {
+		// Same rule WriteGrants follows: a killed agent is not mutated
+		// until it is restored, so a reconcile cannot quietly bring part
+		// of it back.
+		return fmt.Errorf("%w: %s", ErrKilled, agentRef)
+	}
+	c.businessUnits[agentRef] = businessUnit
+	return nil
+}
+
+// BusinessUnit reports the declared business unit for agentRef, empty
+// if none was ever set.
+func (c *InMemoryClient) BusinessUnit(agentRef string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.businessUnits[agentRef]
 }
 
 func (c *InMemoryClient) IsKilled(_ context.Context, agentRef string) (bool, error) {

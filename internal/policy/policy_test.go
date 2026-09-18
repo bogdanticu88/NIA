@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -65,7 +66,7 @@ func TestRestoreClearsKillSentinel(t *testing.T) {
 	if _, err := c.Kill(ctx, "agent:x", "INC-1", "operator"); err != nil {
 		t.Fatalf("Kill: %v", err)
 	}
-	if err := c.Restore(ctx, "agent:x"); err != nil {
+	if err := c.Restore(ctx, "agent:x", "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -82,5 +83,65 @@ func TestRestoreClearsKillSentinel(t *testing.T) {
 	}
 	if len(grants) != 0 {
 		t.Fatalf("expected no grants after restore without re-declaring, got %v", grants)
+	}
+}
+
+func TestInMemoryClient_RestoreRecordsWhoDidIt(t *testing.T) {
+	c := NewInMemoryClient()
+	ctx := context.Background()
+	if _, err := c.Kill(ctx, "agent:billing", "INC-1", "monitoring"); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if err := c.Restore(ctx, "agent:billing", "bogdan"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := c.RestoredBy("agent:billing"); got != "bogdan" {
+		t.Fatalf("RestoredBy = %q, want the operator who restored it", got)
+	}
+}
+
+func TestInMemoryClient_RestoreRequiresAnOperator(t *testing.T) {
+	c := NewInMemoryClient()
+	ctx := context.Background()
+	if _, err := c.Kill(ctx, "agent:billing", "INC-1", "monitoring"); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if err := c.Restore(ctx, "agent:billing", "   "); err == nil {
+		t.Fatal("Restore with a blank operator succeeded, an unattributed restore is a record an incident review cannot use")
+	}
+	// And it did not take effect: a refused restore must leave the kill
+	// standing rather than half-applying.
+	killed, err := c.IsKilled(ctx, "agent:billing")
+	if err != nil {
+		t.Fatalf("IsKilled: %v", err)
+	}
+	if !killed {
+		t.Fatal("the agent was restored despite the refused operator")
+	}
+}
+
+func TestInMemoryClient_SetBusinessUnit(t *testing.T) {
+	c := NewInMemoryClient()
+	ctx := context.Background()
+	if err := c.SetBusinessUnit(ctx, "agent:billing", "finance"); err != nil {
+		t.Fatalf("SetBusinessUnit: %v", err)
+	}
+	if got := c.BusinessUnit("agent:billing"); got != "finance" {
+		t.Fatalf("BusinessUnit = %q, want finance", got)
+	}
+}
+
+// TestInMemoryClient_SetBusinessUnitRefusesAKilledAgent matches the rule
+// WriteGrants follows: nothing about a killed agent is rewritten until
+// it is explicitly restored, so a reconcile cannot quietly bring part of
+// it back.
+func TestInMemoryClient_SetBusinessUnitRefusesAKilledAgent(t *testing.T) {
+	c := NewInMemoryClient()
+	ctx := context.Background()
+	if _, err := c.Kill(ctx, "agent:billing", "INC-1", "monitoring"); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if err := c.SetBusinessUnit(ctx, "agent:billing", "finance"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("SetBusinessUnit on a killed agent = %v, want ErrKilled", err)
 	}
 }

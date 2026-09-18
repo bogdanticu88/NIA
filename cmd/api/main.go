@@ -264,6 +264,19 @@ func (s *server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.registrations.Inc("created")
+	// Push the business unit through to the policy engine. Until
+	// policy.Client grew SetBusinessUnit there was no path to do this at
+	// all, so an agent registered with a business unit here had it
+	// recorded in NIA's own registry and nowhere else, and the Tessera
+	// side always read as empty. Same fail-open posture as the graph and
+	// audit writes below: registration itself already succeeded, and a
+	// failure to propagate an attribute is logged rather than turned
+	// into a failed registration the caller would reasonably retry.
+	if agent.BusinessUnit != "" {
+		if err := s.pol.SetBusinessUnit(ctx, agent.Ref, agent.BusinessUnit); err != nil {
+			log.Printf("nia-api: declaring the business unit for %s to the policy engine failed: %v", agent.Ref, err)
+		}
+	}
 	s.graphAddNode(ctx, agent.Ref, graph.NodeAgent)
 	s.audit(ctx, audit.Event{
 		Action:   "agent.registered",
@@ -512,7 +525,16 @@ func (s *server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	operator := resolveOperator(ctx, req.Operator)
-	if err := s.pol.Restore(ctx, req.AgentRef); err != nil {
+	if operator == "" {
+		// The policy client requires an operator now, for the same
+		// reason Kill always has: a restore attributed to nobody is a
+		// record an incident review cannot use. Rejecting here rather
+		// than letting the client error gives the caller a message
+		// about their request instead of one about Tessera.
+		niahttp.WriteError(w, http.StatusBadRequest, "operator is required, either authenticate with an operator token or set \"operator\" in the request body")
+		return
+	}
+	if err := s.pol.Restore(ctx, req.AgentRef, operator); err != nil {
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

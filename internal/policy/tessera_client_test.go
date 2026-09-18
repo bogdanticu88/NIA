@@ -576,17 +576,38 @@ func TestKill_ServerFailure_ReturnsError(t *testing.T) {
 
 // --- Restore uses the system subject, not a caller operator (interface has none) ---
 
-func TestRestore_SignsTheTokenWithTheSystemSubject(t *testing.T) {
+// TestRestore_SignsTheTokenWithTheOperator is the inverse of what this
+// test used to assert. Restore signed as the configured system subject,
+// so every restore in Tessera's own audit trail was attributed to NIA's
+// service identity rather than to whoever actually did it, which this
+// client's doc comment called out as a real gap. Tessera takes the actor
+// from the token subject and never from the request body, so signing as
+// the operator is the only way the attribution can be right.
+func TestRestore_SignsTheTokenWithTheOperator(t *testing.T) {
 	var sawSubject string
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		sawSubject = subjectFromAuthHeader(t, r, testSigningKey())
 		writeJSON(w, http.StatusOK, restoreResultWire{Success: true, ClientRef: "agent-1"})
 	})
-	if err := c.Restore(context.Background(), "agent-1"); err != nil {
+	if err := c.Restore(context.Background(), "agent-1", "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	if sawSubject != "nia-system" {
-		t.Fatalf("expected the configured system subject, got %q", sawSubject)
+	if sawSubject != "bogdan" {
+		t.Fatalf("subject = %q, want the operator: a restore attributed to the system identity is not attribution", sawSubject)
+	}
+}
+
+func TestRestore_RequiresAnOperator(t *testing.T) {
+	var reached bool
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		writeJSON(w, http.StatusOK, restoreResultWire{Success: true, ClientRef: "agent-1"})
+	})
+	if err := c.Restore(context.Background(), "agent-1", "  "); err == nil {
+		t.Fatal("Restore with a blank operator succeeded, an unattributed restore is a record an incident review cannot use")
+	}
+	if reached {
+		t.Fatal("the request reached Tessera despite the missing operator")
 	}
 }
 
@@ -996,4 +1017,51 @@ func subjectFromAuthHeader(t *testing.T, r *http.Request, key []byte) string {
 
 func base64URLDecode(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// TestSetBusinessUnit_PreservesExistingGrants is the property that makes
+// this safe to call on an agent that already has grants: Tessera's
+// onboard is a full state reconcile, so sending the business unit
+// without the grants would delete them.
+func TestSetBusinessUnit_PreservesExistingGrants(t *testing.T) {
+	var onboardBody onboardRequestBody
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			writeJSON(w, http.StatusOK, getClientResultWire{
+				Outcome: "found",
+				Client: &clientStateWire{
+					ClientRef: "agent-1",
+					Grants:    []wireGrant{{ApiGroup: "orders"}, {ApiGroup: "tool/invoice.read"}},
+				},
+			})
+		default:
+			if err := json.NewDecoder(r.Body).Decode(&onboardBody); err != nil {
+				t.Fatalf("decoding onboard body: %v", err)
+			}
+			writeJSON(w, http.StatusOK, onboardResultWire{Success: true})
+		}
+	})
+
+	if err := c.SetBusinessUnit(context.Background(), "agent-1", "finance"); err != nil {
+		t.Fatalf("SetBusinessUnit: %v", err)
+	}
+	if onboardBody.BusinessUnit != "finance" {
+		t.Fatalf("business_unit = %q, want finance", onboardBody.BusinessUnit)
+	}
+	if len(onboardBody.Grants) != 2 {
+		t.Fatalf("onboarded %d grants, want the 2 that already existed: a full-state reconcile that drops them deletes them", len(onboardBody.Grants))
+	}
+}
+
+func TestSetBusinessUnit_RefusesAKilledAgent(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, getClientResultWire{
+			Outcome: "found",
+			Client:  &clientStateWire{ClientRef: "agent-1", Killed: true},
+		})
+	})
+	if err := c.SetBusinessUnit(context.Background(), "agent-1", "finance"); !errors.Is(err, ErrKilled) {
+		t.Fatalf("SetBusinessUnit on a killed agent = %v, want ErrKilled", err)
+	}
 }

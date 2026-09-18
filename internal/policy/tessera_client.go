@@ -42,28 +42,25 @@ import (
 //  2. Authorization requires an HS256 JWT whose subject Tessera trusts
 //     as the operator for its audit trail, and that subject can only
 //     come from the token, never the request body, by Tessera's own
-//     design. Kill is the one call in this interface that already carries
-//     a caller-supplied operator, so Kill mints its token with that
-//     operator as sub, real per-call attribution lands in Tessera's audit
-//     trail. Every other call here (WriteGrants, DeleteGrants, Restore,
-//     the read-only ones) has no operator parameter on the Go interface
-//     to carry, so they authenticate as this client's configured system
-//     subject instead. That's a real gap for Restore in particular,
-//     restoring a client is exactly the kind of action an incident
-//     record wants attributed to a person, not a service account, and
-//     fixing it means adding an operator parameter to Client.Restore,
-//     which ripples into InMemoryClient and every existing caller. Worth
-//     doing, not done here.
+//     design. Kill and Restore both carry a caller-supplied operator and
+//     mint their token with that operator as sub, so real per-call
+//     attribution lands in Tessera's audit trail. Restore did not until
+//     Client.Restore grew an operator parameter: every restore before
+//     that showed up in Tessera attributed to this client's system
+//     subject, which is exactly the wrong answer for the action an
+//     incident record most wants tied to a person. WriteGrants,
+//     DeleteGrants, SetBusinessUnit and the read-only calls still
+//     authenticate as the system subject, because none of them is an
+//     incident-response action and none has an operator to carry.
 //
-//  3. Client carries no business_unit anywhere, InMemoryClient doesn't
-//     model it either. WriteGrants and DeleteGrants both read whatever
-//     business_unit is already on the Tessera record and pass it straight
-//     back through on the merged onboard call, so it's preserved once
-//     set, but there is no path through this interface to set it in the
-//     first place, an agentRef onboarded through this client always gets
-//     business_unit "". Setting it needs either a Client method that
-//     doesn't exist yet or a caller going around this client straight to
-//     Tessera's onboard endpoint.
+//  3. business_unit is settable through Client.SetBusinessUnit, which
+//     this type implements as the same read, merge, write shape
+//     WriteGrants has, passing the existing grants straight back
+//     through. Before that method existed there was no path through this
+//     interface at all, and an agent onboarded through this client always
+//     got business_unit "" on the Tessera side no matter what cmd/api's
+//     own registry recorded. WriteGrants and DeleteGrants still preserve
+//     whatever is already there, as they always did.
 //
 //  4. Kill does not clear a client's declared grants in Tessera, only its
 //     kill sentinel and its live OpenFGA tuples, confirmed against the
@@ -447,18 +444,69 @@ func (c *TesseraHTTPClient) Kill(ctx context.Context, agentRef, incident, operat
 	return KillResult{AgentRef: agentRef, TuplesDeleted: result.TuplesDeleted}, nil
 }
 
-func (c *TesseraHTTPClient) Restore(ctx context.Context, agentRef string) error {
+func (c *TesseraHTTPClient) Restore(ctx context.Context, agentRef, operator string) error {
 	lock := c.lockFor(agentRef)
 	lock.Lock()
 	defer lock.Unlock()
 
+	if strings.TrimSpace(operator) == "" {
+		return fmt.Errorf("policy: Restore(%s): operator is required, Tessera attributes the restore to whatever subject signs the request", agentRef)
+	}
+
 	var result restoreResultWire
-	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(encodeClientRef(agentRef))+"/restore", c.systemSubject, nil, &result)
+	// Signed as the operator rather than as this client's system
+	// subject, the same way Kill already was. Tessera takes the actor
+	// from the token subject and never from the request body, so this
+	// is the only way a restore lands in its audit trail attributed to
+	// a person; every restore before this showed up as NIA's service
+	// identity.
+	status, raw, err := c.do(ctx, http.MethodPost, "/clients/"+url.PathEscape(encodeClientRef(agentRef))+"/restore", operator, nil, &result)
 	if err != nil {
 		return fmt.Errorf("policy: Restore(%s): %w", agentRef, err)
 	}
 	if status != http.StatusOK || !result.Success {
 		return fmt.Errorf("policy: Restore(%s): tessera returned status %d: %s", agentRef, status, firstNonEmpty(result.ErrorMessage, string(raw)))
+	}
+	return nil
+}
+
+// SetBusinessUnit declares the agent's business unit on the Tessera
+// side. Tessera's onboard is a full state reconcile with no field-level
+// update, so this is the same read, merge, write shape WriteGrants has,
+// with the grants passed straight back through unchanged, and it takes
+// the same locks for the same reason.
+//
+// A killed agent is refused rather than reconciled, matching WriteGrants
+// and InMemoryClient: nothing about a killed agent gets rewritten until
+// it is explicitly restored.
+func (c *TesseraHTTPClient) SetBusinessUnit(ctx context.Context, agentRef, businessUnit string) error {
+	lock := c.lockFor(agentRef)
+	lock.Lock()
+	defer lock.Unlock()
+
+	release, err := c.lockShared(ctx, agentRef)
+	if err != nil {
+		return fmt.Errorf("policy: SetBusinessUnit(%s): %w", agentRef, err)
+	}
+	defer release()
+
+	current, found, err := c.getClientState(ctx, agentRef)
+	if err != nil {
+		return fmt.Errorf("policy: SetBusinessUnit(%s): reading current state: %w", agentRef, err)
+	}
+	if found && current.Killed {
+		return fmt.Errorf("%w: %s", ErrKilled, agentRef)
+	}
+
+	var grants []Grant
+	if found {
+		grants, err = wireGrantsToGrants(current.Grants)
+		if err != nil {
+			return fmt.Errorf("policy: SetBusinessUnit(%s): decoding current grants: %w", agentRef, err)
+		}
+	}
+	if err := c.onboardMerged(ctx, agentRef, businessUnit, grants); err != nil {
+		return fmt.Errorf("policy: SetBusinessUnit(%s): %w", agentRef, err)
 	}
 	return nil
 }

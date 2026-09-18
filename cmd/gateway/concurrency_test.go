@@ -217,7 +217,7 @@ func TestHandleToolCall_RestoreDoesNotReviveACredentialThatWasRevokedByTheKillIt
 		t.Fatalf("after kill and cascade revoke: status = %d, want 401", code)
 	}
 
-	if err := pol.Restore(ctx, "agent:billing"); err != nil {
+	if err := pol.Restore(ctx, "agent:billing", "bogdan"); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	// The agent itself is no longer killed, a fresh credential for it
