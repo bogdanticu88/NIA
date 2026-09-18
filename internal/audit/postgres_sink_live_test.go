@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // TestPostgresSink_Live drives a real Postgres instance end to end:
@@ -248,9 +250,27 @@ func appendLiveChain(t *testing.T, ctx context.Context, sink *PostgresSink, agen
 	// (matched by this run's unique agentRef, including any forged row
 	// a test inserted under the same ref) once it finishes, tampered or
 	// not.
+	//
+	// Deleting the rows is no longer enough on its own. Verify now also
+	// compares the last event's hash against audit_chain_state.last_hash
+	// (see Chain.Tip), so a test that removes its own rows and leaves
+	// the tip pointing at one of them has done exactly what the
+	// truncation check is designed to catch, and every later test's
+	// "untampered chain" assertion would fail against that leftover
+	// rather than against anything it did itself. Capture the tip
+	// before this test writes anything and put it back afterward, so
+	// cleanup undoes the whole of this test's effect on the chain, not
+	// just the visible half.
+	var tipBefore string
+	if err := sink.db.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = TRUE`).Scan(&tipBefore); err != nil {
+		t.Fatalf("reading chain tip before the test: %v", err)
+	}
 	t.Cleanup(func() {
 		if _, err := sink.db.ExecContext(context.Background(), `DELETE FROM audit_events WHERE agent_ref = $1`, agentRef); err != nil {
 			t.Logf("cleanup: deleting rows for %s: %v", agentRef, err)
+		}
+		if _, err := sink.db.ExecContext(context.Background(), `UPDATE audit_chain_state SET last_hash = $1 WHERE id = TRUE`, tipBefore); err != nil {
+			t.Logf("cleanup: restoring chain tip: %v", err)
 		}
 	})
 	for i := 0; i < n; i++ {
@@ -304,5 +324,65 @@ func assertLiveChainBroken(t *testing.T, ctx context.Context, sink *PostgresSink
 		if !seen[want] {
 			t.Fatalf("got breaks %v, want Seq=%d flagged", result.Breaks, want)
 		}
+	}
+}
+
+// TestPostgresSink_ChainLive_DetectsTruncatedChain is the tampering
+// shape none of the tests above can catch by walking events alone:
+// delete the newest rows and everything that remains still links up
+// perfectly, because the break is at an end that no longer exists. Only
+// audit_chain_state.last_hash, a different table the attacker also has
+// to remember to rewrite, still knows the chain went further. See
+// Chain.Tip.
+func TestPostgresSink_ChainLive_DetectsTruncatedChain(t *testing.T) {
+	sink, ctx := liveChainSink(t)
+	agentRef := liveChainAgentRef(t)
+	seqs := appendLiveChain(t, ctx, sink, agentRef, 4)
+
+	if _, err := sink.db.ExecContext(ctx, `DELETE FROM audit_events WHERE id = ANY($1)`, pq.Array([]int64{seqs[2], seqs[3]})); err != nil {
+		t.Fatalf("tampering DELETE: %v", err)
+	}
+
+	result, err := Verify(ctx, sink)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("got %+v, want OK false: the two surviving events are self-consistent but the recorded tip proves two more existed", result)
+	}
+	if len(result.Breaks) != 1 || result.Breaks[0].Seq != seqs[1] {
+		t.Fatalf("Breaks = %+v, want one break naming the last surviving event (seq %d)", result.Breaks, seqs[1])
+	}
+}
+
+// TestPostgresSink_ChainLive_DetectsClearedHashColumn covers the other
+// way to make a row escape verification: leave it in place but blank
+// its hash so it looks like a row written before chaining existed.
+func TestPostgresSink_ChainLive_DetectsClearedHashColumn(t *testing.T) {
+	sink, ctx := liveChainSink(t)
+	agentRef := liveChainAgentRef(t)
+	seqs := appendLiveChain(t, ctx, sink, agentRef, 3)
+
+	if _, err := sink.db.ExecContext(ctx,
+		`UPDATE audit_events SET detail = 'tampered', hash = '', prev_hash = '' WHERE id = $1`, seqs[1],
+	); err != nil {
+		t.Fatalf("tampering UPDATE: %v", err)
+	}
+
+	result, err := Verify(ctx, sink)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("got %+v, want OK false: a blanked hash on a row that follows a hashed row is tampering, not a legacy row", result)
+	}
+	var sawCleared bool
+	for _, b := range result.Breaks {
+		if b.Seq == seqs[1] {
+			sawCleared = true
+		}
+	}
+	if !sawCleared {
+		t.Fatalf("Breaks = %+v, want one naming the blanked row (seq %d)", result.Breaks, seqs[1])
 	}
 }

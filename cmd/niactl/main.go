@@ -827,16 +827,24 @@ func callGateway(ref, credential, tool, arguments string) (*http.Response, error
 	return http.DefaultClient.Do(req)
 }
 
-// operatorToken is NIA_OPERATOR_TOKEN, distinct from cmd/api's own
-// NIA_OPERATOR_TOKENS_PATH (the server-side file naming which tokens
-// are valid and who each belongs to): this is the one token this
-// invocation of niactl presents. Empty when unset, which is the
-// correct default against a cmd/api that has no NIA_OPERATOR_TOKENS_PATH
-// of its own, operatorAuthMiddleware never runs there and no
-// Authorization header is expected, see cmd/api/opauth.go. Against a
-// cmd/api that does have operator auth configured, every del/post/get
-// call below would otherwise get a 401, same failure shape
-// callGateway's own credential parameter closes for the gateway.
+// operatorToken is NIA_OPERATOR_TOKEN, distinct from the server-side
+// NIA_OPERATOR_TOKENS_PATH (the file naming which tokens are valid and
+// who each belongs to): this is the one token this invocation of
+// niactl presents.
+//
+// Unset is only correct against a process deliberately running with
+// NIA_ALLOW_UNAUTHENTICATED=1. Both nia-api and nia-gateway refuse to
+// start without operator tokens configured otherwise, so against an
+// ordinary deployment an unset token means every del/post/get below,
+// and every gateway read through getGateway, comes back 401. That is
+// the right failure, the alternative was a control plane that took
+// anyone's word for who they were.
+//
+// This is not the same thing as the agent credential `simulate call`
+// and `gateway call` take with -credential: that one authenticates an
+// agent to the tool-call path, this one authenticates an operator to
+// the control plane. Two different identities, two different tokens,
+// see cmd/gateway/authn.go and internal/opauth.
 func operatorToken() string {
 	return os.Getenv("NIA_OPERATOR_TOKEN")
 }
@@ -902,8 +910,18 @@ func get(path string) {
 // /incidents and /incidents/{id}, see internal/incident's own doc
 // comment for why those records are created (and so read back) from
 // cmd/gateway's own process rather than cmd/api's.
+//
+// These carry the operator token too. They used to be plain http.Get
+// calls, because the gateway served them to anyone who asked; it
+// requires an authenticated operator now, see cmd/gateway's routes().
 func getGateway(path string) {
-	resp, err := http.Get(gatewayAddr() + path)
+	req, err := http.NewRequest(http.MethodGet, gatewayAddr()+path, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
+		os.Exit(1)
+	}
+	setOperatorAuth(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "niactl: %v\n", err)
 		os.Exit(1)

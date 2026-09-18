@@ -9,6 +9,35 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+
+    # The Postgres-backed tests in this repo (internal/audit,
+    # internal/credentials, internal/monitoring) all skip unless their
+    # own DSN env var is set, so before this service existed a green CI
+    # run proved gofmt, build, vet, and the in-memory implementations
+    # only. Every Postgres implementation, including the audit hash
+    # chain's SELECT ... FOR UPDATE serialization, went unexercised.
+    # One container covers all three, they use separate tables in the
+    # same database.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nia
+          POSTGRES_PASSWORD: nia
+          POSTGRES_DB: nia_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nia -d nia_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      NIA_AUDIT_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+      NIA_CREDENTIALS_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+      NIA_MONITORING_TEST_DATABASE_URL: "postgres://nia:nia@localhost:5432/nia_test?sslmode=disable"
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,3 +57,26 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./... -race
+      # The live tests skip silently when their env var is missing, which
+      # is exactly the failure mode this job exists to prevent: a
+      # misconfigured DSN would make CI green again without running any
+      # of them. Assert they actually ran instead of trusting the
+      # overall pass.
+      - name: Confirm the Postgres-backed tests actually ran
+        run: |
+          go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ -run 'Live' -v 2>&1 | tee live.log
+          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live; do
+            if grep -q -- "--- SKIP: $name" live.log; then
+              echo "$name was skipped, its DSN env var is not reaching the test"
+              exit 1
+            fi
+            if ! grep -q -- "--- PASS: $name" live.log; then
+              echo "$name did not run"
+              exit 1
+            fi
+          done
+
+    # Not covered here: internal/policy's live cross-service test, which
+    # spawns a real Tessera.Service and needs the dotnet SDK plus that
+    # repo checked out (NIA_TESSERA_REPO_PATH). It stays a local opt in,
+    # see tessera_client_live_test.go's own comment.

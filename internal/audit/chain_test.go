@@ -351,3 +351,144 @@ func TestChainHash_FieldBoundariesDontCollide(t *testing.T) {
 		t.Fatal("chainHash collided across a field boundary, canonicalize needs a separator")
 	}
 }
+
+// TestVerify_ClearedHashAfterAHashedEventIsABreak is the hole the tip
+// check and this rule together close. Walking events alone, an event
+// whose hash column has been blanked is indistinguishable from a
+// legitimate pre-chaining row, so it used to be skipped, and a skipped
+// event still left OK true. Chaining is switched on once and never off,
+// so a blank hash can only ever be a prefix of the chain, anything
+// later had a hash when it was written and no longer does.
+func TestVerify_ClearedHashAfterAHashedEventIsABreak(t *testing.T) {
+	first := Event{Action: "agent.registered", AgentRef: "agent:billing", At: time.Now()}
+	firstHash := chainHash(first, GenesisHash)
+	second := Event{Action: "agent.killed", AgentRef: "agent:billing", At: time.Now()}
+
+	store := fakeChainedStore{chain: Chain{
+		StartsAtGenesis: true,
+		Events: []ChainedEvent{
+			{Event: first, Seq: 1, Hash: firstHash, PrevHash: GenesisHash},
+			// The attacker's edit: blank the hash so the row is skipped
+			// rather than recomputed and caught.
+			{Event: second, Seq: 2, Hash: "", PrevHash: firstHash},
+		},
+	}}
+
+	result, err := Verify(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("got %+v, want OK false: a hash cleared after a hashed event is tampering, not a legacy row", result)
+	}
+	if len(result.Breaks) != 1 || result.Breaks[0].Seq != 2 {
+		t.Fatalf("Breaks = %+v, want exactly one break naming seq 2", result.Breaks)
+	}
+}
+
+// TestVerify_TruncatedChainIsCaughtByTheTip covers the shape the
+// event walk cannot see on its own: delete the newest events and what
+// remains is still perfectly self-consistent. Only the separately
+// recorded tip still points at a hash no surviving row carries.
+func TestVerify_TruncatedChainIsCaughtByTheTip(t *testing.T) {
+	sink := NewInMemorySink(100)
+	appendN(t, sink, 4, "agent:billing")
+
+	chain, err := sink.Chain(context.Background())
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if chain.Tip == "" {
+		t.Fatal("Tip is empty, InMemorySink is expected to record one")
+	}
+
+	// Drop the last two events, leaving the tip pointing past the end.
+	truncated := fakeChainedStore{chain: Chain{
+		StartsAtGenesis: true,
+		Events:          chain.Events[:2],
+		Tip:             chain.Tip,
+	}}
+
+	result, err := Verify(context.Background(), truncated)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("got %+v, want OK false: the surviving events link up but the chain tip proves two were removed", result)
+	}
+	if result.Checked != 2 {
+		t.Fatalf("Checked = %d, want 2", result.Checked)
+	}
+}
+
+// TestVerify_EveryHashClearedIsCaughtByTheTip is the degenerate version
+// of the same attack: blank every hash and there is no hashed event
+// left to break the linkage rule above, so the tip is the only thing
+// that still knows the chain ever had content.
+func TestVerify_EveryHashClearedIsCaughtByTheTip(t *testing.T) {
+	sink := NewInMemorySink(100)
+	appendN(t, sink, 3, "agent:billing")
+
+	chain, err := sink.Chain(context.Background())
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	blanked := make([]ChainedEvent, len(chain.Events))
+	copy(blanked, chain.Events)
+	for i := range blanked {
+		blanked[i].Hash = ""
+		blanked[i].PrevHash = ""
+	}
+
+	result, err := Verify(context.Background(), fakeChainedStore{chain: Chain{
+		StartsAtGenesis: true,
+		Events:          blanked,
+		Tip:             chain.Tip,
+	}})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if result.OK {
+		t.Fatalf("got %+v, want OK false: every hash cleared with a real tip recorded is tampering", result)
+	}
+	if result.Skipped != 3 || result.Checked != 0 {
+		t.Fatalf("Skipped = %d Checked = %d, want 3 and 0", result.Skipped, result.Checked)
+	}
+}
+
+// TestVerify_LegacyOnlyTableWithGenesisTipIsOK is the legitimate
+// counterpart to the test above: a table that only ever held
+// pre-chaining rows has a tip that was seeded to GenesisHash and never
+// moved, which is not tampering and must not be reported as a break.
+func TestVerify_LegacyOnlyTableWithGenesisTipIsOK(t *testing.T) {
+	result, err := Verify(context.Background(), fakeChainedStore{chain: Chain{
+		StartsAtGenesis: true,
+		Events: []ChainedEvent{
+			{Event: Event{Action: "legacy.one", At: time.Now()}, Seq: 1},
+			{Event: Event{Action: "legacy.two", At: time.Now()}, Seq: 2},
+		},
+		Tip: GenesisHash,
+	}})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !result.OK || result.Skipped != 2 || result.Checked != 0 {
+		t.Fatalf("got %+v, want OK with 2 skipped and 0 checked", result)
+	}
+}
+
+// TestVerify_UntamperedInMemoryChainMatchesItsTip guards the check
+// itself against being trivially wrong: the ordinary, untouched case
+// has to stay clean now that Verify compares against a tip at all.
+func TestVerify_UntamperedInMemoryChainMatchesItsTip(t *testing.T) {
+	sink := NewInMemorySink(100)
+	appendN(t, sink, 6, "agent:billing")
+
+	result, err := Verify(context.Background(), sink)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !result.OK || result.Checked != 6 || len(result.Breaks) != 0 {
+		t.Fatalf("got %+v, want a clean verify against the sink's own tip", result)
+	}
+}

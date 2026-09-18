@@ -177,16 +177,8 @@ func (s *InMemoryStore) Verify(_ context.Context, id, presentedSecret string) (C
 	s.mu.Lock()
 	c, ok := s.byID[id]
 	s.mu.Unlock()
-	if !ok {
-		return Credential{}, ErrInvalidCredential
-	}
-	if !secretsMatch(hashSecret(presentedSecret), c.SecretHash) {
-		return Credential{}, ErrInvalidCredential
-	}
-	if c.Effective(time.Now()) != StatusActive {
-		return Credential{}, ErrInvalidCredential
-	}
-	return c, nil
+	// Deliberately no early return on !ok, see verifyPresented.
+	return verifyPresented(c, ok, presentedSecret, time.Now())
 }
 
 var _ Store = (*InMemoryStore)(nil)

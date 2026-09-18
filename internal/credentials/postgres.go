@@ -256,16 +256,11 @@ func (s *PostgresStore) Rotate(ctx context.Context, id, rotatedBy string, ttl ti
 
 func (s *PostgresStore) Verify(ctx context.Context, id, presentedSecret string) (Credential, error) {
 	c, err := s.Get(ctx, id)
-	if err != nil {
-		return Credential{}, ErrInvalidCredential
-	}
-	if !secretsMatch(hashSecret(presentedSecret), c.SecretHash) {
-		return Credential{}, ErrInvalidCredential
-	}
-	if c.Effective(time.Now()) != StatusActive {
-		return Credential{}, ErrInvalidCredential
-	}
-	return c, nil
+	// Deliberately no early return on err, see verifyPresented. The
+	// database round trip dominates this function's timing either way,
+	// but both Store implementations answering the same shape means
+	// there's one rule to reason about rather than two.
+	return verifyPresented(c, err == nil, presentedSecret, time.Now())
 }
 
 const selectColumns = `SELECT id, agent_ref, kind, status, secret_hash, issued_at, expires_at,

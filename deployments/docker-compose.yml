@@ -93,6 +93,24 @@
 # run rather than assuming compose behaves identically to two bare
 # processes.
 #
+# NIA_OPERATOR_TOKENS_PATH authenticates the callers of the control
+# plane itself. Both services refuse to start without it now (see
+# internal/opauth.FromEnvEnforced), which is the point: before that,
+# unset meant "accept every request unauthenticated" and this file
+# didn't set it, so the reference stack exposed agent registration,
+# grant writes, credential issuance, kill, restore, and the whole audit
+# trail to anyone who could reach port 8080, and nia-gateway served any
+# agent's risk total and incident history on 8081 the same way. The
+# escape hatch for running open on purpose is NIA_ALLOW_UNAUTHENTICATED=1,
+# deliberately not set here.
+#
+# The file itself is real bearer tokens, so it is gitignored, same
+# posture as .env above. Copy deployments/operator-tokens.example.json
+# to deployments/operator-tokens.json and put a generated token in it
+# (`openssl rand -base64 32`) before bringing the stack up. Both
+# services mount the same file: an operator token is one credential for
+# the control plane, not one per process.
+#
 # NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT turn on
 # risk-based monitoring in nia-gateway, see internal/monitoring and
 # internal/risk.HistoryScorer. Deliberately not set here: turning on a
@@ -129,6 +147,9 @@ services:
       NIA_TESSERA_JWT_SIGNING_KEY: "${NIA_TESSERA_JWT_SIGNING_KEY:?set this, see the comment at the top of this file}"
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
+      NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
+    volumes:
+      - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
       tessera:
         condition: service_healthy
@@ -148,6 +169,9 @@ services:
       NIA_AUDIT_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_CREDENTIALS_DATABASE_URL: "postgres://nia:nia@postgres:5432/nia?sslmode=disable"
       NIA_TOOLS_API_URL: "http://nia-api:8080"
+      NIA_OPERATOR_TOKENS_PATH: "/etc/nia/operator-tokens.json"
+    volumes:
+      - ./operator-tokens.json:/etc/nia/operator-tokens.json:ro
     depends_on:
       tessera:
         condition: service_healthy

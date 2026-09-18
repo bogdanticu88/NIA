@@ -94,6 +94,7 @@ import (
 	"github.com/bogdanticu88/nia/internal/incident"
 	"github.com/bogdanticu88/nia/internal/metrics"
 	"github.com/bogdanticu88/nia/internal/monitoring"
+	"github.com/bogdanticu88/nia/internal/opauth"
 	"github.com/bogdanticu88/nia/internal/policy"
 	"github.com/bogdanticu88/nia/internal/registry/tools"
 	"github.com/bogdanticu88/nia/internal/risk"
@@ -134,9 +135,16 @@ type gateway struct {
 	monitor        *monitoring.Monitor    // nil means monitoring is not configured, see monitoring.ThresholdsFromEnv
 	incidents      incident.Store         // nil unless monitor is also configured, see main(); GET /incidents and GET /incidents/{id} read this directly
 	forwarder      Forwarder              // nil means downstream forwarding is not configured, see forward.go and forwarderFromEnv
-	auditLog       audit.Sink
-	metrics        *gatewayMetrics
-	metricsReg     *metrics.Registry // handleFunc target for GET /metrics
+	// opStore authenticates the operator-facing read endpoints below
+	// (GET /incidents, GET /incidents/{id}, GET /risk/{ref}). It is
+	// unrelated to how a tool call authenticates: an agent presents its
+	// own credential to POST /tools/{tool}/call and never an operator
+	// token, see authn.go. nil only when NIA_ALLOW_UNAUTHENTICATED=1
+	// was set deliberately, see opauth.FromEnvEnforced.
+	opStore    opauth.Store
+	auditLog   audit.Sink
+	metrics    *gatewayMetrics
+	metricsReg *metrics.Registry // handleFunc target for GET /metrics
 }
 
 // gatewayMetrics is every counter cmd/gateway exposes over GET /metrics.
@@ -622,11 +630,35 @@ func (g *gateway) routes() *http.ServeMux {
 		niahttp.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /tools/{tool}/call", g.handleToolCall)
-	mux.HandleFunc("GET /incidents", g.handleListIncidents)
-	mux.HandleFunc("GET /incidents/{id}", g.handleGetIncident)
-	mux.HandleFunc("GET /risk/{ref}", g.handleRisk)
+	// These three are operator-facing reads, not hot path. Every one of
+	// them returns per-agent security state, an agent's cumulative risk
+	// total, the thresholds it is being judged against, and the full
+	// signal breakdown of every containment decision made about it. Before
+	// this they were served to anyone who could reach this port, with no
+	// authentication of any kind, while the tool-call path right above
+	// them demanded a verified credential. That asymmetry was the bug.
+	mux.Handle("GET /incidents", g.operatorOnly(http.HandlerFunc(g.handleListIncidents)))
+	mux.Handle("GET /incidents/{id}", g.operatorOnly(http.HandlerFunc(g.handleGetIncident)))
+	mux.Handle("GET /risk/{ref}", g.operatorOnly(http.HandlerFunc(g.handleRisk)))
 	mux.Handle("GET /metrics", g.metricsReg)
 	return mux
+}
+
+// operatorOnly wraps an operator-facing handler in operator-token
+// authentication. A nil opStore means NIA_ALLOW_UNAUTHENTICATED=1 was
+// set deliberately (opauth.FromEnvEnforced refuses to produce one any
+// other way, and main logs it loudly), so this is the one path where
+// the handler is served unwrapped, the same explicit opt-out
+// NIA_GATEWAY_INSECURE_HEADER_AUTH gives the tool-call path.
+//
+// Tests in this package construct gateway structs directly and leave
+// opStore nil, which is why this degrades rather than panicking: the
+// deployment-posture decision belongs in main, not in every handler.
+func (g *gateway) operatorOnly(h http.Handler) http.Handler {
+	if g.opStore == nil {
+		return h
+	}
+	return opauth.Middleware(g.opStore, h)
 }
 
 func main() {
@@ -766,6 +798,22 @@ func main() {
 		log.Printf("nia-gateway: %s is not set, this process only decides allow/deny, it does not forward calls to a real tool", envDownstreamURL)
 	}
 
+	// opauth.FromEnvEnforced: same posture cmd/api takes, and the same
+	// single NIA_ALLOW_UNAUTHENTICATED escape hatch. This process needs
+	// it for a narrower reason than cmd/api does, only the three
+	// operator-facing read endpoints are affected, the tool-call path
+	// authenticates agents with their own credentials either way, see
+	// routes() and authn.go.
+	opStore, openOnPurpose, err := opauth.FromEnvEnforced()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+	if openOnPurpose {
+		log.Printf("nia-gateway: %s=1, GET /incidents, GET /incidents/{id} and GET /risk/{ref} are served to anyone who can reach this port, this must never be set on anything reachable by an untrusted caller", opauth.EnvAllowUnauthenticated)
+	} else {
+		log.Printf("nia-gateway: operator authentication is on, GET /incidents, GET /incidents/{id} and GET /risk/{ref} require Authorization: Bearer <operator token>")
+	}
+
 	metricsReg := metrics.NewRegistry()
 	g := &gateway{
 		resolver:       resolver,
@@ -777,6 +825,7 @@ func main() {
 		monitor:        monitor,
 		incidents:      incidents,
 		forwarder:      forwarder,
+		opStore:        opStore,
 		auditLog:       auditLog,
 		metrics:        newGatewayMetrics(metricsReg),
 		metricsReg:     metricsReg,

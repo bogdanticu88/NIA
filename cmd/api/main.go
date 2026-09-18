@@ -140,15 +140,21 @@ func newServer(ctx context.Context) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
 	}
-	// opauth.FromEnv: unset NIA_OPERATOR_TOKENS_PATH means opStore is
-	// nil and routes() never wraps the mux in operatorAuthMiddleware,
-	// this process authenticates callers exactly the way it always
-	// has, none, see opauth.go's own doc comment and
-	// docs/SECURITY_INVARIANTS.md invariant 11 for what setting it
-	// actually closes and what it still doesn't.
-	opStore, err := opauth.FromEnv()
+	// opauth.FromEnvEnforced: NIA_OPERATOR_TOKENS_PATH unset is a
+	// startup failure, not a silently open control plane. The only way
+	// to get a nil opStore (and so a mux routes() never wraps in
+	// operatorAuthMiddleware) is NIA_ALLOW_UNAUTHENTICATED=1, set
+	// deliberately. Before this, unset meant open, and the shipped
+	// docker-compose.yml didn't set it, so the reference deployment
+	// exposed agent registration, grant writes, credential issuance,
+	// kill, restore, and the whole audit trail with no authentication
+	// at all. See docs/SECURITY_INVARIANTS.md invariant 11.
+	opStore, openOnPurpose, err := opauth.FromEnvEnforced()
 	if err != nil {
 		return nil, fmt.Errorf("nia-api: %w", err)
+	}
+	if openOnPurpose {
+		log.Printf("nia-api: %s=1, this process accepts every request unauthenticated and trusts operator/*_by fields at face value, this must never be set on anything reachable by an untrusted caller", opauth.EnvAllowUnauthenticated)
 	}
 	s := &server{
 		agents:    registry.NewInMemoryAgentRegistry(),
@@ -1489,9 +1495,7 @@ func main() {
 		log.Fatalf("nia-api: %v", err)
 	}
 	if s.opStore != nil {
-		log.Printf("nia-api: NIA_OPERATOR_TOKENS_PATH is set, every request except GET /healthz and GET /metrics requires Authorization: Bearer <operator token>")
-	} else {
-		log.Printf("nia-api: NIA_OPERATOR_TOKENS_PATH is not set, this process accepts every request unauthenticated, operator/*_by fields are trusted at face value, see docs/SECURITY_INVARIANTS.md invariant 11")
+		log.Printf("nia-api: operator authentication is on, every request except GET /healthz and GET /metrics requires Authorization: Bearer <operator token>")
 	}
 	srv := &http.Server{
 		Addr:              addr,

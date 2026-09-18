@@ -42,6 +42,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -235,6 +236,43 @@ func hashSecret(secret string) string {
 // the digest is a deterministic function of the secret.
 func secretsMatch(presentedDigest, storedDigest string) bool {
 	return subtle.ConstantTimeCompare([]byte(presentedDigest), []byte(storedDigest)) == 1
+}
+
+// absentDigest is what a presented secret gets compared against when
+// the id it named doesn't exist. It's a real, fixed, 64-character hex
+// string so the comparison has the same shape and length as a genuine
+// one, and it is not the digest of any secret this package can ever
+// issue: newSecret's plaintext is 43 base64url characters of 256-bit
+// entropy, and sha256 of anything is what this is deliberately not.
+var absentDigest = strings.Repeat("ff", sha256.Size)
+
+// verifyPresented is the shared tail of both Store implementations'
+// Verify. It exists so neither of them returns early on "no such id":
+// an early return skips the hash and the comparison entirely, which
+// makes an unknown id measurably faster to reject than a real id with
+// a wrong secret, and that difference is an oracle telling an attacker
+// which credential ids exist. ErrInvalidCredential's own doc comment
+// says those failures are deliberately indistinguishable to the
+// caller, this is what makes that true in timing as well as in the
+// returned error.
+//
+// The work is the same either way: hash the presented secret, compare
+// it in constant time against either the stored digest or absentDigest,
+// then check the effective status. A caller still learns nothing from
+// the outcome, every path returns the same error.
+func verifyPresented(c Credential, found bool, presentedSecret string, now time.Time) (Credential, error) {
+	stored := absentDigest
+	if found {
+		stored = c.SecretHash
+	}
+	match := secretsMatch(hashSecret(presentedSecret), stored)
+	if !found || !match {
+		return Credential{}, ErrInvalidCredential
+	}
+	if c.Effective(now) != StatusActive {
+		return Credential{}, ErrInvalidCredential
+	}
+	return c, nil
 }
 
 func randomID() (string, error) {

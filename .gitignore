@@ -4,6 +4,11 @@
 *.out
 .env
 
+# The operator token file docker-compose.yml mounts into both
+# services. Real bearer tokens, same posture as .env above, generate
+# your own from deployments/operator-tokens.example.json.
+/deployments/operator-tokens.json
+
 # go build ./cmd/<name>/ with no -o drops a binary named after the
 # directory right here, easy to do by accident while iterating.
 /api

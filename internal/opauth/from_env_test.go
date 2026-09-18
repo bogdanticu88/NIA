@@ -82,3 +82,65 @@ func writeTokenFile(t *testing.T, content string) string {
 	}
 	return path
 }
+
+func TestFromEnvEnforced_UnsetIsAnErrorNotAnOpenProcess(t *testing.T) {
+	t.Setenv(envTokensPath, "")
+	t.Setenv(EnvAllowUnauthenticated, "")
+
+	store, allowed, err := FromEnvEnforced()
+	if err == nil {
+		t.Fatalf("FromEnvEnforced() = (%v, %v, nil), want an error: an unset tokens path must not silently produce an unauthenticated process", store, allowed)
+	}
+	if store != nil || allowed {
+		t.Fatalf("got store %v allowed %v alongside the error, want nil and false", store, allowed)
+	}
+}
+
+func TestFromEnvEnforced_UnsetWithExplicitOptOutIsAllowed(t *testing.T) {
+	t.Setenv(envTokensPath, "")
+	t.Setenv(EnvAllowUnauthenticated, "1")
+
+	store, allowed, err := FromEnvEnforced()
+	if err != nil {
+		t.Fatalf("FromEnvEnforced: %v", err)
+	}
+	if store != nil {
+		t.Fatalf("store = %v, want nil when running unauthenticated on purpose", store)
+	}
+	if !allowed {
+		t.Fatal("allowedUnauthenticated = false, want true so the caller can log the difference")
+	}
+}
+
+func TestFromEnvEnforced_AnyOtherOptOutValueStillFails(t *testing.T) {
+	// Only "1" opts out. "true", "yes", and an accidental empty-ish
+	// value must not, a deployment shouldn't be able to disable
+	// authentication by almost setting a variable.
+	for _, v := range []string{"true", "yes", "0", " 1", "TRUE"} {
+		t.Setenv(envTokensPath, "")
+		t.Setenv(EnvAllowUnauthenticated, v)
+		if _, _, err := FromEnvEnforced(); err == nil {
+			t.Fatalf("%s=%q was accepted as an opt out, want only \"1\" to count", EnvAllowUnauthenticated, v)
+		}
+	}
+}
+
+func TestFromEnvEnforced_ValidFileReturnsAStoreAndNoOptOut(t *testing.T) {
+	path := writeTokenFile(t, `[{"token":"tok-a","name":"bogdan"}]`)
+	t.Setenv(envTokensPath, path)
+	t.Setenv(EnvAllowUnauthenticated, "")
+
+	store, allowed, err := FromEnvEnforced()
+	if err != nil {
+		t.Fatalf("FromEnvEnforced: %v", err)
+	}
+	if store == nil {
+		t.Fatal("store is nil, want a usable store")
+	}
+	if allowed {
+		t.Fatal("allowedUnauthenticated = true, want false when a real tokens file is configured")
+	}
+	if _, err := store.Verify(context.Background(), "tok-a"); err != nil {
+		t.Fatalf("Verify with the configured token: %v", err)
+	}
+}

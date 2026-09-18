@@ -247,7 +247,18 @@ func (s *PostgresSink) Chain(ctx context.Context) (Chain, error) {
 	if err := rows.Err(); err != nil {
 		return Chain{}, fmt.Errorf("audit: chain: iterating rows: %w", err)
 	}
-	return Chain{Events: out, StartsAtGenesis: true}, nil
+	// The tip lives in audit_chain_state, a different table from the
+	// events, which is the whole point: an attacker who truncates
+	// audit_events has to know to rewrite this row too, see Chain.Tip's
+	// own doc comment. A missing row (a database predating the chain
+	// migration that somehow never ran NewPostgresSink) leaves Tip
+	// empty and Verify skips the check rather than reporting a false
+	// break.
+	var tip string
+	if err := s.db.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = TRUE`).Scan(&tip); err != nil && err != sql.ErrNoRows {
+		return Chain{}, fmt.Errorf("audit: chain: reading chain tip: %w", err)
+	}
+	return Chain{Events: out, StartsAtGenesis: true, Tip: tip}, nil
 }
 
 func scanEvents(rows *sql.Rows) ([]Event, error) {

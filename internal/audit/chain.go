@@ -132,6 +132,23 @@ type ChainedEvent struct {
 type Chain struct {
 	Events          []ChainedEvent
 	StartsAtGenesis bool
+
+	// Tip is the last chain hash the store recorded separately from the
+	// events themselves, PostgresSink's audit_chain_state.last_hash row.
+	// Verify compares the final event's hash against it, which is what
+	// catches the one tampering shape walking the events alone cannot:
+	// clearing the hash column on a suffix of rows, or deleting the
+	// newest rows outright, leaves the remaining events perfectly
+	// self-consistent. The tip still points at a hash none of them
+	// carries.
+	//
+	// Empty means this store keeps no separate tip and Verify skips
+	// that check. How much the check is worth depends on the store: for
+	// PostgresSink it's a different table an attacker has to remember
+	// to rewrite too, for InMemorySink it's a field in the same struct
+	// as the events, so it catches bugs and careless tampering, not an
+	// attacker who already has the process's memory.
+	Tip string
 }
 
 // Chained is the read side a Store can optionally implement to make
@@ -193,13 +210,28 @@ func Verify(ctx context.Context, store Chained) (VerifyResult, error) {
 
 	result := VerifyResult{OK: true}
 	var prevHash string
+	var lastSeq int64
 	haveChainStart := false
 
 	for _, e := range chain.Events {
 		if e.Hash == "" {
 			// Predates hash chaining being enabled on this store, never
-			// had a hash computed for it, not a break, see this file's
-			// own doc comment and PostgresSink's migration comment.
+			// had a hash computed for it, see this file's own doc
+			// comment and PostgresSink's migration comment. Legitimate
+			// only as a prefix: chaining was switched on at one moment
+			// in this table's life and never switched off, so every
+			// event after the first hashed one was written with a hash.
+			// An empty hash after that point is not a legacy row, it is
+			// a row whose hash column was cleared, which is exactly how
+			// an attacker would try to make a modified event skip
+			// verification instead of failing it.
+			if haveChainStart {
+				result.OK = false
+				result.Breaks = append(result.Breaks, ChainBreak{
+					Seq:    e.Seq,
+					Reason: "hash is empty on an event that follows a hashed event: chaining is never switched back off, so this event's hash was cleared after it was written",
+				})
+			}
 			result.Skipped++
 			continue
 		}
@@ -234,6 +266,32 @@ func Verify(ctx context.Context, store Chained) (VerifyResult, error) {
 
 		result.Checked++
 		prevHash = e.Hash
+		lastSeq = e.Seq
+	}
+
+	// The tip check. Everything above verifies the events against each
+	// other, which is self-consistent by construction if an attacker
+	// truncates the chain: delete the newest events, or blank their
+	// hashes, and what's left still links up perfectly. Comparing the
+	// last surviving hash against the tip the store recorded somewhere
+	// else is what makes that visible, see Chain.Tip's own doc comment
+	// for how much that's worth per implementation.
+	switch {
+	case chain.Tip == "":
+		// This store keeps no separate tip, nothing further to check.
+	case result.Checked == 0:
+		if chain.Tip != GenesisHash {
+			result.OK = false
+			result.Breaks = append(result.Breaks, ChainBreak{
+				Reason: "the store recorded a chain tip but no hashed event is left to match it: every chained event was deleted or had its hash cleared",
+			})
+		}
+	case prevHash != chain.Tip:
+		result.OK = false
+		result.Breaks = append(result.Breaks, ChainBreak{
+			Seq:    lastSeq,
+			Reason: "the last event's hash does not match the chain tip the store recorded separately: one or more events were removed from the end of the chain",
+		})
 	}
 
 	return result, nil

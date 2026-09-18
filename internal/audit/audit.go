@@ -147,7 +147,11 @@ func (s *InMemorySink) Chain(_ context.Context) (Chain, error) {
 	defer s.mu.Unlock()
 	out := make([]ChainedEvent, len(s.chain))
 	copy(out, s.chain)
-	return Chain{Events: out, StartsAtGenesis: !s.truncated}, nil
+	// lastHash is this sink's own record of where the chain ended,
+	// kept separately from the events slice Append writes into, see
+	// Chain.Tip's doc comment for what that is and isn't worth for an
+	// in-memory store.
+	return Chain{Events: out, StartsAtGenesis: !s.truncated, Tip: s.lastHash}, nil
 }
 
 var (

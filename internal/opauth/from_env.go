@@ -20,6 +20,20 @@ import (
 // itself out.
 const envTokensPath = "NIA_OPERATOR_TOKENS_PATH"
 
+// EnvAllowUnauthenticated is the explicit, loudly-named opt out of
+// operator authentication, the same shape cmd/gateway's
+// NIA_GATEWAY_INSECURE_HEADER_AUTH already had for its own
+// authentication. One variable covers both binaries on purpose: a
+// deployment that decides to run open should say so once, in a way
+// that's visible in the same place for nia-api and nia-gateway, not
+// per-process.
+//
+// It exists because local development genuinely needs a way to run
+// without minting tokens first, and because a hard requirement with no
+// escape hatch gets worked around in worse ways. What it must never be
+// is the default, see FromEnvEnforced.
+const EnvAllowUnauthenticated = "NIA_ALLOW_UNAUTHENTICATED"
+
 // tokenFile is one entry in the JSON file NIA_OPERATOR_TOKENS_PATH
 // points at: a flat array of {"token": "...", "name": "..."}. The
 // plaintext token lives in this file because something has to, the
@@ -70,4 +84,38 @@ func FromEnv() (Store, error) {
 		tokens[f.Token] = f.Name
 	}
 	return NewStaticStore(tokens), nil
+}
+
+// FromEnvEnforced is FromEnv with the deployment posture inverted:
+// unset NIA_OPERATOR_TOKENS_PATH is an error, not a silently open
+// process, unless NIA_ALLOW_UNAUTHENTICATED=1 says otherwise
+// explicitly.
+//
+// This is the whole point of the change: FromEnv's own default (nil
+// Store, no error) meant a deployment that never set the variable ran
+// its control plane wide open, and the only thing standing between
+// that and a real incident was someone remembering to set an env var
+// nobody's compose file set either. cmd/gateway already had this
+// right, its insecure path needs NIA_GATEWAY_INSECURE_HEADER_AUTH=1,
+// cmd/api had it backwards. Both binaries call this now.
+//
+// The returned Store is nil only in the allow-unauthenticated case,
+// and the second return value says which of the two situations
+// produced a nil Store so a caller can log the difference rather than
+// guessing.
+func FromEnvEnforced() (store Store, allowedUnauthenticated bool, err error) {
+	store, err = FromEnv()
+	if err != nil {
+		return nil, false, err
+	}
+	if store != nil {
+		return store, false, nil
+	}
+	if os.Getenv(EnvAllowUnauthenticated) == "1" {
+		return nil, true, nil
+	}
+	return nil, false, fmt.Errorf(
+		"opauth: %s is not set, so this process would accept every request unauthenticated: point it at a tokens file, or set %s=1 to run open on purpose (never do that on anything reachable by an untrusted caller)",
+		envTokensPath, EnvAllowUnauthenticated,
+	)
 }

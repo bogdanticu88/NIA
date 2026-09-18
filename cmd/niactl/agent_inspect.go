@@ -252,7 +252,16 @@ func printAgentRecentAudit(out io.Writer, ref string, limit int) {
 // "monitoring isn't configured there" are both routine, not failures
 // of the inspect command itself.
 func printAgentRisk(out io.Writer, ref string) {
-	resp, err := http.Get(gatewayAddr() + "/risk/" + url.PathEscape(ref))
+	// GET /risk/{ref} on the gateway needs an authenticated operator now
+	// (see cmd/gateway's routes()), so this carries NIA_OPERATOR_TOKEN
+	// the same way every control-plane call does.
+	req, err := http.NewRequest(http.MethodGet, gatewayAddr()+"/risk/"+url.PathEscape(ref), nil)
+	if err != nil {
+		fmt.Fprintf(out, "  could not build the gateway request: %v\n", err)
+		return
+	}
+	setOperatorAuth(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(out, "  could not reach the gateway at %s: %v\n", gatewayAddr(), err)
 		return
