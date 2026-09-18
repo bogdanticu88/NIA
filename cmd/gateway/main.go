@@ -171,7 +171,7 @@ type gateway struct {
 // auditWriteFailures mirrors cmd/api's counter of the same name, this
 // process keeps its own audit sink and its own failure count.
 type gatewayMetrics struct {
-	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved|downstream_ok|downstream_client_error|downstream_server_error|downstream_unreachable
+	requests           *metrics.Counter // outcome: allowed|denied_tool|denied_resource|unknown_tool|tool_lookup_error|check_error|resolve_error|unresolved|downstream_ok|downstream_client_error|downstream_server_error|downstream_unreachable|downstream_ungranted_field
 	monitoringActions  *metrics.Counter // action: flag|revoke|kill
 	auditWriteFailures *metrics.Counter // no labels
 	rateLimited        *metrics.Counter // scope: client|agent
@@ -427,6 +427,80 @@ func (g *gateway) inspectAndAuditDownstream(ctx context.Context, agentRef, tool,
 	if msg, ok := downstreamReportedError(result.Body); ok {
 		g.audit(ctx, "gateway.downstream_reported_error", agentRef, detail+fmt.Sprintf(" error=%q", msg))
 	}
+
+	g.inspectResponseFields(ctx, agentRef, tool, credentialID, detail, result.Body)
+}
+
+// inspectResponseFields is the check that looks at what actually came
+// back rather than only at whether the call was allowed to happen.
+//
+// The gap it closes: the request-side check (resources.go) decides what
+// a call is asking for from its arguments, and an agent granted
+// database.query on a table it is entitled to can still receive a
+// column nobody granted, because the downstream decides what to put in
+// the response. Before this, that response reached the agent and the
+// only thing the gateway recorded was that the call succeeded.
+//
+// Deliberately audit and score, not block. By the time this runs the
+// downstream has already produced the data and the response is on its
+// way back, so "deny" here would be theatre: the tool has already read
+// it. What this can honestly do is make it visible, attribute it, and
+// feed it into the risk total that does have teeth, so an agent pulling
+// fields it was never granted accumulates toward containment. Actually
+// preventing it means either declaring the resource up front so the
+// request-side data-grant check refuses the call, which already works
+// today, or filtering the response, which would mean NIA deciding what
+// an agent is allowed to see field by field and is a much larger
+// design than this.
+func (g *gateway) inspectResponseFields(ctx context.Context, agentRef, tool, credentialID, detail string, body []byte) {
+	if g.sensitive == nil || len(body) == 0 {
+		return
+	}
+	fields := sensitiveResponseFields(body, g.sensitive)
+	if len(fields) == 0 {
+		return
+	}
+
+	// Split by whether the agent actually holds a data grant for the
+	// field. Both are worth recording, for different reasons: a granted
+	// sensitive field in a response is ordinary but worth having in the
+	// trail during an investigation, an ungranted one is the finding.
+	var granted, ungranted []string
+	for _, field := range fields {
+		allowed, err := g.pol.Check(ctx, agentRef, policy.GrantForData(field))
+		if err != nil {
+			// Same posture the rest of this function takes: the call is
+			// already done, an unanswerable check is recorded rather
+			// than turned into a failure, and it is not counted as a
+			// finding because nobody knows whether it is one.
+			g.audit(ctx, "gateway.downstream_field_check_error", agentRef, detail+fmt.Sprintf(" field=%s err=%v", field, err))
+			continue
+		}
+		if allowed {
+			granted = append(granted, field)
+			continue
+		}
+		ungranted = append(ungranted, field)
+	}
+
+	if len(granted) > 0 {
+		g.audit(ctx, "gateway.downstream_sensitive_fields", agentRef, detail+fmt.Sprintf(" granted_fields=%s", formatFieldList(granted)))
+	}
+	if len(ungranted) == 0 {
+		return
+	}
+
+	g.metrics.requests.Inc("downstream_ungranted_field")
+	g.audit(ctx, "gateway.downstream_ungranted_fields", agentRef,
+		detail+fmt.Sprintf(" ungranted_fields=%s", formatFieldList(ungranted)))
+
+	// Feed it into the risk total, which is the part with consequences.
+	// Scored separately from the call itself so an operator reading an
+	// incident can see the response, not just the request, was what
+	// pushed the agent over.
+	if g.monitor != nil && g.scorer != nil {
+		g.observeResponse(ctx, agentRef, tool, ungranted)
+	}
 }
 
 // downstreamReportedError looks for a top-level "error" string field in
@@ -477,6 +551,39 @@ type riskSignal struct {
 // all, a scoring error means there is no risk data worth attaching to
 // the response, not that the call should look unscored versus scored
 // zero.
+// observeResponse scores the fields a downstream actually returned that
+// the agent holds no data grant for, and hands the result to the same
+// monitor the request-side scoring uses, so a response-side finding can
+// cross the same thresholds and trigger the same containment.
+//
+// It scores through the same CallContext.Resources path the request side
+// uses rather than inventing a second signal type: from internal/risk's
+// point of view "this call touched customers.ssn" is the same fact
+// whether the arguments named it or the response carried it, and the
+// weighting for a sensitive or critical resource is already tuned for
+// exactly that. What differs is the audit trail, where the two arrive
+// under different actions.
+//
+// Best effort, like the rest of the post-decision path: the call has
+// already happened, so a scoring failure is recorded and does not fail
+// the response.
+func (g *gateway) observeResponse(ctx context.Context, agentRef, tool string, ungranted []string) {
+	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now(), Resources: ungranted})
+	if err != nil {
+		g.audit(ctx, "gateway.scoring_error", agentRef, fmt.Sprintf("tool=%s phase=response err=%v", tool, err))
+		return
+	}
+	incidentRef := fmt.Sprintf("auto-response-%d", time.Now().UnixNano())
+	action, err := g.monitor.Observe(ctx, score, incidentRef)
+	if err != nil {
+		g.audit(ctx, "gateway.monitoring_error", agentRef, fmt.Sprintf("tool=%s phase=response incident=%s err=%v", tool, incidentRef, err))
+		return
+	}
+	if action != monitoring.ActionNone {
+		g.metrics.monitoringActions.Inc(string(action))
+	}
+}
+
 func (g *gateway) observe(ctx context.Context, agentRef, tool string, resources []string) (riskInfo, bool) {
 	score, err := g.scorer.Score(ctx, risk.CallContext{AgentRef: agentRef, Tool: tool, At: time.Now(), Resources: resources})
 	if err != nil {
