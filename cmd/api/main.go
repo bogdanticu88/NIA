@@ -7,7 +7,9 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -1667,6 +1669,101 @@ func (s *server) handleListCheckpoints(w http.ResponseWriter, r *http.Request) {
 	niahttp.WriteJSON(w, http.StatusOK, list)
 }
 
+// bindCertificateRequest binds a client certificate to an agent.
+//
+// Either form is accepted, and PEM is the one to prefer: handing the
+// server the certificate lets it compute the thumbprint itself, which
+// removes an entire class of mistake (a fingerprint copied with colons,
+// in uppercase, of the wrong certificate in a chain, or of the CA rather
+// than the leaf). A thumbprint is accepted too, normalized the same way,
+// for an operator who genuinely only has one.
+type bindCertificateRequest struct {
+	CertificatePEM string `json:"certificate_pem"`
+	Thumbprint     string `json:"thumbprint"`
+}
+
+// normalizeThumbprint accepts the shapes a human actually has in front
+// of them, "AA:BB:CC..." from openssl or a bare hex string, and produces
+// the one form this codebase stores.
+func normalizeThumbprint(raw string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(raw), ":", ""))
+}
+
+func (s *server) handleBindCertificate(w http.ResponseWriter, r *http.Request) {
+	ref := r.PathValue("ref")
+	if ref == "" {
+		niahttp.WriteError(w, http.StatusBadRequest, "agent ref is required")
+		return
+	}
+	var req bindCertificateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	ctx := r.Context()
+	if _, err := s.agents.Get(ctx, ref); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			niahttp.WriteError(w, http.StatusNotFound, "agent not registered")
+			return
+		}
+		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var thumbprint string
+	switch {
+	case strings.TrimSpace(req.CertificatePEM) != "":
+		block, _ := pem.Decode([]byte(req.CertificatePEM))
+		if block == nil || block.Type != "CERTIFICATE" {
+			niahttp.WriteError(w, http.StatusBadRequest, "certificate_pem is not a PEM encoded certificate")
+			return
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			niahttp.WriteError(w, http.StatusBadRequest, "certificate_pem did not parse as a certificate: "+err.Error())
+			return
+		}
+		// Computed from the same DER bytes the gateway will see on the
+		// wire, by the same function, which is what makes the binding
+		// match, see credentials.ThumbprintOf.
+		thumbprint = credentials.ThumbprintOf(block.Bytes)
+	case normalizeThumbprint(req.Thumbprint) != "":
+		thumbprint = normalizeThumbprint(req.Thumbprint)
+		if len(thumbprint) != 64 {
+			niahttp.WriteError(w, http.StatusBadRequest, "thumbprint must be a hex SHA-256, 64 characters after removing any colons")
+			return
+		}
+	default:
+		niahttp.WriteError(w, http.StatusBadRequest, "one of certificate_pem or thumbprint is required")
+		return
+	}
+
+	cred, err := s.creds.BindCertificate(ctx, ref, thumbprint)
+	if err != nil {
+		// Already bound to a different agent is the caller's problem to
+		// resolve, not a server failure: they revoke the old binding
+		// first, which leaves a trail.
+		s.metrics.credentialsIssued.Inc("error")
+		niahttp.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.metrics.credentialsIssued.Inc("success")
+	s.graphAddNode(ctx, cred.ID, graph.NodeCredential)
+	s.graphAddEdge(ctx, cred.ID, ref, graph.EdgeBoundTo)
+	s.audit(ctx, audit.Event{
+		Action:   "credential.certificate_bound",
+		AgentRef: ref,
+		Operator: resolveOperator(ctx, ""),
+		Detail:   fmt.Sprintf("credential=%s thumbprint=%s", cred.ID, thumbprint),
+		At:       time.Now(),
+	})
+	niahttp.WriteJSON(w, http.StatusCreated, map[string]any{
+		"credential": cred,
+		"thumbprint": thumbprint,
+		"note":       "this certificate now authenticates as this agent at a gateway configured for mTLS; revoke the credential to revoke the binding",
+	})
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -1695,6 +1792,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("DELETE /agents/{ref}/grants", write(s.handleDeleteGrants))
 	mux.Handle("GET /agents/{ref}/grants", read(s.handleListGrants))
 	mux.Handle("POST /agents/{ref}/credentials", write(s.handleIssueCredential))
+	mux.Handle("POST /agents/{ref}/certificates", write(s.handleBindCertificate))
 	mux.Handle("GET /agents/{ref}/credentials", read(s.handleListCredentials))
 	mux.Handle("POST /credentials/{id}/revoke", write(s.handleRevokeCredential))
 	mux.Handle("POST /credentials/{id}/disable", write(s.handleDisableCredential))

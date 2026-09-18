@@ -3,6 +3,7 @@ package credentials
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,6 +34,18 @@ CREATE TABLE IF NOT EXISTS credentials (
 	rotated_to   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS credentials_agent_ref_idx ON credentials (agent_ref);
+-- ADD COLUMN IF NOT EXISTS rather than a fresh CREATE TABLE: this column
+-- arrived with mTLS certificate bindings, after the table already
+-- existed in real deployments, same migration story internal/audit's
+-- chain columns have.
+ALTER TABLE credentials ADD COLUMN IF NOT EXISTS thumbprint TEXT NOT NULL DEFAULT '';
+-- Partial unique index: a thumbprint identifies one certificate, and one
+-- certificate must not resolve to two different agents. Partial because
+-- every non-certificate credential has an empty thumbprint and there are
+-- many of those, and because a revoked binding should not block the same
+-- certificate being deliberately rebound later.
+CREATE UNIQUE INDEX IF NOT EXISTS credentials_active_thumbprint_idx
+	ON credentials (thumbprint) WHERE thumbprint <> '' AND status = 'active';
 `
 
 // PostgresStore is the real Store: credential state survives a restart
@@ -279,7 +292,7 @@ func (s *PostgresStore) Verify(ctx context.Context, id, presentedSecret string) 
 }
 
 const selectColumns = `SELECT id, agent_ref, kind, status, secret_hash, issued_at, expires_at,
-	revoked_at, revoked_by, reason, disabled_at, disabled_by, enabled_at, rotated_from, rotated_to`
+	revoked_at, revoked_by, reason, disabled_at, disabled_by, enabled_at, rotated_from, rotated_to, thumbprint`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -291,7 +304,7 @@ func scanCredential(row rowScanner) (Credential, error) {
 	if err := row.Scan(
 		&c.ID, &c.AgentRef, &kind, &status, &c.SecretHash, &c.IssuedAt, &c.ExpiresAt,
 		&c.RevokedAt, &c.RevokedBy, &c.Reason, &c.DisabledAt, &c.DisabledBy, &c.EnabledAt,
-		&c.RotatedFrom, &c.RotatedTo,
+		&c.RotatedFrom, &c.RotatedTo, &c.Thumbprint,
 	); err != nil {
 		return Credential{}, err
 	}
@@ -315,3 +328,67 @@ func checkUpdated(res sql.Result, err error, op string) error {
 }
 
 var _ Store = (*PostgresStore)(nil)
+
+// BindCertificate records that a client certificate belongs to agentRef,
+// see InMemoryStore.BindCertificate for why rebinding to a different
+// agent is refused rather than silently moved.
+//
+// The refusal is enforced by the partial unique index on thumbprint as
+// well as by the read below, so two replicas binding the same
+// certificate to two different agents at the same moment cannot both
+// succeed: the database decides, the same way Register does in
+// internal/registry.
+func (s *PostgresStore) BindCertificate(ctx context.Context, agentRef, thumbprint string) (Credential, error) {
+	if thumbprint == "" {
+		return Credential{}, fmt.Errorf("credentials: a certificate binding needs a thumbprint")
+	}
+
+	existing, err := s.VerifyCertificate(ctx, thumbprint)
+	switch {
+	case err == nil && existing.AgentRef == agentRef:
+		return existing, nil
+	case err == nil:
+		return Credential{}, fmt.Errorf("credentials: that certificate is already bound to %s, revoke that binding first", existing.AgentRef)
+	case !errors.Is(err, ErrInvalidCredential):
+		return Credential{}, err
+	}
+
+	id, err := randomID()
+	if err != nil {
+		return Credential{}, err
+	}
+	cred := Credential{
+		ID:         id,
+		AgentRef:   agentRef,
+		Kind:       KindMTLSCert,
+		Status:     StatusActive,
+		Thumbprint: thumbprint,
+		IssuedAt:   time.Now(),
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO credentials (id, agent_ref, kind, status, secret_hash, issued_at, thumbprint)
+		 VALUES ($1,$2,$3,$4,'',$5,$6)`,
+		cred.ID, cred.AgentRef, string(cred.Kind), string(cred.Status), cred.IssuedAt, cred.Thumbprint,
+	); err != nil {
+		return Credential{}, fmt.Errorf("credentials: binding certificate for %s: %w", agentRef, err)
+	}
+	return cred, nil
+}
+
+func (s *PostgresStore) VerifyCertificate(ctx context.Context, thumbprint string) (Credential, error) {
+	if thumbprint == "" {
+		return Credential{}, ErrInvalidCredential
+	}
+	row := s.db.QueryRowContext(ctx, selectColumns+` FROM credentials WHERE thumbprint = $1 AND thumbprint <> '' ORDER BY issued_at DESC LIMIT 1`, thumbprint)
+	c, err := scanCredential(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Credential{}, ErrInvalidCredential
+	}
+	if err != nil {
+		return Credential{}, fmt.Errorf("credentials: reading certificate binding: %w", err)
+	}
+	if c.Effective(time.Now()) != StatusActive {
+		return Credential{}, ErrInvalidCredential
+	}
+	return c, nil
+}

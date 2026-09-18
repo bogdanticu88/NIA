@@ -73,7 +73,7 @@ jobs:
       - name: Confirm the Postgres-backed tests actually ran
         run: |
           go test ./internal/audit/ ./internal/credentials/ ./internal/monitoring/ ./internal/risk/ ./internal/registry/ ./internal/incident/ ./internal/policy/ -run 'Live' -v 2>&1 | tee live.log
-          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live TestPostgresLocker_Live TestPostgresCheckpointStore_Live; do
+          for name in TestPostgresSink_Live TestPostgresStore_Live TestPostgresRiskStore_Live TestPostgresCallHistory_Live TestPostgresAgentRegistry_Live TestPostgresLocker_Live TestPostgresCheckpointStore_Live TestPostgresStore_Live_CertificateBinding; do
             if grep -q -- "--- SKIP: $name" live.log; then
               echo "$name was skipped, its DSN env var is not reaching the test"
               exit 1

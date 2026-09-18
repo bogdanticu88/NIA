@@ -170,12 +170,7 @@ func (g *gateway) mcpHandler() http.Handler {
 	)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		headers := map[string]string{}
-		for k := range r.Header {
-			headers[k] = r.Header.Get(k)
-		}
-
-		resolved, err := g.resolver.Resolve(r.Context(), identity.ResolveContext{Headers: headers})
+		resolved, err := g.resolver.Resolve(r.Context(), resolveContextFor(r))
 		if err != nil {
 			g.metrics.requests.Inc("resolve_error")
 			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())

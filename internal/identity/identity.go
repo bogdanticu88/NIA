@@ -10,6 +10,7 @@ package identity
 
 import (
 	"context"
+	"crypto/x509"
 	"time"
 )
 
@@ -76,6 +77,32 @@ type AgentRef struct {
 type ResolveContext struct {
 	Claims  map[string]string
 	Headers map[string]string
+
+	// VerifiedChains is what the TLS stack concluded about the client
+	// certificate, if one was presented: the chains it successfully
+	// built to a configured trusted root, leaf first. Empty when the
+	// connection is plain HTTP, when no client certificate was offered,
+	// or when one was offered and failed verification, because the TLS
+	// handshake fails in that last case and the request never arrives.
+	//
+	// This carries the certificate itself rather than a thumbprint on
+	// purpose. A resolver that took a precomputed thumbprint would be
+	// trusting whoever computed it, and the entire security property of
+	// certificate authentication is that the identity comes from the key
+	// the peer proved it holds during the handshake, not from anything
+	// the peer can assert. Every caller that needs a thumbprint computes
+	// it here, from these bytes.
+	VerifiedChains [][]*x509.Certificate
+}
+
+// LeafCertificate returns the verified leaf certificate, the one the
+// peer actually presented, or nil when no client certificate was
+// verified on this connection.
+func (rc ResolveContext) LeafCertificate() *x509.Certificate {
+	if len(rc.VerifiedChains) == 0 || len(rc.VerifiedChains[0]) == 0 {
+		return nil
+	}
+	return rc.VerifiedChains[0][0]
 }
 
 // ResolvedIdentity is the outcome of resolving a request to an AgentRef.

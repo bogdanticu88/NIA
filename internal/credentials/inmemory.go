@@ -2,6 +2,7 @@ package credentials
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -182,3 +183,62 @@ func (s *InMemoryStore) Verify(_ context.Context, id, presentedSecret string) (C
 }
 
 var _ Store = (*InMemoryStore)(nil)
+
+// BindCertificate records that a client certificate belongs to agentRef.
+//
+// A thumbprint binds to exactly one agent. Rebinding a thumbprint that
+// is already bound to a different agent is refused rather than silently
+// moved, because "this certificate is now someone else" is not something
+// that should happen as a side effect of a create call: an operator who
+// means it can revoke the old binding first, which leaves a trail.
+func (s *InMemoryStore) BindCertificate(_ context.Context, agentRef, thumbprint string) (Credential, error) {
+	if thumbprint == "" {
+		return Credential{}, fmt.Errorf("credentials: a certificate binding needs a thumbprint")
+	}
+	id, err := randomID()
+	if err != nil {
+		return Credential{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.byID {
+		if c.Thumbprint != thumbprint {
+			continue
+		}
+		if c.Effective(time.Now()) != StatusActive {
+			continue
+		}
+		if c.AgentRef != agentRef {
+			return Credential{}, fmt.Errorf("credentials: that certificate is already bound to %s, revoke that binding first", c.AgentRef)
+		}
+		return c, nil
+	}
+
+	cred := Credential{
+		ID:         id,
+		AgentRef:   agentRef,
+		Kind:       KindMTLSCert,
+		Status:     StatusActive,
+		Thumbprint: thumbprint,
+		IssuedAt:   time.Now(),
+	}
+	s.byID[id] = cred
+	return cred, nil
+}
+
+func (s *InMemoryStore) VerifyCertificate(_ context.Context, thumbprint string) (Credential, error) {
+	if thumbprint == "" {
+		return Credential{}, ErrInvalidCredential
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.byID {
+		if c.Thumbprint == thumbprint && c.Effective(time.Now()) == StatusActive {
+			return c, nil
+		}
+	}
+	// Unbound, revoked, expired and disabled all collapse here, the same
+	// way Verify collapses its own failure modes.
+	return Credential{}, ErrInvalidCredential
+}

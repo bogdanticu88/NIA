@@ -448,6 +448,46 @@ The connection NIA opens downstream is separate from the agent's connection to N
 
 * * *
 
+### 37. A client certificate authenticates only the agent its thumbprint is explicitly bound to
+
+A certificate signed by a CA in the configured bundle is not, by itself, an authenticated agent. It authenticates when, and only when, an operator has bound its SHA-256 thumbprint to a specific agent.
+
+**Enforced:** `cmd/gateway/mtls.go`'s `mtlsResolver` computes the thumbprint from the DER bytes of the verified leaf and resolves it through `credentials.Store.VerifyCertificate`. An unbound thumbprint resolves to no identity, so the request is unauthenticated and refused. Binding is a deliberate operator action, `POST /agents/{ref}/certificates` or `niactl credential bind-cert`.
+
+The reasoning is the invariant: a trusted CA means the deployment trusts that CA's issuance process, which is a different statement from "this certificate is agent X". Treating the first as the second would make every certificate that CA ever issues, for any purpose, an authenticated agent of this control plane.
+
+**Tested:** `cmd/gateway/mtls_test.go` does real TLS handshakes against a real listener with a real CA. `TestMTLS_ValidCertificateWithNoBindingDoesNotAuthenticate` presents a perfectly valid certificate with no binding and asserts 401. `TestMTLS_ValidBoundCertificateAuthenticates` and `TestMTLS_CertificateAuthenticatesAsTheBoundAgent` cover the positive case and that the agent is the bound one, with a second certificate bound to a different agent getting that agent's authorization. `TestMTLS_UnknownCAIsRejected`, `TestMTLS_ExpiredCertificateIsRejected` and `TestMTLS_InvalidChainIsRejected` cover the cases the TLS stack itself refuses.
+
+**Status:** Holds when the gateway is configured with a server certificate and a client CA bundle. Without a client CA bundle no client certificate is requested or verified and only bearer credentials authenticate, which is the unchanged default.
+
+* * *
+
+### 38. The certificate thumbprint comes from the certificate presented in the handshake, never from a header
+
+No header can establish, change or influence a certificate-based identity.
+
+**Enforced:** the thumbprint is computed by `credentials.ThumbprintOf` over `rc.LeafCertificate().Raw`, the DER bytes the TLS stack verified. `identity.ResolveContext` carries the verified chains rather than a precomputed thumbprint precisely so there is no field a caller could populate. `X-Client-Cert`, `X-Client-Cert-Thumbprint` and `X-Forwarded-Client-Cert` are not read anywhere in this codebase.
+
+The resolver chain puts certificate authentication first, so on a connection where a bound certificate was presented, that is the identity, and a bearer credential in the same request cannot replace it.
+
+**Tested:** `TestMTLS_HeadersCannotOverrideTheCertificateIdentity` presents a certificate bound to an agent with no grants while sending `X-Agent-Ref`, `X-Client-Cert`, `X-Client-Cert-Thumbprint`, `X-Forwarded-Client-Cert` and a valid bearer credential for a different, granted agent, and asserts the result is 403 for the certificate's agent rather than 200 for the header's. `TestMTLS_ADifferentCertificateCannotImpersonateABinding` presents a second certificate with the same subject from the same CA and asserts it does not inherit the binding.
+
+**Status:** Holds. TLS termination at an ingress with the certificate forwarded in a header is deliberately not supported: it needs a trusted-proxy boundary and a way to know a request genuinely came through it, and a half-built version of that is worse than none, see `mtls.go`.
+
+* * *
+
+### 39. Certificate and bearer authentication are subject to the same authorization, risk and containment
+
+Neither authentication mechanism is a side door. Both produce the same `identity.ResolvedIdentity` and everything after authentication is identical.
+
+**Enforced:** `mtlsResolver` and `credentialResolver` both implement `identity.Resolver` and both return the same type, which the single pipeline in `decision.go` consumes. There is no certificate-specific authorization path, so there is no second path that could be missing a check. Both resolvers also check kill state independently, so a killed agent authenticates by neither.
+
+**Tested:** `TestMTLS_BearerAndCertificateGoThroughTheSameAuthorization` drives the same agent through both mechanisms: both are refused 403 with no grant, both succeed once the grant exists, and both are refused 401 after the agent is killed. `TestMTLS_RevokedBindingIsRejected` covers revoking the binding specifically, which is the local revocation mechanism for certificates.
+
+**Status:** Holds. Revocation is local and explicit: revoke the binding and the certificate stops authenticating everywhere on the next request, because the binding is what is checked. CRL and OCSP are not implemented, and whether a deployment needs them, and how it distributes revocation information, is a PKI decision this codebase should not make on its own.
+
+* * *
+
 ### What this document does not cover
 
 Multi-replica correctness is no longer a single unproven claim, it splits by which state a decision actually depends on, see docs/ARCHITECTURE.md's "Distributed state" section for the full table. Kill state, credential state, policy state, the audit trail, and, as of invariant 16 above, risk enforcement state are all genuinely safe to share across `cmd/api`/`cmd/gateway` replicas when their respective `NIA_*_DATABASE_URL` (or `NIA_TESSERA_BASE_URL`) variables are set, and this pass verified that against real infrastructure, not just tests, see docs/THREAT_MODEL.md's rewritten threat 11. Behavioural history joined that list in the gap-closing pass, see invariant 22, which is what makes invariant 16's shared risk total meaningful rather than a correctly-shared number built from fragmented inputs. `internal/incident` and `internal/registry` joined it too, see invariant 25: both now have a `PostgresX` counterpart, so containment evidence outlives the process that recorded it and the agent inventory is the same from every replica. What remains genuinely process-local is the identity graph, which was never meant to be live authorization state in the first place, and whose historical/append-only model, chosen and tested this pass, means it wouldn't matter for an authorization decision even if it were replicated, see invariant 18 above and the identity graph section above. It does not gate a decision the way the invariants above do, `GET /agents/{ref}` in particular already live-queries the shared kill state rather than trusting its own cache, so this is a completeness and investigability gap, not an authorization bypass, stated here rather than left to be discovered running a second replica. One specific version of it was found by watching a real `niactl list` during the gap-closing pass rather than by reading code: `handleListAgents` returned the registry's cached records untouched, so `GET /agents` reported an agent as `active` that `GET /agents/{ref}` correctly reported as `killed`, and an operator scanning a list during an incident read the wrong answer. That is closed, see invariant 29: both endpoints report the same shape from the same live check now, with the per-row cost bounded by running the checks eight at a time. `internal/opauth`, invariants 13 and 26 above, both authenticates a caller to `cmd/api` and decides what that caller may do. What it still lacks: the roles are global rather than scoped to particular agents or business units, so an operator who may write grants may write them for any agent, and there is no issuance API, the first token is written into the file by hand as a deployment step. Expiry and revocation it does have, see invariant 27. It is no longer opt-in, which was the single largest gap this document used to carry: both binaries now refuse to start without `NIA_OPERATOR_TOKENS_PATH` unless `NIA_ALLOW_UNAUTHENTICATED=1` is set deliberately, see invariants 13 and 19. The scoping gap above is what remains. Downstream forwarding, invariant 14 above, is also opt-in, and even configured it inspects a response for a narrow, named set of conditions, not full content, a downstream tool that returns a plausible-looking but poisoned 200 raises none of `inspectAndAuditDownstream`'s checks, see docs/THREAT_MODEL.md's threat 6. Invariant 15's hash chain is tamper evidence, not tamper prevention: an attacker who correctly rewrites the entire suffix of the chain after their tamper, or who replaces the whole table wholesale, defeats it, that boundary is stated directly in `internal/audit/chain.go`'s own doc comment rather than left implicit, and nothing here calls `Verify` automatically, it's an on-demand operation (`GET /audit/verify`, `niactl audit verify`), not continuous monitoring or an alert. Bearer credential replay within a still-valid window, invariant 17 is about the digest never leaking, not about the live secret being single-use, is also not covered anywhere in this codebase, see docs/THREAT_MODEL.md's threat 1 for that boundary stated directly: `<id>.<secret>` has no nonce or freshness check, a captured valid credential is reusable for its full remaining lifetime. All of these gaps are named directly rather than implied covered by their invariant's presence in this list.

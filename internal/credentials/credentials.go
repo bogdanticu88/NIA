@@ -122,6 +122,25 @@ type Credential struct {
 	EnabledAt   *time.Time
 	RotatedFrom string // set on the new credential Rotate creates, the ID it replaced
 	RotatedTo   string // set on the old credential once Rotate has replaced it
+
+	// Thumbprint is the hex SHA-256 of the DER bytes of the client
+	// certificate this credential is bound to, set only for KindMTLSCert
+	// credentials created through BindCertificate.
+	//
+	// A certificate binding is deliberately a credential rather than a
+	// separate concept. It is the same thing every other credential is,
+	// a named, revocable, expirable proof that a particular NHI is the
+	// caller, and modelling it here means revocation, expiry, disable,
+	// the kill cascade and the audit trail all apply to it without a
+	// second implementation of each. The difference is only what counts
+	// as proof: a secret the caller knows, or a private key the caller
+	// demonstrably holds during the TLS handshake.
+	//
+	// Tagged json:"-" for the same reason SecretHash is. It is not
+	// secret, a thumbprint is public information, but it is also not
+	// something any API response has a reason to carry, and the fewer
+	// identifiers that leak into logs and response bodies the better.
+	Thumbprint string `json:"-"`
 }
 
 // Effective returns the status that actually governs whether this
@@ -206,6 +225,40 @@ type Store interface {
 	// failure modes are deliberately indistinguishable from outside
 	// this package.
 	Verify(ctx context.Context, id, presentedSecret string) (Credential, error)
+
+	// BindCertificate binds a client certificate, identified by the hex
+	// SHA-256 of its DER bytes, to agentRef. The result is a
+	// KindMTLSCert credential with no secret: the proof of possession is
+	// the TLS handshake, not something the caller sends.
+	//
+	// Binding is explicit and required. A certificate signed by a
+	// trusted CA is a certificate the deployment trusts the issuer of,
+	// which is a different statement from "this certificate is agent X",
+	// and treating the first as the second would make every certificate
+	// any trusted CA ever issues into an authenticated agent. This is
+	// the step that turns a validated certificate into an identity.
+	BindCertificate(ctx context.Context, agentRef, thumbprint string) (Credential, error)
+
+	// VerifyCertificate resolves a thumbprint to the credential bound to
+	// it, and only if that credential's Effective status is Active. An
+	// unbound, revoked, expired or disabled binding returns
+	// ErrInvalidCredential, the same undifferentiated error Verify
+	// returns, for the same reason.
+	VerifyCertificate(ctx context.Context, thumbprint string) (Credential, error)
+}
+
+// ThumbprintOf is the one definition of a certificate's thumbprint in
+// this codebase: hex-encoded SHA-256 over the certificate's DER bytes,
+// which is what RFC 8705 calls the certificate thumbprint and what every
+// other tool that prints one produces.
+//
+// It takes raw DER rather than an x509.Certificate so there is no way to
+// accidentally hash a parsed, re-encoded, or partially populated
+// certificate and get a value that does not match what the peer actually
+// presented.
+func ThumbprintOf(der []byte) string {
+	sum := sha256.Sum256(der)
+	return hex.EncodeToString(sum[:])
 }
 
 // newSecret generates a fresh high-entropy bearer secret and its hex

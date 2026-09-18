@@ -203,6 +203,22 @@
 # the two do not drift apart if a future endpoint reads incidents from
 # the control plane side.
 #
+# NIA_GATEWAY_TLS_CERT / NIA_GATEWAY_TLS_KEY / NIA_GATEWAY_TLS_CLIENT_CA
+# turn on TLS termination at the gateway and, with the CA bundle, mutual
+# TLS. A client certificate that chains to that bundle and whose SHA-256
+# thumbprint is bound to an agent authenticates as that agent; one that
+# is valid but unbound authenticates as nobody, because a trusted CA
+# vouches for the key and says nothing about which agent is calling.
+#
+# Bind a certificate with `niactl credential bind-cert -ref <agent> -cert
+# client.pem`, and revoke the binding to revoke the certificate.
+#
+# Deliberately unset here: this stack publishes plain HTTP ports for
+# local work, and generating a CA and per-agent certificates is a real
+# PKI decision rather than something a dev compose file should invent.
+# Certificate headers from an ingress (X-Client-Cert and friends) are
+# never trusted, see cmd/gateway/mtls.go.
+#
 # NIA_GATEWAY_MCP_DOWNSTREAM_URL turns on the MCP endpoint. The gateway
 # then serves MCP over streamable HTTP at /mcp, terminates it, inspects
 # the operation, authorizes it, scores it, audits it, and only then opens

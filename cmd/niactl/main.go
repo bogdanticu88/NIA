@@ -47,6 +47,7 @@ Usage:
   niactl audit checkpoint
   niactl audit checkpoints
   niactl credential issue -ref <agent_ref> -kind <api_key|oauth_token|mtls_cert> [-ttl <duration>]
+  niactl credential bind-cert -ref <agent_ref> -cert <path to PEM certificate>
   niactl credential list -ref <agent_ref>
   niactl credential revoke -id <credential_id> [-reason <reason>] [-operator <name>]
   niactl credential disable -id <credential_id> [-reason <reason>] [-operator <name>]
@@ -287,6 +288,8 @@ func cmdCredential(args []string) {
 		cmdCredentialEnable(args[1:])
 	case "rotate":
 		cmdCredentialRotate(args[1:])
+	case "bind-cert":
+		cmdCredentialBindCert(args[1:])
 	default:
 		usage()
 		os.Exit(1)
@@ -491,6 +494,31 @@ func cmdCredentialIssue(args []string) {
 		"operator":    *operator,
 	})
 	post("/agents/"+url.PathEscape(*ref)+"/credentials", body)
+}
+
+// cmdCredentialBindCert binds a client certificate to an agent, which is
+// what turns a certificate a trusted CA signed into an authenticated
+// identity. The PEM is sent rather than a fingerprint the operator
+// computed: the server derives the thumbprint from the same bytes the
+// gateway will see on the wire, which removes the whole class of
+// mistakes that come from copying a fingerprint by hand.
+func cmdCredentialBindCert(args []string) {
+	fs := flag.NewFlagSet("credential bind-cert", flag.ExitOnError)
+	ref := fs.String("ref", "", "agent ref to bind the certificate to")
+	certPath := fs.String("cert", "", "path to the client certificate, PEM encoded")
+	_ = fs.Parse(args)
+
+	if *ref == "" || *certPath == "" {
+		fmt.Fprintln(os.Stderr, "credential bind-cert: -ref and -cert are both required")
+		os.Exit(1)
+	}
+	pem, err := os.ReadFile(*certPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "credential bind-cert: reading %s: %v\n", *certPath, err)
+		os.Exit(1)
+	}
+	body, _ := json.Marshal(map[string]any{"certificate_pem": string(pem)})
+	post("/agents/"+url.PathEscape(*ref)+"/certificates", body)
 }
 
 func cmdCredentialList(args []string) {

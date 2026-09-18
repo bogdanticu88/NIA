@@ -3,6 +3,7 @@ package credentials
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -106,5 +107,68 @@ func TestPostgresStore_Live(t *testing.T) {
 	}
 	if len(list) != 2 {
 		t.Fatalf("ListForAgent returned %d credentials for %s, want 2 (the original and the rotated-to one): %+v", len(list), agentRef, list)
+	}
+}
+
+// TestPostgresStore_Live_CertificateBinding covers the mTLS binding
+// against a real table, including the migration: the thumbprint column
+// is added to a credentials table that already exists in deployments,
+// so a store opened against an older database has to work.
+func TestPostgresStore_Live_CertificateBinding(t *testing.T) {
+	dsn := os.Getenv("NIA_CREDENTIALS_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("NIA_CREDENTIALS_TEST_DATABASE_URL not set, skipping live Postgres test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store, err := NewPostgresStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	defer store.Close()
+
+	agentRef := fmt.Sprintf("agent:cert-live-%d", time.Now().UnixNano())
+	thumbprint := ThumbprintOf([]byte(agentRef)) // any stable 32 bytes of DER stand-in
+	t.Cleanup(func() {
+		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM credentials WHERE agent_ref = $1`, agentRef)
+	})
+
+	bound, err := store.BindCertificate(ctx, agentRef, thumbprint)
+	if err != nil {
+		t.Fatalf("BindCertificate: %v", err)
+	}
+	if bound.Kind != KindMTLSCert || bound.Thumbprint != thumbprint {
+		t.Fatalf("bound = %+v, want an mtls_cert credential carrying the thumbprint", bound)
+	}
+
+	// Read back through a second handle, standing in for another replica.
+	second, err := NewPostgresStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("second store: %v", err)
+	}
+	defer second.Close()
+
+	got, err := second.VerifyCertificate(ctx, thumbprint)
+	if err != nil {
+		t.Fatalf("VerifyCertificate through a second handle: %v", err)
+	}
+	if got.AgentRef != agentRef {
+		t.Fatalf("resolved to %s, want %s", got.AgentRef, agentRef)
+	}
+
+	// Rebinding to someone else is refused rather than silently moved.
+	other := agentRef + "-other"
+	if _, err := store.BindCertificate(ctx, other, thumbprint); err == nil {
+		t.Fatal("a bound certificate was rebound to a different agent")
+	}
+
+	// Revoking the binding stops it resolving, which is the local
+	// revocation mechanism mTLS relies on.
+	if err := store.Revoke(ctx, bound.ID, "bogdan", "key compromised"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := second.VerifyCertificate(ctx, thumbprint); !errors.Is(err, ErrInvalidCredential) {
+		t.Fatalf("VerifyCertificate after revocation = %v, want ErrInvalidCredential", err)
 	}
 }

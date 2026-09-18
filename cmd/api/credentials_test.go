@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bogdanticu88/nia/internal/credentials"
 )
@@ -273,4 +282,111 @@ func TestCredentialResponses_NeverCarryTheSecretHash(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "SecretHash") {
 		t.Fatalf("list response contains SecretHash: %s", rec.Body.String())
 	}
+}
+
+func TestHandleBindCertificate_DerivesTheThumbprintFromThePEM(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents",
+		strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	der := testCertificateDER(t)
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
+	body, _ := json.Marshal(map[string]string{"certificate_pem": string(pemBytes)})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/certificates", bytes.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	// The thumbprint the server derived must be the one the gateway will
+	// compute from the same certificate on the wire, or the binding
+	// silently never matches.
+	want := credentials.ThumbprintOf(der)
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Fatalf("response %s does not carry the thumbprint %s derived from the certificate", rec.Body.String(), want)
+	}
+	if _, err := s.creds.VerifyCertificate(t.Context(), want); err != nil {
+		t.Fatalf("VerifyCertificate after binding: %v", err)
+	}
+}
+
+func TestHandleBindCertificate_AcceptsAColonSeparatedThumbprint(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents",
+		strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	raw := credentials.ThumbprintOf(testCertificateDER(t))
+	// The shape openssl prints, which is what an operator will paste.
+	var spaced strings.Builder
+	for i := 0; i < len(raw); i += 2 {
+		if i > 0 {
+			spaced.WriteString(":")
+		}
+		spaced.WriteString(strings.ToUpper(raw[i : i+2]))
+	}
+
+	body, _ := json.Marshal(map[string]string{"thumbprint": spaced.String()})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/certificates", bytes.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 for a colon separated uppercase fingerprint: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.creds.VerifyCertificate(t.Context(), raw); err != nil {
+		t.Fatalf("VerifyCertificate: %v", err)
+	}
+}
+
+func TestHandleBindCertificate_RejectsNonsense(t *testing.T) {
+	s := newTestServer()
+	mux := s.routes()
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/agents",
+		strings.NewReader(`{"ref":"agent:billing","owner":"bogdan"}`)))
+
+	for name, body := range map[string]string{
+		"neither field":    `{}`,
+		"not pem":          `{"certificate_pem":"hello"}`,
+		"short thumbprint": `{"thumbprint":"abcd"}`,
+		"pem of nothing":   "{\"certificate_pem\":\"-----BEGIN CERTIFICATE-----\\nZm9v\\n-----END CERTIFICATE-----\\n\"}",
+	} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:billing/certificates", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandleBindCertificate_RequiresARegisteredAgent(t *testing.T) {
+	s := newTestServer()
+	der := testCertificateDER(t)
+	body, _ := json.Marshal(map[string]string{"thumbprint": credentials.ThumbprintOf(der)})
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/agents/agent:nope/certificates", bytes.NewReader(body)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for an unregistered agent", rec.Code)
+	}
+}
+
+// testCertificateDER mints a throwaway self-signed certificate, enough
+// to have real DER bytes to hash.
+func testCertificateDER(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "agent-billing"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("creating certificate: %v", err)
+	}
+	return der
 }

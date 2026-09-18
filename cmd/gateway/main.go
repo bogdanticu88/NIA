@@ -208,12 +208,7 @@ type toolCallRequest struct {
 // the only enforcement point; there is no second place in the codebase
 // that decides whether a call is allowed.
 func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
-	headers := map[string]string{}
-	for k := range r.Header {
-		headers[k] = r.Header.Get(k)
-	}
-
-	resolved, err := g.resolver.Resolve(r.Context(), identity.ResolveContext{Headers: headers})
+	resolved, err := g.resolver.Resolve(r.Context(), resolveContextFor(r))
 	if err != nil {
 		g.metrics.requests.Inc("resolve_error")
 		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
@@ -908,7 +903,32 @@ func main() {
 	// real deployment is quietly still running because nobody changed a
 	// default. A deployment that sets this should not be reachable by
 	// anything it doesn't fully trust.
+	// tlsConfigFromEnv: unset means plain HTTP, the default every
+	// deployment before this had. With a client CA bundle configured,
+	// the listener verifies client certificates and mTLS becomes
+	// available, see mtls.go.
+	tlsConfig, mtlsEnabled, err := tlsConfigFromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+
+	// Certificate authentication first when it is configured: it is a
+	// property of the connection rather than of a header, so a caller
+	// that presented a bound certificate is that agent and a bearer
+	// credential in the same request cannot change it. Both resolvers
+	// produce the same ResolvedIdentity, so everything downstream of
+	// authentication is identical for the two and there is no second
+	// authorization path that could be missing a control.
 	var resolver identity.Resolver = credentialResolver{creds: creds, pol: pol}
+	if mtlsEnabled {
+		resolver = chainResolver{resolvers: []identity.Resolver{
+			mtlsResolver{creds: creds, pol: pol},
+			credentialResolver{creds: creds, pol: pol},
+		}}
+		log.Printf("nia-gateway: mTLS is on, a client certificate verified against %s authenticates the agent its thumbprint is bound to, and bearer credentials keep working for callers that present none", envTLSClientCA)
+	} else if tlsConfig != nil {
+		log.Printf("nia-gateway: serving TLS without %s, so client certificates are not requested or verified and bearer credentials are the only authentication", envTLSClientCA)
+	}
 	if os.Getenv("NIA_GATEWAY_INSECURE_HEADER_AUTH") == "1" {
 		log.Printf("nia-gateway: NIA_GATEWAY_INSECURE_HEADER_AUTH=1, trusting X-Agent-Ref with no credential check, this must never be set on anything reachable by an untrusted caller")
 		resolver = headerResolver{headerName: "X-Agent-Ref"}
@@ -994,6 +1014,18 @@ func main() {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+	}
+
+	if tlsConfig != nil {
+		srv.TLSConfig = tlsConfig
+		log.Printf("nia-gateway listening on %s over TLS", addr)
+		// Paths are empty because the certificate and key are already
+		// loaded into TLSConfig, which is also what makes the client CA
+		// and ClientAuth settings above take effect.
+		if err := srv.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("nia-gateway: %v", err)
+		}
+		return
 	}
 
 	log.Printf("nia-gateway listening on %s", addr)
