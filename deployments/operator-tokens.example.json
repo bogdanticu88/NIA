@@ -1,6 +1,17 @@
 [
   {
     "token": "replace-me-with-openssl-rand-base64-32",
-    "name": "bogdan"
+    "name": "bogdan",
+    "roles": ["admin"]
+  },
+  {
+    "token": "replace-me-too",
+    "name": "deploy-pipeline",
+    "roles": ["operator"]
+  },
+  {
+    "token": "and-this-one",
+    "name": "on-call",
+    "roles": ["viewer"]
   }
 ]

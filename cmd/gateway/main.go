@@ -694,7 +694,11 @@ func (g *gateway) operatorOnly(h http.Handler) http.Handler {
 	if g.opStore == nil {
 		return h
 	}
-	return opauth.Middleware(g.opStore, h)
+	// All three are reads, so PermRead is the requirement: an on-call
+	// engineer with the viewer role can investigate an agent's risk and
+	// the incidents behind a containment decision, which is exactly the
+	// access that role exists for, and nothing here changes state.
+	return opauth.Middleware(g.opStore, opauth.Require(opauth.PermRead, h))
 }
 
 func main() {

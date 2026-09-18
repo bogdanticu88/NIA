@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // envTokensPath names a JSON file of operator tokens. Unset means
@@ -35,15 +36,26 @@ const envTokensPath = "NIA_OPERATOR_TOKENS_PATH"
 const EnvAllowUnauthenticated = "NIA_ALLOW_UNAUTHENTICATED"
 
 // tokenFile is one entry in the JSON file NIA_OPERATOR_TOKENS_PATH
-// points at: a flat array of {"token": "...", "name": "..."}. The
+// points at: a flat array of
+// {"token": "...", "name": "...", "roles": ["operator"]}.
+//
+// roles is required and must name at least one known role, see
+// roles.go. Not optional-with-a-default on purpose: defaulting to admin
+// would silently keep the gap roles exist to close, and defaulting to
+// viewer would silently break a deployment that thought it had granted
+// more. An explicit list is the only reading that cannot be wrong by
+// accident, and the startup error names the valid roles.
+//
+// The
 // plaintext token lives in this file because something has to, the
 // same tradeoff NIA_TESSERA_JWT_SIGNING_KEY and TESSERA_JWT_SIGNING_KEY
 // already make for a different shared secret, an operator managing
 // this file is expected to treat it like any other credential store
 // and keep it out of version control.
 type tokenFile struct {
-	Token string `json:"token"`
-	Name  string `json:"name"`
+	Token string   `json:"token"`
+	Name  string   `json:"name"`
+	Roles []string `json:"roles"`
 }
 
 // FromEnv builds a Store from the tokens file named by
@@ -73,7 +85,7 @@ func FromEnv() (Store, error) {
 		return nil, fmt.Errorf("opauth: %s is set but %s contains no tokens, a deployment would lock every operator out, remove the env var instead if that's genuinely intended", envTokensPath, path)
 	}
 
-	tokens := make(map[string]string, len(files))
+	operators := make(map[string]Operator, len(files))
 	for i, f := range files {
 		if f.Token == "" {
 			return nil, fmt.Errorf("opauth: entry %d in %s has an empty token", i, path)
@@ -81,9 +93,20 @@ func FromEnv() (Store, error) {
 		if f.Name == "" {
 			return nil, fmt.Errorf("opauth: entry %d in %s (token present) has an empty name", i, path)
 		}
-		tokens[f.Token] = f.Name
+		if len(f.Roles) == 0 {
+			return nil, fmt.Errorf("opauth: entry %d (%s) in %s declares no roles, add at least one of: %s", i, f.Name, path, strings.Join(KnownRoles(), ", "))
+		}
+		roles := make([]Role, 0, len(f.Roles))
+		for _, raw := range f.Roles {
+			role, err := ParseRole(raw)
+			if err != nil {
+				return nil, fmt.Errorf("opauth: entry %d (%s) in %s: %w", i, f.Name, path, err)
+			}
+			roles = append(roles, role)
+		}
+		operators[f.Token] = Operator{Name: f.Name, Roles: roles}
 	}
-	return NewStaticStore(tokens), nil
+	return NewStaticStoreWithOperators(operators), nil
 }
 
 // FromEnvEnforced is FromEnv with the deployment posture inverted:

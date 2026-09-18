@@ -5,18 +5,18 @@
 // This is a different problem from internal/credentials: that package
 // authenticates an agent (an NHI) to cmd/gateway's hot path, this one
 // authenticates whoever is allowed to register agents, write grants,
-// pull the kill switch, and read the audit trail in the first place.
+// pull the kill switch, and read the audit trail in the first place,
+// and, as of roles.go, decides which of those each caller may do.
 // Before this package existed, cmd/api trusted whatever "operator"
 // string a caller put in a request body, register an agent as
 // "owner":"bogdan" and kill it as "operator":"bogdan" and the API
 // believed both, no proof required, see the security hardening
-// directive's own audit findings. That's a real, named gap, and this
-// package closes the authentication half of it (a verified caller
-// identity), not the authorization half (what that identity is
-// allowed to do): every operator this package can authenticate can
-// still do everything cmd/api exposes, there's no per-operator scoping
-// yet, see this package's own doc comment on Store for the honest
-// statement of that boundary.
+// directive's own audit findings. This package closes both halves of
+// that: authentication, a verified caller identity rather than a
+// claimed one, and authorization, which of cmd/api's actions that
+// identity may take, see roles.go. Authorization came later than
+// authentication and the gap in between was real: for a while any
+// token that authenticated could kill any agent.
 package opauth
 
 import (
@@ -33,6 +33,11 @@ import (
 // claims, see cmd/api/opauth.go's operatorFromContext.
 type Operator struct {
 	Name string
+	// Roles is what this operator is allowed to do, see roles.go. Empty
+	// means nothing is allowed, which is the safe direction for a value
+	// that failed to load: a handler asks Can(perm) and gets false
+	// rather than a permissive default.
+	Roles []Role
 }
 
 // ErrInvalidToken covers every reason a presented token fails: unknown,
@@ -50,13 +55,14 @@ var ErrInvalidToken = errors.New("opauth: invalid token")
 // provider, not OAuth. NIA doesn't have enough distinct human callers
 // yet to justify more, and a static list that's actually checked beats
 // a more sophisticated design that never gets built. What this
-// deliberately doesn't have: per-operator scoping (every valid token
-// can do everything cmd/api exposes), rotation or expiry (a leaked
-// token has to be removed from the source file and the process
-// restarted, there's no live revoke the way internal/credentials has),
-// and any notion of roles. All three are real, open gaps, named here
-// rather than implied solved, closing them is separate work if cmd/api
-// ever has enough distinct operators or enough at stake to need it.
+// deliberately doesn't have: rotation or expiry (a leaked token has to
+// be removed from the source file and the process restarted, there's no
+// live revoke the way internal/credentials has). That is a real, open
+// gap, named here rather than implied solved.
+//
+// Per-operator scoping used to be on that list and is not any more, see
+// roles.go: a token declares roles, a handler demands a permission, and
+// "any authenticated operator can kill any agent" is no longer true.
 type Store interface {
 	Verify(ctx context.Context, token string) (Operator, error)
 }

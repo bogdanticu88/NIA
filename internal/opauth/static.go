@@ -14,13 +14,26 @@ type StaticStore struct {
 }
 
 // NewStaticStore builds a StaticStore from token to operator-name
-// pairs. Plaintext tokens are hashed immediately and never retained,
-// same posture as internal/credentials.Issue never keeping the
-// plaintext secret around after handing it back once.
+// pairs, giving every operator RoleAdmin. Kept for tests and for
+// callers that genuinely want one all-powerful token; FromEnv uses
+// NewStaticStoreWithOperators so a real deployment declares roles
+// explicitly. Plaintext tokens are hashed immediately and never
+// retained, same posture as internal/credentials.Issue never keeping
+// the plaintext secret around after handing it back once.
 func NewStaticStore(tokens map[string]string) *StaticStore {
-	s := &StaticStore{byDigest: make(map[string]Operator, len(tokens))}
+	ops := make(map[string]Operator, len(tokens))
 	for token, name := range tokens {
-		s.byDigest[hashToken(token)] = Operator{Name: name}
+		ops[token] = Operator{Name: name, Roles: []Role{RoleAdmin}}
+	}
+	return NewStaticStoreWithOperators(ops)
+}
+
+// NewStaticStoreWithOperators builds a StaticStore from token to
+// Operator, roles included.
+func NewStaticStoreWithOperators(operators map[string]Operator) *StaticStore {
+	s := &StaticStore{byDigest: make(map[string]Operator, len(operators))}
+	for token, op := range operators {
+		s.byDigest[hashToken(token)] = op
 	}
 	return s
 }

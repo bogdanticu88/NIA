@@ -111,6 +111,13 @@
 # services mount the same file: an operator token is one credential for
 # the control plane, not one per process.
 #
+# Every entry must declare roles, and both services refuse to start if
+# one does not. viewer can read, operator can also change what exists,
+# admin can also kill and restore, see internal/opauth/roles.go. There
+# is no default on purpose: defaulting to admin would silently keep the
+# gap roles exist to close, and defaulting to viewer would silently
+# break a deployment that thought it had granted more.
+#
 # NIA_OPENFGA_API_URL / NIA_OPENFGA_STORE_ID make a hot-path
 # authorization check read live OpenFGA tuples instead of Tessera's
 # declared grant list, see internal/policy.OpenFGAChecker. They matter

@@ -19,7 +19,7 @@ func TestFromEnv_UnsetReturnsNilStoreNoError(t *testing.T) {
 }
 
 func TestFromEnv_ValidFileBuildsAWorkingStore(t *testing.T) {
-	path := writeTokenFile(t, `[{"token":"tok-bogdan","name":"bogdan"},{"token":"tok-ci","name":"ci-pipeline"}]`)
+	path := writeTokenFile(t, `[{"token":"tok-bogdan","name":"bogdan","roles":["admin"]},{"token":"tok-ci","name":"ci-pipeline","roles":["operator"]}]`)
 	t.Setenv(envTokensPath, path)
 
 	store, err := FromEnv()
@@ -126,7 +126,7 @@ func TestFromEnvEnforced_AnyOtherOptOutValueStillFails(t *testing.T) {
 }
 
 func TestFromEnvEnforced_ValidFileReturnsAStoreAndNoOptOut(t *testing.T) {
-	path := writeTokenFile(t, `[{"token":"tok-a","name":"bogdan"}]`)
+	path := writeTokenFile(t, `[{"token":"tok-a","name":"bogdan","roles":["admin"]}]`)
 	t.Setenv(envTokensPath, path)
 	t.Setenv(EnvAllowUnauthenticated, "")
 

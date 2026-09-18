@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bogdanticu88/nia/internal/audit"
 	"github.com/bogdanticu88/nia/internal/opauth"
 )
 
@@ -157,5 +158,133 @@ func TestHandleKill_AuthenticatedOperatorOverridesTheClaimedOneInTheAuditTrail(t
 	}
 	if killed.Operator != "bogdan" {
 		t.Fatalf("Operator = %q, want bogdan (the authenticated token holder), the request body's claimed operator (%q) must not win when auth is configured", killed.Operator, "someone-else-entirely")
+	}
+}
+
+// newTestServerWithRoles wires a token per role so a test can drive the
+// same route as three different callers.
+func newTestServerWithRoles(t *testing.T) *server {
+	t.Helper()
+	return newTestServerWithOpauth(opauth.NewStaticStoreWithOperators(map[string]opauth.Operator{
+		"tok-viewer":   {Name: "reader", Roles: []opauth.Role{opauth.RoleViewer}},
+		"tok-operator": {Name: "day-to-day", Roles: []opauth.Role{opauth.RoleOperator}},
+		"tok-admin":    {Name: "bogdan", Roles: []opauth.Role{opauth.RoleAdmin}},
+	}))
+}
+
+func callAs(t *testing.T, s *server, token, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, path, nil)
+	} else {
+		r = httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, r)
+	return rec
+}
+
+func TestAuthorization_ViewerCanReadButNotWrite(t *testing.T) {
+	s := newTestServerWithRoles(t)
+
+	if got := callAs(t, s, "tok-viewer", http.MethodGet, "/agents", "").Code; got != http.StatusOK {
+		t.Fatalf("GET /agents as viewer = %d, want 200", got)
+	}
+	if got := callAs(t, s, "tok-viewer", http.MethodPost, "/agents", `{"ref":"agent:x"}`).Code; got != http.StatusForbidden {
+		t.Fatalf("POST /agents as viewer = %d, want 403", got)
+	}
+	if got := callAs(t, s, "tok-viewer", http.MethodPost, "/tools", `{"name":"t"}`).Code; got != http.StatusForbidden {
+		t.Fatalf("POST /tools as viewer = %d, want 403", got)
+	}
+}
+
+// TestAuthorization_OperatorCannotKill is the separation that closes the
+// gap this document used to name directly: an authenticated operator
+// who should not be able to kill agents could kill agents.
+func TestAuthorization_OperatorCannotKill(t *testing.T) {
+	s := newTestServerWithRoles(t)
+
+	if got := callAs(t, s, "tok-operator", http.MethodPost, "/agents", `{"ref":"agent:by-operator"}`).Code; got != http.StatusCreated {
+		t.Fatalf("POST /agents as operator = %d, want 201", got)
+	}
+	rec := callAs(t, s, "tok-operator", http.MethodPost, "/policy/kill", `{"agent_ref":"agent:by-operator","incident":"INC-1"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("POST /policy/kill as operator = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	if got := callAs(t, s, "tok-operator", http.MethodPost, "/policy/restore", `{"agent_ref":"agent:by-operator"}`).Code; got != http.StatusForbidden {
+		t.Fatalf("POST /policy/restore as operator = %d, want 403", got)
+	}
+}
+
+func TestAuthorization_AdminCanKill(t *testing.T) {
+	s := newTestServerWithRoles(t)
+	if got := callAs(t, s, "tok-admin", http.MethodPost, "/agents", `{"ref":"agent:by-admin"}`).Code; got != http.StatusCreated {
+		t.Fatalf("POST /agents as admin = %d, want 201", got)
+	}
+	rec := callAs(t, s, "tok-admin", http.MethodPost, "/policy/kill", `{"agent_ref":"agent:by-admin","incident":"INC-1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /policy/kill as admin = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAuthorization_UnauthenticatedIs401NotForbidden keeps the two
+// answers distinct: "I don't know who you are" and "I know exactly who
+// you are and you may not do this" are different facts.
+func TestAuthorization_UnauthenticatedIs401NotForbidden(t *testing.T) {
+	s := newTestServerWithRoles(t)
+	if got := callAs(t, s, "", http.MethodPost, "/policy/kill", `{"agent_ref":"agent:x"}`).Code; got != http.StatusUnauthorized {
+		t.Fatalf("status = %d with no token, want 401 rather than 403", got)
+	}
+}
+
+func TestAuthorization_KilledByRecordsTheAuthenticatedAdmin(t *testing.T) {
+	s := newTestServerWithRoles(t)
+	if got := callAs(t, s, "tok-admin", http.MethodPost, "/agents", `{"ref":"agent:attributed"}`).Code; got != http.StatusCreated {
+		t.Fatalf("register = %d", got)
+	}
+	// The body claims someone else. The audit trail must not believe it.
+	if got := callAs(t, s, "tok-admin", http.MethodPost, "/policy/kill",
+		`{"agent_ref":"agent:attributed","incident":"INC-9","operator":"someone-else-entirely"}`).Code; got != http.StatusOK {
+		t.Fatalf("kill = %d", got)
+	}
+
+	events, err := s.auditLog.(*audit.InMemorySink).ForAgent(t.Context(), "agent:attributed")
+	if err != nil {
+		t.Fatalf("ForAgent: %v", err)
+	}
+	for _, e := range events {
+		if e.Action == "agent.killed" {
+			if e.Operator != "bogdan" {
+				t.Fatalf("audit Operator = %q, want the authenticated admin", e.Operator)
+			}
+			return
+		}
+	}
+	t.Fatal("no agent.killed event was written")
+}
+
+// TestAuthorization_ReadRoutesStayReadable is a guard against the
+// opposite mistake: over-restricting the investigation surface, which
+// is exactly what an on-call engineer needs during an incident.
+func TestAuthorization_ReadRoutesStayReadable(t *testing.T) {
+	s := newTestServerWithRoles(t)
+	for _, path := range []string{"/agents", "/tools", "/audit", "/audit/verify"} {
+		if got := callAs(t, s, "tok-viewer", http.MethodGet, path, "").Code; got == http.StatusForbidden {
+			t.Fatalf("GET %s as viewer = 403, a viewer is meant to be able to investigate", path)
+		}
+	}
+}
+
+func TestAuthorization_HealthAndMetricsNeedNoRole(t *testing.T) {
+	s := newTestServerWithRoles(t)
+	for _, path := range []string{"/healthz", "/metrics"} {
+		if got := callAs(t, s, "", http.MethodGet, path, "").Code; got != http.StatusOK {
+			t.Fatalf("GET %s = %d without a token, want 200", path, got)
+		}
 	}
 }

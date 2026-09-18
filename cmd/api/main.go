@@ -1476,32 +1476,48 @@ func (s *server) handleVerifyAudit(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
+
+	// Every route below declares the permission it needs, next to the
+	// route rather than in a table somewhere else, so the answer to
+	// "who can do this" is visible at the point the route is defined.
+	// read is anything that only looks, write changes what exists, and
+	// kill is the switch plus its restore, separated because its
+	// consequence is immediate and total: it deletes an agent's tuples
+	// and cascades into revoking every credential it holds. See
+	// internal/opauth/roles.go.
+	//
+	// GET /healthz and GET /metrics take no permission for the same
+	// reason opauth.Middleware exempts them from authentication.
+	read := func(h http.HandlerFunc) http.Handler { return opauth.Require(opauth.PermRead, h) }
+	write := func(h http.HandlerFunc) http.Handler { return opauth.Require(opauth.PermWrite, h) }
+	kill := func(h http.HandlerFunc) http.Handler { return opauth.Require(opauth.PermKill, h) }
+
 	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.HandleFunc("POST /agents", s.handleRegisterAgent)
-	mux.HandleFunc("GET /agents", s.handleListAgents)
-	mux.HandleFunc("GET /agents/{ref}", s.handleGetAgent)
-	mux.HandleFunc("POST /policy/kill", s.handleKill)
-	mux.HandleFunc("POST /policy/restore", s.handleRestore)
-	mux.HandleFunc("POST /agents/{ref}/grants", s.handleWriteGrants)
-	mux.HandleFunc("DELETE /agents/{ref}/grants", s.handleDeleteGrants)
-	mux.HandleFunc("GET /agents/{ref}/grants", s.handleListGrants)
-	mux.HandleFunc("POST /agents/{ref}/credentials", s.handleIssueCredential)
-	mux.HandleFunc("GET /agents/{ref}/credentials", s.handleListCredentials)
-	mux.HandleFunc("POST /credentials/{id}/revoke", s.handleRevokeCredential)
-	mux.HandleFunc("POST /credentials/{id}/disable", s.handleDisableCredential)
-	mux.HandleFunc("POST /credentials/{id}/enable", s.handleEnableCredential)
-	mux.HandleFunc("POST /credentials/{id}/rotate", s.handleRotateCredential)
-	mux.HandleFunc("POST /tools", s.handleRegisterTool)
-	mux.HandleFunc("GET /tools", s.handleListTools)
-	mux.HandleFunc("GET /tools/{name}", s.handleGetTool)
-	mux.HandleFunc("GET /audit", s.handleRecentAudit)
-	mux.HandleFunc("GET /agents/{ref}/audit", s.handleAgentAudit)
-	mux.HandleFunc("GET /audit/verify", s.handleVerifyAudit)
-	mux.HandleFunc("POST /graph/nodes", s.handleAddGraphNode)
-	mux.HandleFunc("POST /graph/edges", s.handleAddGraphEdge)
-	mux.HandleFunc("GET /graph/{id}/neighbors", s.handleGraphNeighbors)
-	mux.HandleFunc("GET /graph/{id}/reachable", s.handleGraphReachable)
-	mux.HandleFunc("GET /graph/{id}/blast-radius", s.handleBlastRadius)
+	mux.Handle("POST /agents", write(s.handleRegisterAgent))
+	mux.Handle("GET /agents", read(s.handleListAgents))
+	mux.Handle("GET /agents/{ref}", read(s.handleGetAgent))
+	mux.Handle("POST /policy/kill", kill(s.handleKill))
+	mux.Handle("POST /policy/restore", kill(s.handleRestore))
+	mux.Handle("POST /agents/{ref}/grants", write(s.handleWriteGrants))
+	mux.Handle("DELETE /agents/{ref}/grants", write(s.handleDeleteGrants))
+	mux.Handle("GET /agents/{ref}/grants", read(s.handleListGrants))
+	mux.Handle("POST /agents/{ref}/credentials", write(s.handleIssueCredential))
+	mux.Handle("GET /agents/{ref}/credentials", read(s.handleListCredentials))
+	mux.Handle("POST /credentials/{id}/revoke", write(s.handleRevokeCredential))
+	mux.Handle("POST /credentials/{id}/disable", write(s.handleDisableCredential))
+	mux.Handle("POST /credentials/{id}/enable", write(s.handleEnableCredential))
+	mux.Handle("POST /credentials/{id}/rotate", write(s.handleRotateCredential))
+	mux.Handle("POST /tools", write(s.handleRegisterTool))
+	mux.Handle("GET /tools", read(s.handleListTools))
+	mux.Handle("GET /tools/{name}", read(s.handleGetTool))
+	mux.Handle("GET /audit", read(s.handleRecentAudit))
+	mux.Handle("GET /agents/{ref}/audit", read(s.handleAgentAudit))
+	mux.Handle("GET /audit/verify", read(s.handleVerifyAudit))
+	mux.Handle("POST /graph/nodes", write(s.handleAddGraphNode))
+	mux.Handle("POST /graph/edges", write(s.handleAddGraphEdge))
+	mux.Handle("GET /graph/{id}/neighbors", read(s.handleGraphNeighbors))
+	mux.Handle("GET /graph/{id}/reachable", read(s.handleGraphReachable))
+	mux.Handle("GET /graph/{id}/blast-radius", read(s.handleBlastRadius))
 	mux.Handle("GET /metrics", s.metricsReg)
 	// routes() returns http.Handler rather than *http.ServeMux
 	// specifically so this wrap is possible: when operator auth is

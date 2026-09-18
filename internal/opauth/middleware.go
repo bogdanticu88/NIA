@@ -2,6 +2,7 @@ package opauth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -14,21 +15,56 @@ import (
 // string key into a context.
 type contextKey struct{}
 
-// OperatorFromContext returns the authenticated operator's name and
+// FromContext returns the authenticated operator, roles included, and
 // whether one was actually established. A handler uses this in
 // preference to any operator/*_by field a request body supplies: when
 // Middleware ran, the caller cannot claim to be anyone but who their
 // token says they are.
-func OperatorFromContext(ctx context.Context) (string, bool) {
-	name, ok := ctx.Value(contextKey{}).(string)
-	return name, ok
+func FromContext(ctx context.Context) (Operator, bool) {
+	op, ok := ctx.Value(contextKey{}).(Operator)
+	return op, ok
 }
 
-// withOperator is the only way a name gets into the context under
+// OperatorFromContext returns just the authenticated operator's name,
+// the shape every audit-writing handler wants.
+func OperatorFromContext(ctx context.Context) (string, bool) {
+	op, ok := FromContext(ctx)
+	return op.Name, ok
+}
+
+// withOperator is the only way an Operator gets into the context under
 // contextKey, kept unexported so the only path to an "authenticated"
 // operator identity is through Middleware actually verifying a token.
-func withOperator(ctx context.Context, name string) context.Context {
-	return context.WithValue(ctx, contextKey{}, name)
+func withOperator(ctx context.Context, op Operator) context.Context {
+	return context.WithValue(ctx, contextKey{}, op)
+}
+
+// Require wraps a handler so it only runs for an operator holding perm.
+// An authenticated caller without it gets 403, which is a different
+// answer from the 401 an unauthenticated one gets and deliberately so:
+// "I don't know who you are" and "I know exactly who you are and you
+// may not do this" are different facts, and an operator debugging their
+// own access needs to be able to tell them apart.
+//
+// A request that never went through Middleware has no operator in its
+// context at all. That happens only when the process is running with
+// NIA_ALLOW_UNAUTHENTICATED=1, where there is no identity to authorize
+// and every request is already trusted, so this passes through rather
+// than refusing: refusing would make the escape hatch useless without
+// making anything safer.
+func Require(perm Permission, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		op, ok := FromContext(r.Context())
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !op.Can(perm) {
+			niahttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("operator %q holds roles %s, which do not include the %q permission this endpoint requires", op.Name, strings.Join(op.RoleNames(), ", "), perm))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // bearerPrefix is the scheme an operator token must be presented with.
@@ -82,6 +118,6 @@ func Middleware(store Store, next http.Handler, exempt ...string) http.Handler {
 			niahttp.WriteError(w, http.StatusInternalServerError, "could not verify operator token")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withOperator(r.Context(), op.Name)))
+		next.ServeHTTP(w, r.WithContext(withOperator(r.Context(), op)))
 	})
 }
