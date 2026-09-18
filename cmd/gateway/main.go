@@ -761,6 +761,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("nia-gateway: %v", err)
 	}
+	// Validated here rather than inside the monitoringConfigured branch
+	// below, because a malformed rate configuration should be an error
+	// whether or not anything is going to use it. Inside the branch, a
+	// deployment that set NIA_RISK_RATE_WINDOW alone and no thresholds
+	// would start cleanly and report nothing, and then quietly stay
+	// wrong the day someone turned thresholds on.
+	rateWindow, rateThreshold, err := risk.RateConfigFromEnv()
+	if err != nil {
+		log.Fatalf("nia-gateway: %v", err)
+	}
+	if rateThreshold > 0 && !monitoringConfigured {
+		log.Printf("nia-gateway: rate detection is configured (%d calls per %s) but no risk threshold is set, so nothing is scored and it has no effect, see NIA_RISK_FLAG_AT, NIA_RISK_REVOKE_AT and NIA_RISK_KILL_AT", rateThreshold, rateWindow)
+	}
 	if monitoringConfigured {
 		riskStore, err := monitoring.RiskStoreFromEnv(context.Background())
 		if err != nil {
@@ -772,15 +785,12 @@ func main() {
 		// restart. Set it to the same database every replica points at
 		// and the inputs to the risk total are shared the same way
 		// RiskStoreFromEnv already shares the total itself, see
-		// risk.PostgresCallHistory. risk.RateConfigFromEnv: both of
-		// NIA_RISK_RATE_WINDOW and NIA_RISK_RATE_THRESHOLD, or neither,
-		// the call_rate signal stays off until an operator picks
-		// numbers for their own traffic.
+		// risk.PostgresCallHistory. The rate configuration was already
+		// read and validated above, both of NIA_RISK_RATE_WINDOW and
+		// NIA_RISK_RATE_THRESHOLD or neither, the call_rate signal
+		// stays off until an operator picks numbers for their own
+		// traffic.
 		callHistory, sharedHistory, err := risk.CallHistoryFromEnv(context.Background())
-		if err != nil {
-			log.Fatalf("nia-gateway: %v", err)
-		}
-		rateWindow, rateThreshold, err := risk.RateConfigFromEnv()
 		if err != nil {
 			log.Fatalf("nia-gateway: %v", err)
 		}

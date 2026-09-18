@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -34,6 +35,32 @@ CREATE TABLE IF NOT EXISTS risk_state (
 // A running total genuinely only ever needs one statement to update
 // safely, there's no multi-row invariant here to protect with a wider
 // transaction.
+// Pool limits. database/sql defaults to an unbounded number of open
+// connections, and one NIA process now opens four separate pools
+// against the same database (audit, credentials, risk state, call
+// history), so an unbounded default means a handful of replicas under
+// load can exhaust a stock Postgres, whose own default is 100 clients.
+// That failure is worse than it sounds because it hits every store at
+// once: audit appends start failing (fail-open by design, see
+// docs/SECURITY_INVARIANTS.md invariant 8), risk scoring starts
+// erroring, and credential verification starts returning
+// infrastructure errors rather than answers.
+//
+// Observed rather than theorised: a live concurrency test opening 100
+// simultaneous callers across two pools, with two NIA binaries already
+// holding their own, hit "pq: sorry, too many clients already" and lost
+// updates.
+//
+// Same numbers in all four constructors on purpose, duplicated rather
+// than shared because there is no common database package here yet and
+// inventing one for three constants is the wrong trade. If these ever
+// need to differ per store, that is the moment to add one.
+const (
+	maxOpenConns    = 8
+	maxIdleConns    = 4
+	connMaxLifetime = 30 * time.Minute
+)
+
 type PostgresRiskStore struct {
 	db *sql.DB
 }
@@ -54,6 +81,9 @@ func NewPostgresRiskStore(ctx context.Context, dsn string) (*PostgresRiskStore, 
 		db.Close()
 		return nil, fmt.Errorf("monitoring: creating risk_state schema: %w", err)
 	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(connMaxLifetime)
 	return &PostgresRiskStore{db: db}, nil
 }
 

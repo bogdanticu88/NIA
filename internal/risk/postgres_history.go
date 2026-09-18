@@ -57,6 +57,32 @@ CREATE INDEX IF NOT EXISTS agent_calls_ref_at_idx ON agent_calls (agent_ref, at)
 // scored novel_tool up to three times and every restart made the whole
 // catalog look novel again, so a correctly shared total was being fed
 // by inputs that were neither shared nor stable.
+// Pool limits. database/sql defaults to an unbounded number of open
+// connections, and one NIA process now opens four separate pools
+// against the same database (audit, credentials, risk state, call
+// history), so an unbounded default means a handful of replicas under
+// load can exhaust a stock Postgres, whose own default is 100 clients.
+// That failure is worse than it sounds because it hits every store at
+// once: audit appends start failing (fail-open by design, see
+// docs/SECURITY_INVARIANTS.md invariant 8), risk scoring starts
+// erroring, and credential verification starts returning
+// infrastructure errors rather than answers.
+//
+// Observed rather than theorised: a live concurrency test opening 100
+// simultaneous callers across two pools, with two NIA binaries already
+// holding their own, hit "pq: sorry, too many clients already" and lost
+// updates.
+//
+// Same numbers in all four constructors on purpose, duplicated rather
+// than shared because there is no common database package here yet and
+// inventing one for three constants is the wrong trade. If these ever
+// need to differ per store, that is the moment to add one.
+const (
+	maxOpenConns    = 8
+	maxIdleConns    = 4
+	connMaxLifetime = 30 * time.Minute
+)
+
 type PostgresCallHistory struct {
 	db *sql.DB
 }
@@ -77,6 +103,9 @@ func NewPostgresCallHistory(ctx context.Context, dsn string) (*PostgresCallHisto
 		db.Close()
 		return nil, fmt.Errorf("risk: creating call history schema: %w", err)
 	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(connMaxLifetime)
 	return &PostgresCallHistory{db: db}, nil
 }
 

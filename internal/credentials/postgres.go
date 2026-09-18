@@ -43,6 +43,18 @@ CREATE INDEX IF NOT EXISTS credentials_agent_ref_idx ON credentials (agent_ref);
 // not just within one, see docs/ARCHITECTURE.md's "State convergence"
 // section. Rotate's atomicity is a real transaction here, not just a
 // mutex the way InMemoryStore manages it, see Rotate's own comment.
+// Pool limits, same numbers and the same reasoning as every other
+// PostgresX constructor in this codebase, see
+// internal/audit/postgres_sink.go's own block for the full rationale:
+// database/sql is unbounded by default, one NIA process now opens four
+// separate pools against the same database, and a stock Postgres allows
+// 100 clients in total.
+const (
+	maxOpenConns    = 8
+	maxIdleConns    = 4
+	connMaxLifetime = 30 * time.Minute
+)
+
 type PostgresStore struct {
 	db *sql.DB
 }
@@ -63,6 +75,9 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("credentials: creating credentials schema: %w", err)
 	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(connMaxLifetime)
 	return &PostgresStore{db: db}, nil
 }
 
