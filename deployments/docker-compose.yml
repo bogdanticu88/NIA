@@ -203,6 +203,32 @@
 # the two do not drift apart if a future endpoint reads incidents from
 # the control plane side.
 #
+# NIA_GATEWAY_MCP_DOWNSTREAM_URL turns on the MCP endpoint. The gateway
+# then serves MCP over streamable HTTP at /mcp, terminates it, inspects
+# the operation, authorizes it, scores it, audits it, and only then opens
+# its own separate MCP connection to the downstream server. It is not a
+# tunnel: a gateway that forwards the agent's bytes can authenticate the
+# connection and nothing else, it cannot tell tools/call from tools/list
+# or see which tool and which arguments, which is every decision NIA
+# exists to make.
+#
+# NIA_GATEWAY_MCP_DOWNSTREAM_TOKEN is the credential NIA presents to the
+# downstream, and it is deliberately NIA's own. The agent's credential
+# authenticates the agent to NIA and stops there: a downstream that
+# received it could act as that agent against anything else trusting the
+# same credential. NIA_GATEWAY_MCP_DOWNSTREAM_HEADER moves it out of
+# Authorization for a downstream that wants it elsewhere.
+#
+# Deliberately unset here because this stack has no MCP server in it to
+# proxy to. Point it at one and the endpoint appears.
+#
+# Session model is stateless streamable HTTP, so the gateway is safe
+# behind a load balancer with no sticky routing and replicas share
+# nothing. The cost is one downstream session per call, and the limit is
+# that MCP features needing session state (server-initiated messages on
+# the standalone SSE stream, resumability, subscriptions) are not
+# available, see cmd/gateway/mcp.go.
+#
 # Rate limiting is on by default in both services and needs no
 # configuration here, which is why no NIA_RATE_LIMIT_* variable appears
 # below. 50 requests per second per client address (burst 100) and, in

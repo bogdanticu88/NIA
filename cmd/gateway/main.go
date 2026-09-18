@@ -150,6 +150,12 @@ type gateway struct {
 	// moment the agent's ref exists. The two are not redundant: one
 	// agent can call from many addresses, and one address can present
 	// many agents' credentials.
+	// mcpDownstream is the MCP server this gateway proxies to, nil when
+	// NIA_GATEWAY_MCP_DOWNSTREAM_URL is unset, in which case /mcp is not
+	// served at all. Separate from forwarder: that one is the plain JSON
+	// downstream, this one speaks MCP, and a deployment can have either,
+	// both or neither.
+	mcpDownstream  *mcpDownstream
 	clientLimiter  *ratelimit.Limiter
 	agentLimiter   *ratelimit.Limiter
 	trustForwarded bool
@@ -222,113 +228,30 @@ func (g *gateway) handleToolCall(w http.ResponseWriter, r *http.Request) {
 	tool := r.PathValue("tool")
 	ctx := r.Context()
 
-	// The per-agent limit goes here, after identity resolution and
-	// before anything expensive: this is the first point the agent's
-	// ref exists, and every step below it (catalog lookup, policy
-	// check, argument inspection, scoring, forwarding) costs real work
-	// on behalf of a caller that may be flooding. internal/risk's
-	// call_rate signal observes the same burst and feeds containment,
-	// this is the half that actually refuses it.
-	if !g.agentLimiter.Allow(resolved.Ref) {
-		g.metrics.rateLimited.Inc("agent")
-		g.audit(ctx, "gateway.rate_limited", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
-		w.Header().Set("Retry-After", "1")
-		niahttp.WriteError(w, http.StatusTooManyRequests, "rate limit exceeded for this agent, slow down")
-		return
-	}
-
 	var body toolCallRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		niahttp.WriteError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if g.toolCat != nil {
-		if _, err := g.toolCat.Get(ctx, tool); err != nil {
-			if errors.Is(err, tools.ErrNotFound) {
-				g.metrics.requests.Inc("unknown_tool")
-				g.audit(ctx, "gateway.unknown_tool", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
-				niahttp.WriteError(w, http.StatusNotFound, "tool is not registered")
-				return
-			}
-			// Same posture as a failed policy check below: couldn't
-			// determine whether this tool is even real, so this is not
-			// a denial, it's "we couldn't ask," worth its own action
-			// for an incident review to tell apart from "we said no."
-			g.metrics.requests.Inc("tool_lookup_error")
-			g.audit(ctx, "gateway.tool_lookup_error", resolved.Ref, fmt.Sprintf("tool=%s err=%v", tool, err))
-			niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
-			return
+	// The whole security pipeline, shared with the MCP transport so the
+	// two front doors cannot drift apart, see decision.go.
+	decision := g.decideToolCall(ctx, resolved, tool, body.Arguments)
+	if !decision.Allowed {
+		if decision.Outcome == outcomeRateLimited {
+			w.Header().Set("Retry-After", "1")
 		}
-	}
-
-	grant := policy.GrantForTool(tool)
-	allowed, err := g.pol.Check(ctx, resolved.Ref, grant)
-	if err != nil {
-		// A failed check is not a denial, the policy engine couldn't be
-		// reached or errored, worth its own action so an incident
-		// review can tell "we said no" apart from "we couldn't ask."
-		g.metrics.requests.Inc("check_error")
-		g.audit(ctx, "gateway.check_error", resolved.Ref, fmt.Sprintf("tool=%s err=%v", tool, err))
-		niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		niahttp.WriteError(w, decision.HTTPStatus(), decision.Message)
 		return
 	}
-	if !allowed {
-		g.metrics.requests.Inc("denied_tool")
-		g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
-		niahttp.WriteError(w, http.StatusForbidden, "agent is not authorized for this tool")
-		return
-	}
-
-	// Being allowed to call the tool is not being allowed to touch
-	// every resource the arguments name. This only runs when
-	// resourcePolicy is configured, additive, nothing that worked
-	// before this existed stops working, and even then it only demands
-	// an explicit data grant for a resource classified at
-	// sensitivity.Sensitive or above, see resources.go and
-	// internal/sensitivity's package doc for why: an agent authorized
-	// for database.query doesn't need a data grant declared for every
-	// column it might ever touch, only the ones an operator has flagged
-	// as actually sensitive.
-	var resources []string
-	if g.resourcePolicy != nil {
-		resources = g.resourcePolicy.Resources(tool, body.Arguments)
-		for _, resource := range resources {
-			level := sensitivity.Public
-			if g.sensitive != nil {
-				level = g.sensitive.Classify(resource)
-			}
-			if level < sensitivity.Sensitive {
-				continue
-			}
-			dataAllowed, err := g.pol.Check(ctx, resolved.Ref, policy.GrantForData(resource))
-			if err != nil {
-				g.metrics.requests.Inc("check_error")
-				g.audit(ctx, "gateway.check_error", resolved.Ref, fmt.Sprintf("tool=%s resource=%s err=%v", tool, resource, err))
-				niahttp.WriteError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if !dataAllowed {
-				g.metrics.requests.Inc("denied_resource")
-				g.audit(ctx, "gateway.denied", resolved.Ref, fmt.Sprintf("tool=%s resource=%s level=%s credential=%s", tool, resource, level, resolved.CredentialID))
-				niahttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("agent is not authorized for resource %q", resource))
-				return
-			}
-		}
-	}
-
-	g.metrics.requests.Inc("allowed")
-	g.audit(ctx, "gateway.allowed", resolved.Ref, fmt.Sprintf("tool=%s credential=%s", tool, resolved.CredentialID))
 
 	resp := map[string]any{
 		"agent":  resolved.Ref,
 		"tool":   tool,
 		"status": "allowed",
 	}
-	if g.monitor != nil {
-		if ri, ok := g.observe(ctx, resolved.Ref, tool, resources); ok {
-			resp["risk"] = ri
-		}
+	if decision.Risk != nil {
+		resp["risk"] = *decision.Risk
 	}
 
 	// Everything above this point is the decision: identity, credential
@@ -775,6 +698,14 @@ func (g *gateway) routes() http.Handler {
 	mux.Handle("GET /incidents", g.operatorOnly(http.HandlerFunc(g.handleListIncidents)))
 	mux.Handle("GET /incidents/{id}", g.operatorOnly(http.HandlerFunc(g.handleGetIncident)))
 	mux.Handle("GET /risk/{ref}", g.operatorOnly(http.HandlerFunc(g.handleRisk)))
+	// The MCP endpoint, when a downstream MCP server is configured. It
+	// authenticates the agent itself, in front of the protocol, see
+	// mcp.go, so it is not wrapped in operatorOnly: an agent presents
+	// its own credential here, never an operator token.
+	if g.mcpDownstream != nil {
+		mux.Handle(mcpPath, g.mcpHandler())
+	}
+
 	mux.Handle("GET /metrics", g.metricsReg)
 
 	// Same order as cmd/api: rate limit, then body cap, then the mux.
@@ -988,6 +919,18 @@ func main() {
 	// returns its own response, same as every gateway before this pass.
 	// Set it to a real downstream tool/MCP server's address and an
 	// authorized call actually reaches it, see forward.go.
+	// mcpDownstreamFromEnv: NIA_GATEWAY_MCP_DOWNSTREAM_URL unset means
+	// no MCP endpoint, same additive posture as everything else here.
+	mcpDown := mcpDownstreamFromEnv()
+	if mcpDown != nil {
+		log.Printf("nia-gateway: %s is set, serving MCP over streamable HTTP at %s, proxying to the downstream MCP server on its own connection", envMCPDownstreamURL, mcpPath)
+		if mcpDown.token == "" {
+			log.Printf("nia-gateway: no %s is set, the downstream MCP server is called with no credential from NIA, the agent's own credential is never forwarded either way", envMCPDownstreamToken)
+		}
+	} else {
+		log.Printf("nia-gateway: %s is not set, the MCP endpoint is not served", envMCPDownstreamURL)
+	}
+
 	forwarder := forwarderFromEnv()
 	if forwarder != nil {
 		log.Printf("nia-gateway: %s is set, authorized calls are forwarded to a real downstream tool", envDownstreamURL)
@@ -1029,6 +972,7 @@ func main() {
 		incidents:      incidents,
 		forwarder:      forwarder,
 		opStore:        opStore,
+		mcpDownstream:  mcpDown,
 		clientLimiter:  rateCfg.PerClient(),
 		agentLimiter:   rateCfg.PerAgent(),
 		trustForwarded: rateCfg.TrustForwardedFor,
