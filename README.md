@@ -15,7 +15,7 @@ Full documentation is in [`docs/`](docs/), and the development log is in [`CHANG
 
 ## See it work
 
-This is a real transcript, `niactl simulate attack -scenario agent-hijack` run against real `nia-api` and `nia-gateway` processes sharing a real, running Tessera instance (in-memory-backed, no OpenFGA needed for this), not printed output standing in for one. An invoice-processing agent is granted seven tools up front, a realistic, coarse, over-privileged starting point: broad RBAC says yes to all of it. Each individual call below is fully authorized. Nothing here is an authorization failure. The compromise is visible only in the pattern:
+This is a real transcript, `niactl simulate attack -scenario agent-hijack` run against the Docker stack below: real `nia-api` and `nia-gateway` processes, a real Tessera instance backed by a real OpenFGA, and one Postgres shared between them. An invoice-processing agent is granted seven tools up front, a realistic, coarse, over-privileged starting point: broad RBAC says yes to all of it. Every call the agent is allowed to make below is fully authorized. Nothing here is an authorization failure. The compromise is visible only in the pattern.
 
 ```
 [01] agent:invoice-agent -> invoice.read
@@ -23,44 +23,48 @@ This is a real transcript, `niactl simulate attack -scenario agent-hijack` run a
      risk this call: 1, cumulative: 1  [novel_tool(+1)]
 [02] agent:invoice-agent -> customer.read
      ALLOWED
-     risk this call: 1, cumulative: 2  [novel_tool(+1)]
+     risk this call: 2, cumulative: 2  [novel_tool(+1), novel_transition(+0)]
 [03] agent:invoice-agent -> payment.lookup
      ALLOWED
-     risk this call: 1, cumulative: 3  [novel_tool(+1)]
+     risk this call: 2, cumulative: 4  [novel_tool(+1), novel_transition(+0)]  monitoring action: flag
 [04] agent:invoice-agent -> customer.export
      DETECTED: new tool, privilege deviation (call was allowed, flagged for review, not blocked outright)
-     risk this call: 4, cumulative: 7  [novel_tool(+1), risk_class:destructive(+3)]  monitoring action: flag
+     risk this call: 4, cumulative: 8  [novel_tool(+1), novel_transition(+0), risk_class:destructive(+3)]  monitoring action: flag
 [05] agent:invoice-agent -> credential.read
      DETECTED: privilege escalation attempt (call was allowed, flagged for review, not blocked outright)
-     risk this call: 4, cumulative: 11  [novel_tool(+1), risk_class:destructive(+3)]  monitoring action: revoke
+     risk this call: 4, cumulative: 0  [novel_tool(+1), novel_transition(+0), risk_class:destructive(+3)]  monitoring action: kill
 [06] agent:invoice-agent -> database.query
-     DETECTED: sensitive data access (customers.ssn) (call was allowed, flagged for review, not blocked outright)
-     risk this call: 1, cumulative: 12  [novel_tool(+1)]  monitoring action: revoke
+     CUT OFF (the credential was revoked by the containment above, this call fails at authentication and never reaches the authorization check)
 [07] agent:invoice-agent -> external.upload
-     DETECTED: exfiltration attempt (call was allowed, flagged for review, not blocked outright)
-     risk this call: 4, cumulative: 0  [novel_tool(+1), risk_class:destructive(+3)]  monitoring action: kill
+     CUT OFF (the credential was revoked by the containment above, this call fails at authentication and never reaches the authorization check)
 [08] agent:invoice-agent -> invoice.read
-     BLOCKED (agent is not authorized for this tool)
+     CUT OFF (the credential was revoked by the containment above, this call fails at authentication and never reaches the authorization check)
 ```
 
-Steps 1 through 3 are the agent's normal workload, ordinary tool calls it's authorized for, low risk, nothing worth a second look. Step 4 is the first sign something changed, a destructive tool this agent has never called before, flagged, not blocked, `policy.Check` still says yes because the grant is real. Step 5 pushes the running total over the revoke threshold, an actual `internal/monitoring` containment decision, not a log line, though in this run it's an audited no-op, `cmd/gateway` has no `credentials.Store` wired into it, a documented, honest gap, see `docs/ARCHITECTURE.md`'s Runtime monitoring row. Step 7 crosses the kill threshold: `internal/monitoring.Monitor` calls `internal/policy.Kill`, a real kill sentinel gets set in Tessera, and the cumulative risk resets to 0, the one thing that does reset it. Step 8 re-calls a tool the agent was granted and had already used successfully in step 1, and it's denied, not because anything about the request changed, but because `policy.Check` now reads the kill sentinel instead of the prior grant. That's an actual state transition an incident responder could have triggered by hand with `niactl kill`, except here nothing human decided it, the accumulated pattern did.
+Steps 1 through 3 are the agent's normal workload, ordinary tool calls it is authorized for, individually unremarkable. The running total still reaches the flag threshold at step 3, purely from tools this agent had never called before. Step 4 is the first thing that looks wrong on its own, a destructive tool this agent has no history with, and it is still allowed, because `policy.Check` says yes and the grant is real. Step 5 reaches for credentials, crosses the kill threshold, and `internal/monitoring.Monitor` calls `internal/policy.Kill`: a kill sentinel is set in Tessera and the agent's credential is revoked in the same decision. The cumulative total resets to 0, which is the one thing that resets it.
 
-`GET /risk/agent:invoice-agent` on the gateway, read right after this run, shows the same four containment decisions as structured `internal/incident` records, not just this transcript:
+Steps 6 through 8 are what containment actually looks like from the agent's side. It is not that its calls are refused, it is that the credential it was using no longer exists, so it fails at authentication and never reaches the authorization check at all. Step 8 is the same tool as step 1, granted and already used successfully, which is the point: nothing about the request changed, the agent did.
+
+`GET /risk/agent:invoice-agent` on the gateway, read right after this run, shows the same decisions as structured `internal/incident` records rather than just this transcript:
 
 ```json
-{"cumulative":0,"thresholds":{"FlagAt":4,"RevokeAt":8,"KillAt":15},"incidents":[
-  {"Action":"flag","Cumulative":7,"Reason":"cumulative risk 7 crossed threshold"},
-  {"Action":"revoke","Cumulative":11,"Reason":"cumulative risk 11 crossed the revoke threshold, but this process has no credentials.Store configured, nothing was revoked"},
-  {"Action":"revoke","Cumulative":12,"Reason":"cumulative risk 12 crossed the revoke threshold, but this process has no credentials.Store configured, nothing was revoked"},
-  {"Action":"kill","Cumulative":16,"Reason":"cumulative risk 16 crossed threshold"}
+{"cumulative":0,"thresholds":{"FlagAt":4,"RevokeAt":100,"KillAt":12},"incidents":[
+  {"Action":"flag","Cumulative":4,"Reason":"cumulative risk 4 crossed threshold"},
+  {"Action":"flag","Cumulative":8.5,"Reason":"cumulative risk 8 crossed threshold"},
+  {"Action":"kill","Cumulative":13,"Reason":"cumulative risk 13 crossed threshold, killed, revoked 1 active credential(s)"}
 ]}
 ```
 
-`GET /metrics` on the gateway from the same run: `nia_gateway_requests_total{outcome="allowed"} 7`, `nia_gateway_requests_total{outcome="denied_tool"} 1`, `nia_monitoring_actions_total{action="flag"} 1`, `nia_monitoring_actions_total{action="revoke"} 2`, `nia_monitoring_actions_total{action="kill"} 1`, the same eight-call sequence, one more way to see it.
+`GET /metrics` on the gateway from the same run, one more way to see the same eight calls:
 
-One honest gap this specific run surfaced, and what happened to it since, because the transcript above predates the fix: `niactl agent inspect`, read right after the kill, used to still show the agent's `state` as `active`. The kill went through `internal/monitoring.Monitor` calling `internal/policy.Kill` directly inside `cmd/gateway`, which is what actually revokes access, but it never touched `cmd/api`'s own registry, so the control plane's inventory could report an agent as active that was, in every way that mattered to the gateway, already killed. Enforcement was never wrong, step 8 above proves the next call is genuinely denied, but the inventory disagreed with it. That is closed now, and not the way this README originally predicted: rather than having `cmd/gateway` reach back into `cmd/api` over HTTP on every automatic kill, `GET /agents/{ref}` queries the live kill sentinel on every read and reports it as `effective_state`, with `kill_sentinel_checked` saying whether that live query itself succeeded, so a cached `state` can look stale for a moment but `effective_state` cannot be wrong without saying so. See phases 13 and 26 in [`CHANGELOG.md`](CHANGELOG.md).
+```
+nia_gateway_requests_total{outcome="allowed"} 5
+nia_gateway_requests_total{outcome="unresolved"} 3
+nia_monitoring_actions_total{action="flag"} 2
+nia_monitoring_actions_total{action="kill"} 1
+```
 
-Reproducing this: bring up `nia-api` and `nia-gateway` both pointed at the same Tessera instance (`NIA_TESSERA_BASE_URL` and the signing key, see [`docs/RUNNING.md`](docs/RUNNING.md)), start the gateway with `NIA_RISK_FLAG_AT=4 NIA_RISK_REVOKE_AT=8 NIA_RISK_KILL_AT=15` and `NIA_TOOLS_API_URL` pointed at `nia-api` (so the `risk_class` signal is scored, not just `novel_tool`), then `niactl simulate attack -scenario agent-hijack`. Lower or higher thresholds change exactly where flag/revoke/kill fire, the point isn't the specific numbers, it's that they're real thresholds being crossed by a real accumulating total, not a scripted outcome.
+Five allowed, three that could not authenticate because the agent had been contained, two flags and one kill. The thresholds were `NIA_RISK_FLAG_AT=4`, `NIA_RISK_REVOKE_AT=100` and `NIA_RISK_KILL_AT=12`, chosen so the run reaches the kill; set the revoke threshold low instead and containment fires earlier, at the revoke, and the rest of the sequence is cut off the same way. The specific numbers are not the point, a real accumulating total crossing a real threshold is.
 
 ## How it works
 
@@ -130,6 +134,8 @@ docker compose up -d --build
 ```
 
 Five containers, all healthy: `nia-api`, `nia-gateway`, `tessera`, `openfga`, `postgres`. Both NIA services share one Postgres for credentials, audit, registry, incidents and risk state, and one Tessera for policy, which is what makes the gateway usable.
+
+One thing to know before it bites you: OpenFGA here keeps its store in memory, so recreating that container throws away the store and the authorization model while `.env` still names the old id. Everything then fails with a Tessera 500 whose real cause, `No authorization models found for store`, is only visible in `docker compose logs tessera`. Re-run `./bootstrap-openfga.sh`, put the new id in `.env`, and bring the stack up again.
 
 Risk monitoring is off by default, deliberately, since a kill threshold in a shared dev stack is the kind of thing that should be opted into rather than sprung on someone. Three lines in `.env` turn it on:
 

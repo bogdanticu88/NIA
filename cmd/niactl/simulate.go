@@ -141,18 +141,27 @@ func runScenario(sc scenario, out io.Writer) {
 	credential := issueScenarioCredential(out, sc)
 
 	fmt.Fprintln(out, "\n[attack sequence]")
-	contained := false
+	how := notContained
+	fired := false
 	for i, step := range sc.steps {
 		res := runStep(sc.agentRef, credential, step)
-		if printStepResult(out, i+1, sc.agentRef, step, res) {
-			contained = true
+		if c := printStepResult(out, i+1, sc.agentRef, step, res, fired); c != notContained && how == notContained {
+			// First one wins: the interesting fact is how the agent was
+			// stopped, and every step after that is a consequence.
+			how = c
+		}
+		if a := stepAction(res); a == "revoke" || a == "kill" {
+			fired = true
 		}
 	}
 
 	fmt.Fprintln(out, "\n[result]")
-	if contained {
+	switch how {
+	case cutOffByRevocation:
+		fmt.Fprintf(out, "%s was cut off mid-sequence. Crossing a revoke or kill threshold revokes the agent's credential through the shared credential store, so every later call fails at authentication: the agent cannot present a credential that still exists, let alone reach the authorization check. This is enforcement, not a printed result.\n", sc.agentRef)
+	case blockedByPolicy:
 		fmt.Fprintf(out, "%s was denied a call after previously being granted and successfully using that same tool, consistent with the kill switch having fired mid-sequence: policy.Check now reads the kill sentinel for this agent rather than its prior grants, this is enforcement, not a printed result.\n", sc.agentRef)
-	} else {
+	default:
 		fmt.Fprintln(out, "no previously-allowed call was denied during this run. Either nothing here crossed a configured risk threshold, or the gateway wasn't started with NIA_RISK_FLAG_AT / NIA_RISK_REVOKE_AT / NIA_RISK_KILL_AT set, monitoring is off by default, see deployments/docker-compose.yml's comment on those three variables.")
 	}
 
@@ -302,12 +311,52 @@ func runStep(agentRef, credential string, step attackStep) stepResult {
 // containment fired: a call denied after the agent was granted and had
 // already successfully used that same tool is what a kill mid-sequence
 // looks like from the caller's side.
-func printStepResult(out io.Writer, n int, agentRef string, step attackStep, res stepResult) bool {
+// containment is how, if at all, a step showed the control plane
+// actually stopping the agent. There are two shapes and they happen at
+// different layers, which is the whole reason this is not a bool.
+type containment string
+
+const (
+	notContained containment = ""
+	// blockedByPolicy is a 403: the agent still authenticates, and the
+	// authorization check refuses the call because the kill sentinel is
+	// set rather than because the grant is gone.
+	blockedByPolicy containment = "blocked"
+	// cutOffByRevocation is a 401 after containment fired: revoke and
+	// kill both revoke the agent's credential now, so the next call
+	// fails at authentication and never reaches authorization at all.
+	cutOffByRevocation containment = "cut_off"
+)
+
+// stepAction is the monitoring action the gateway reported for a step,
+// "flag", "revoke", "kill", or empty.
+func stepAction(res stepResult) string {
+	risk, ok := res.body["risk"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	action, _ := risk["action"].(string)
+	return action
+}
+
+// printStepResult renders one step and says whether it demonstrated
+// containment.
+//
+// fired says whether an earlier step already crossed a revoke or kill
+// threshold, and it is what makes a 401 readable. Before containment, a
+// 401 means the setup is wrong, almost always two processes with no
+// shared credential store, and calling that "expected" would hide a
+// real misconfiguration. After containment, a 401 is the containment
+// working: the credential it was using no longer exists. Same status
+// code, opposite meanings, and the transcript used to print both as
+// "UNEXPECTED", which said the run had failed when it had just
+// succeeded.
+func printStepResult(out io.Writer, n int, agentRef string, step attackStep, res stepResult, fired bool) containment {
 	fmt.Fprintf(out, "[%02d] %s -> %s\n", n, agentRef, step.tool)
 	switch {
 	case res.err != nil:
 		fmt.Fprintf(out, "     ERROR: %v\n", res.err)
-		return false
+		return notContained
 	case res.status == http.StatusOK:
 		if step.tag != "" {
 			fmt.Fprintf(out, "     DETECTED: %s (call was allowed, flagged for review, not blocked outright)\n", step.tag)
@@ -317,15 +366,18 @@ func printStepResult(out io.Writer, n int, agentRef string, step attackStep, res
 		if risk, ok := res.body["risk"].(map[string]any); ok {
 			printStepRisk(out, risk)
 		}
-		return false
+		return notContained
 	case res.status == http.StatusForbidden:
 		reason, _ := res.body["error"].(string)
 		fmt.Fprintf(out, "     BLOCKED (%s)\n", reason)
-		return true
+		return blockedByPolicy
+	case res.status == http.StatusUnauthorized && fired:
+		fmt.Fprintln(out, "     CUT OFF (the credential was revoked by the containment above, this call fails at authentication and never reaches the authorization check)")
+		return cutOffByRevocation
 	default:
 		reason, _ := res.body["error"].(string)
 		fmt.Fprintf(out, "     UNEXPECTED (%d): %s\n", res.status, reason)
-		return false
+		return notContained
 	}
 }
 

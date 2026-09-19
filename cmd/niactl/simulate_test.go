@@ -49,7 +49,7 @@ func TestScenarios_AgentHijackIsWellFormed(t *testing.T) {
 func TestPrintStepResult_Allowed(t *testing.T) {
 	var buf bytes.Buffer
 	res := stepResult{status: http.StatusOK, body: map[string]any{}}
-	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "invoice.read"}, res)
+	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "invoice.read"}, res, false) != notContained
 	if contained {
 		t.Fatal("an ordinary 200 should not be reported as containment")
 	}
@@ -61,7 +61,7 @@ func TestPrintStepResult_Allowed(t *testing.T) {
 func TestPrintStepResult_AllowedButTagged_ReportsDetectedNotBlocked(t *testing.T) {
 	var buf bytes.Buffer
 	res := stepResult{status: http.StatusOK, body: map[string]any{}}
-	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "customer.export", tag: "privilege deviation"}, res)
+	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "customer.export", tag: "privilege deviation"}, res, false) != notContained
 	if contained {
 		t.Fatal("a tagged-but-allowed call is a detection, not containment")
 	}
@@ -73,7 +73,7 @@ func TestPrintStepResult_AllowedButTagged_ReportsDetectedNotBlocked(t *testing.T
 func TestPrintStepResult_Denied_ReportsContainment(t *testing.T) {
 	var buf bytes.Buffer
 	res := stepResult{status: http.StatusForbidden, body: map[string]any{"error": "agent is not authorized for this tool"}}
-	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "credential.read"}, res)
+	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "credential.read"}, res, false) != notContained
 	if !contained {
 		t.Fatal("a 403 must be reported as containment")
 	}
@@ -85,7 +85,7 @@ func TestPrintStepResult_Denied_ReportsContainment(t *testing.T) {
 func TestPrintStepResult_TransportError(t *testing.T) {
 	var buf bytes.Buffer
 	res := stepResult{err: os.ErrDeadlineExceeded}
-	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "invoice.read"}, res)
+	contained := printStepResult(&buf, 1, "agent:x", attackStep{tool: "invoice.read"}, res, false) != notContained
 	if contained {
 		t.Fatal("a transport error is not containment")
 	}
@@ -283,5 +283,67 @@ func TestPrintScenarioBlastRadius_UnreachableAPI(t *testing.T) {
 	printScenarioBlastRadius(&buf, "agent:test")
 	if !strings.Contains(buf.String(), "could not reach") {
 		t.Fatalf("got %q, want an honest error rather than a panic", buf.String())
+	}
+}
+
+// Test401BeforeContainmentIsStillUnexpected keeps the bug fix from
+// swallowing the failure it used to be confused with. A 401 before
+// anything crossed a threshold means the two processes have no shared
+// credential store, which is the single most common way this scenario
+// is run wrong, and it has to keep reading as wrong.
+func Test401BeforeContainmentIsStillUnexpected(t *testing.T) {
+	var buf bytes.Buffer
+	res := stepResult{status: http.StatusUnauthorized, body: map[string]any{"error": "could not resolve caller identity"}}
+	got := printStepResult(&buf, 1, "agent:x", attackStep{tool: "invoice.read"}, res, false)
+	if got != notContained {
+		t.Errorf("containment = %q, want %q: a 401 with no prior containment is a misconfiguration, not a success", got, notContained)
+	}
+	if !strings.Contains(buf.String(), "UNEXPECTED") {
+		t.Errorf("transcript = %q, want it to still say UNEXPECTED", buf.String())
+	}
+}
+
+// Test401AfterContainmentIsTheContainmentWorking is the fix itself. Once
+// revoke or kill has fired, the agent's credential is gone, so the next
+// call cannot authenticate. That used to print UNEXPECTED and report
+// "no previously-allowed call was denied", which told the reader the run
+// had failed at the exact moment it had succeeded.
+func Test401AfterContainmentIsTheContainmentWorking(t *testing.T) {
+	var buf bytes.Buffer
+	res := stepResult{status: http.StatusUnauthorized, body: map[string]any{"error": "could not resolve caller identity"}}
+	got := printStepResult(&buf, 6, "agent:x", attackStep{tool: "database.query"}, res, true)
+	if got != cutOffByRevocation {
+		t.Errorf("containment = %q, want %q", got, cutOffByRevocation)
+	}
+	out := buf.String()
+	if strings.Contains(out, "UNEXPECTED") {
+		t.Errorf("transcript = %q, should not call a revoked credential unexpected", out)
+	}
+	if !strings.Contains(out, "CUT OFF") {
+		t.Errorf("transcript = %q, want it to say the agent was cut off", out)
+	}
+}
+
+// TestStepActionReadsTheMonitoringAction covers the input the loop uses
+// to decide whether containment has fired, since getting that wrong
+// would silently restore the old behaviour.
+func TestStepActionReadsTheMonitoringAction(t *testing.T) {
+	cases := []struct {
+		name string
+		res  stepResult
+		want string
+	}{
+		{"kill", stepResult{body: map[string]any{"risk": map[string]any{"action": "kill"}}}, "kill"},
+		{"revoke", stepResult{body: map[string]any{"risk": map[string]any{"action": "revoke"}}}, "revoke"},
+		{"flag", stepResult{body: map[string]any{"risk": map[string]any{"action": "flag"}}}, "flag"},
+		{"no risk block at all", stepResult{body: map[string]any{}}, ""},
+		{"risk block with no action", stepResult{body: map[string]any{"risk": map[string]any{}}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stepAction(tc.res); got != tc.want {
+				t.Errorf("stepAction = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
