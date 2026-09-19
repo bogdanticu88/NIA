@@ -94,3 +94,72 @@ jobs:
     # wire-format mismatches against another service, so they are worth
     # running by hand before anything that touches the policy client
     # ships.
+
+  # The Go toolchain on the runner never reads deployments/, so nothing
+  # in build-test can see a broken Dockerfile. That is not hypothetical:
+  # both Dockerfiles pinned golang:1.24-alpine for a while after go.mod
+  # moved to 1.25, so every docker build failed with "go.mod requires go
+  # >= 1.25.0" while CI stayed green, and it was only found by someone
+  # trying to follow the README. This job exists to catch that class of
+  # drift, where the images and the module disagree.
+  #
+  # It builds NIA's own two images and nothing else. The compose stack
+  # also builds Tessera from ../../tessera, a separate repository that
+  # is not checked out here, so bringing the whole stack up is out of
+  # scope for CI and stays a local step, see README.md.
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the api image
+        run: docker build -f deployments/Dockerfile.api -t nia-api:ci .
+
+      - name: Build the gateway image
+        run: docker build -f deployments/Dockerfile.gateway -t nia-gateway:ci .
+
+      # Building proves the compile step ran. It does not prove the
+      # binary that came out is usable: a multi-stage copy from the
+      # wrong path, or a base image the static binary cannot run on,
+      # both produce an image that builds and then does nothing. So
+      # start it and ask it something.
+      - name: Confirm the api image actually serves
+        run: |
+          docker run -d --rm --name nia-ci-smoke \
+            -e NIA_ALLOW_UNAUTHENTICATED=1 -p 8080:8080 nia-api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "healthz answered after ${i}s"
+              docker stop nia-ci-smoke >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the api image never answered /healthz, its log:"
+          docker logs nia-ci-smoke || true
+          docker stop nia-ci-smoke >/dev/null || true
+          exit 1
+
+      # The gateway has no dependency-free startup path worth serving
+      # here, so this checks the weaker but still useful property: the
+      # binary in the image runs and reaches its own configuration
+      # checks rather than failing to execute at all.
+      - name: Confirm the gateway image runs
+        run: |
+          out="$(docker run --rm nia-gateway:ci 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *NIA_OPERATOR_TOKENS_PATH*) echo "the gateway binary ran and refused to start open, as designed" ;;
+            *) echo "the gateway image did not reach its own startup checks"; exit 1 ;;
+          esac
+
+      # Cheap, and catches a compose file that no longer parses or that
+      # references a variable nothing supplies. The values are dummies:
+      # this validates the file, it does not start anything.
+      - name: Validate the compose file
+        env:
+          NIA_TESSERA_JWT_SIGNING_KEY: ci-dummy
+          TESSERA_OPENFGA_STORE_ID: ci-dummy
+          NIA_TOOLS_API_TOKEN: ci-dummy
+        run: docker compose -f deployments/docker-compose.yml --env-file /dev/null config >/dev/null
